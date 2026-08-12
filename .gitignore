@@ -1,0 +1,43 @@
+# ==== 凭证 / 密钥：绝不提交 ====
+config.local.json
+.env
+*.key
+*credentials*
+
+# ==== 本地数据缓存（iFinD 配额有限，静态数据缓存到本地）====
+data_cache/
+*.parquet
+*.pkl
+
+# ==== 生成物 / 预览 ====
+output/
+_preview_*
+# 只忽略**根目录**的下划线临时脚本（_run*.py / _dbg*.py 这类一次性诊断脚本）。
+# 不能写成 `_*.py`——那会连 `core/__init__.py` 一起误伤（它也以下划线开头），
+# 包标识文件一旦漏传，别人 clone 下来 import 就会出问题。
+/_*.py
+/_*.pkl
+
+# ==== 只留本地的工作文档 ====
+# 设计与论点库的问题记录属于内部工作底稿，不随代码分发。
+# THESIS_LIBRARY.md 例外：它被 core/thesis.py 直接解析，是代码的一部分。
+DESIGN.md
+论点库说明与问题.md
+
+# ==== 第三方材料：绝不提交 ====
+# references/ 是券商研报与内部模板（含标注"内部使用"的材料），有版权与合规风险；
+# sources/ 是分析师放待引用研报的工作台，同理。
+# 二者都不是本项目的代码，且一旦推上去，即使事后删除，旧提交里仍然留有副本。
+references/
+sources/
+
+# ==== Python ====
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ==== 打包产物 ====
+build/
+dist/
+*.spec
