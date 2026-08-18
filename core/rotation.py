@@ -67,6 +67,15 @@ def _ret(code: str, window: int, years: int, provider) -> float | None:
     return val
 
 
+def current_return(code: str, *, window: int = 20, years: int = 1,
+                   provider: DataProvider | None = None) -> float | None:
+    """某代码近 window 日区间涨跌幅（%）。供 thesis.py 判断"当前是否已进入某情形"用。
+
+    只是把已有的私有 `_ret()`（带缓存）公开出来，不改其行为。
+    """
+    return _ret(code, window, years, provider)
+
+
 def relative(a_code: str, b_code: str, *, window: int = 20, years: int = 1,
              provider: DataProvider | None = None) -> RelPerf:
     """A 相对 B 的区间表现差。"""

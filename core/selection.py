@@ -152,6 +152,154 @@ def render(cands: list[Candidate]) -> str:
     return "\n".join(lines)
 
 
+# ---------------- 择优（B4：接入报告生成，§9.2②）----------------
+
+@dataclass
+class Pick:
+    代码: str
+    简称: str = ""
+    理由: str = ""
+    适合: str = ""          # 这个选项对应什么配置偏好（多选项时用于区分）
+    指标: dict = dfield(default_factory=dict)
+    展示: dict = dfield(default_factory=dict)
+
+
+@dataclass
+class Proposal:
+    picks: list[Pick] = dfield(default_factory=list)
+    择优维度: list[str] = dfield(default_factory=list)
+    说明: str = ""
+    候选数: int = 0
+    tokens: int = 0
+    ok: bool = False
+    error: str = ""
+
+
+# 择优这一步**必须给候选池**才能推理，否则模型只能凭记忆编代码
+# （已两次踩坑：思源电气→中国石化、证券ETF代码给错）。故池子与真实指标一并给出，
+# 且返回的代码逐个回查池子，不在池中的直接丢弃。
+_SYSTEM_PICK = """你是场外衍生品的"挂钩标的择优器"。
+给你一个**真实存在、代码已校验**的候选池（含实测指标），请为本次报告选出挂钩标的。
+
+铁律（违反即作废）：
+1. **只能从候选池里选**，代码必须与池中完全一致。绝对不许写池子里没有的代码或名称。
+2. **理由只能引用候选池里给出的真实指标**，不得引入池外数字，更不得编造。
+   指标缺失（显示为空）的维度不要拿来当理由。
+3. 选 **1~3 个**。选多个时，必须说明每个各自**适合什么配置偏好**
+   （如"集中硬科技暴露"vs"跨板均衡配置"），而不是罗列几个差不多的。
+4. **择优维度要明说**，且应贴合本次主题。典型维度：主题暴露度（该标的多大比例
+   落在本次分析的产业/板块上）、估值水平、成分股市值与流动性、波动弹性。
+5. 若池中确实没有能表达本次主题的标的，`挂钩候选` 给空数组，并在 `说明` 里
+   写清为什么——**宁可承认没有合适标的，也不要硬挑一个不相关的**。
+6. 不要给期权结构、期限、报价建议——那由交易台决定，不在你的职责内。
+只输出一个 JSON 对象，不要多余文字。"""
+
+
+def _pick_prompt(topic: str, topic_type: str, cands: list[Candidate],
+                 context: dict | None, direction: str) -> str:
+    import json
+
+    pool = []
+    for c in cands:
+        row = {"代码": c.代码, "简称": c.简称, "类型": c.类型,
+               "标签": c.标签, "说明": c.说明}
+        row.update({k: v for k, v in c.展示.items() if v})
+        pool.append(row)
+    spec = {
+        "本次主题": topic,
+        "报告类型": topic_type,
+        **({"需求背景": context} if context else {}),
+        **({"报告整体方向": direction} if direction else {}),
+        "候选池_只能从这里选_指标为实测值": pool,
+        "输出格式": {
+            "择优维度": ["本次据以比较的维度，2~4 个"],
+            "挂钩候选": [
+                {"代码": "必须与候选池中完全一致",
+                 "理由": "为什么是它，只引用候选池里的真实指标",
+                 "适合": "这个选项对应什么配置偏好（只有一个候选时可留空）"}
+            ],
+            "说明": "一句话总结择优结论；池中无合适标的时在此说明原因",
+        },
+    }
+    return json.dumps(spec, ensure_ascii=False, indent=1)
+
+
+def propose(topic: str, topic_type: str = "", *, context: dict | None = None,
+            direction: str = "", client=None,
+            provider: DataProvider | None = None) -> Proposal:
+    """从候选池择优出本次的挂钩标的（B4 / DESIGN §9.2②）。
+
+    用途是板块类需求之外的那两类：产业趋势与事件驱动的**分析对象本身不可交易**
+    （"AI 产业景气""IPO 的流动性冲击"都挂不了），必须映射到一只有该暴露的
+    可交易标的上，而这一步映射正是报告的价值所在（参考模板 AI→科创50/双创50、
+    长鑫IPO→中证500 都专门用一节讲这个映射的理由）。
+
+    板块类需求不必走这里：`instruments.underlying_for()` 已经给出确定答案。
+
+    实现上**一次 LLM 调用**：先把整个候选池的实测指标批量取回（配额可忽略，
+    见 §11 额度说明），连池子一起喂给模型，避免"先让模型缩小范围、再取数、
+    再让模型选"的两次调用。模型返回的代码逐个回查池子，编的直接丢弃。
+    """
+    from llm.client import DeepSeekClient
+
+    p = Proposal()
+    provider = provider or get_provider()
+    client = client or DeepSeekClient()
+    if not client.available():
+        p.error = "未配置 DeepSeek key，无法择优"
+        return p
+
+    cands = compare(codes=[i.代码 for i in inst.INSTRUMENTS], provider=provider)
+    p.候选数 = len(cands)
+    if not cands:
+        p.error = "候选池取数失败，无法比较"
+        return p
+
+    res = client.chat_json(_SYSTEM_PICK,
+                           _pick_prompt(topic, topic_type, cands, context, direction),
+                           temperature=0.3)
+    p.tokens = client.total_tokens
+    if not res.ok or not isinstance(res.data, dict):
+        p.error = res.error or "LLM 返回非预期结构"
+        return p
+
+    by_code = {c.代码: c for c in cands}
+    p.择优维度 = [str(x).strip() for x in (res.data.get("择优维度") or []) if str(x).strip()]
+    p.说明 = str(res.data.get("说明", "")).strip()
+    for it in (res.data.get("挂钩候选") or [])[:3]:
+        if not isinstance(it, dict):
+            continue
+        code = str(it.get("代码", "")).strip()
+        c = by_code.get(code)
+        if c is None:              # 池子里没有 = 模型编的，丢弃（铁律1）
+            continue
+        p.picks.append(Pick(
+            代码=code, 简称=c.简称,
+            理由=str(it.get("理由", "")).strip(),
+            适合=str(it.get("适合", "")).strip(),
+            指标=dict(c.指标), 展示=dict(c.展示),
+        ))
+    p.ok = True
+    return p
+
+
+def render_proposal(p: Proposal) -> str:
+    if not p.ok:
+        return f"择优失败：{p.error}"
+    if not p.picks:
+        return f"候选池 {p.候选数} 个中未选出合适标的：{p.说明 or '（未说明）'}"
+    out = [f"择优维度：{'、'.join(p.择优维度) or '—'}（候选池 {p.候选数} 个）"]
+    for k in p.picks:
+        seg = "、".join(f"{n}{v}" for n, v in k.展示.items() if v)
+        out.append(f"  · {k.简称}（{k.代码}）{('｜' + k.适合) if k.适合 else ''}")
+        if seg:
+            out.append(f"      实测：{seg}")
+        out.append(f"      理由：{k.理由}")
+    if p.说明:
+        out.append(f"  结论：{p.说明}")
+    return "\n".join(out)
+
+
 if __name__ == "__main__":  # python -m core.selection
     print("【场景】某事件冲击科技成长股，需选一个挂钩标的表达\n")
     cands = compare(tags=[inst.T_TECH, inst.T_GROWTH])

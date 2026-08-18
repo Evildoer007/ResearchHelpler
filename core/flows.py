@@ -111,17 +111,22 @@ def etf_share_trend(sector: str, *, lookback_days: int = 90,
                     provider: DataProvider | None = None) -> FlowTrend:
     """板块代表 ETF 的份额趋势（近 lookback_days 天变动）。支撑 F7/F7b。
 
-    代表 ETF 取自 instruments.py 已校验的候选池（`find(sector)` 第一个匹配），
-    该池已实测代码全部有效，不在本函数里再猜/编 ETF 代码。
+    代表 ETF 优先取 `underlying_for`——那是 #73 同一套板块→ETF映射表，
+    与"分析ETF"/观点包挂钩标的是同一个来源。此前这里独立走 `find(sector)`
+    按名称模糊匹配、取第一个，实测两条路给出过不同答案：同一份"半导体"报告，
+    `find("半导体")[0]` 命中"半导体ETF"(512480.SH，简称含关键词排序靠前)，
+    而 `underlying_for`/分析ETF 走的是"芯片ETF"(159995.SZ)——F7 的证据引用
+    512480、报告挂钩推荐 159995，一份报告里悄悄出现了两个不同的"半导体ETF"。
+    映射表没有登记时才退回 `find(sector)` 模糊匹配，不让"取不到"变成"没数据"。
     """
     from . import instruments as im
 
-    cands = im.find(sector)
-    if not cands:
+    inst, _note = im.underlying_for(sector)
+    etf = inst if inst is not None else (im.find(sector) or [None])[0]
+    if etf is None:
         t = FlowTrend(指标="ETF份额")
         t.error = f"instruments 候选池未找到「{sector}」对应的 ETF"
         return t
-    etf = cands[0]
 
     rows = _wc_series(f"{etf.代码} 基金份额 近{lookback_days + 30}天",
                       "基金份额", "fund", provider)

@@ -47,6 +47,10 @@ class ViewPackage:
     标的代码: str                   # **可交易的挂钩标的**（板块 ETF），非数据阶段的代表个股
     标的名称: str = ""
     标的口径: str = ""              # 该 ETF 跟踪什么，与本报告板块口径是否一致
+    # 挂钩标的**不等于**分析对象时，这里是那一层映射的理由（B4/§9.2②）。
+    # 板块类需求两者本就同一，此项为空；产业趋势/事件驱动类必须有——
+    # 不允许"分析 A、推荐 B、却对 A 与 B 的关系只字不提"（见设计理念）。
+    挂钩理由: str = ""
     数据代表标的: str = ""          # 数据锚点，仅供追溯，不是挂钩对象
     板块: str = ""
     板块理由: str = ""
@@ -72,11 +76,41 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
 
     # 挂钩标的取板块 ETF，不是数据阶段的代表个股。报告分析的是整个板块，
     # 把观点绑到贵州茅台身上，做出来的结构承担的是茅台的个股风险而非板块风险。
-    inst, note = ins.underlying_for(sector)
+    #
+    # #73 起，优先读 `field_values["__etf__"]`——那是取数阶段（`fetch_profile`）
+    # 已经过流动性校验的同一个结果：如果这份报告的波动率/涨跌幅等字段本就取自
+    # 这只 ETF 自己的价格数据（`_SECTOR_DERIVED` 路由），观点包这里必须推荐同一只，
+    # 否则"分析的东西"和"推荐挂钩的东西"又会变成两个不一致的对象——
+    # 正是这次改造要消灭的基差问题。只有旧数据（没有这个键，如反序列化的
+    # 历史 pickle）才退回当场重新解析，且那次解析不含流动性校验，仅作兜底。
+    etf_code = ma.field_values.get("__etf__")
+    if etf_code:
+        inst, note = ins.get(etf_code), ma.field_values.get("__etf_note__") or ""
+    elif etf_code is None:              # 键都不存在，说明是改造前的旧数据
+        inst, note = ins.underlying_for(sector)
+    else:                                # 键存在但为空串：取数阶段已判定无合格ETF
+        inst, note = None, ma.field_values.get("__etf_note__") or "无合适挂钩ETF"
+
+    # 板块→ETF 给不出答案时，用择优结果（B4/§9.2②）。这两类需求的分析对象
+    # 本身不可交易，挂钩标的必须经映射得出，且映射理由要一并带上——
+    # 否则观点包给下游的就是一个"未定"，A1 那节永远空白。
+    择优 = getattr(ma, "挂钩择优", None)
+    择优理由 = ""
+    if inst is None and 择优 is not None and getattr(择优, "picks", None):
+        top = 择优.picks[0]
+        inst = ins.get(top.代码)
+        择优理由 = top.理由
+        维度 = "、".join(getattr(择优, "择优维度", []) or [])
+        note = (f"择优自 {择优.候选数} 个候选" + (f"（维度：{维度}）" if 维度 else "")
+                + ("；另一选项：" + "、".join(
+                    f"{k.简称}{('·' + k.适合) if k.适合 else ''}" for k in 择优.picks[1:])
+                   if len(择优.picks) > 1 else ""))
+
     vp = ViewPackage(
         标的代码=inst.代码 if inst else "",
         标的名称=inst.简称 if inst else "",
         标的口径=note,
+        挂钩理由=择优理由,
         数据代表标的=f"{getattr(ma, 'rep_name', '') or ''} {ma.rep_code}".strip(),
         板块=sector,
         板块理由=getattr(ma, "板块理由", "") or "",
@@ -132,6 +166,8 @@ def render(vp: ViewPackage) -> str:
         lines.append(f"  标的口径：{vp.标的口径}")
     if vp.数据代表标的:
         lines.append(f"  数据代表标的：{vp.数据代表标的}（仅数据锚点，非挂钩对象）")
+    if vp.挂钩理由:
+        lines.append(f"  挂钩理由：{vp.挂钩理由}")
     if vp.板块理由:
         lines.append(f"  选取依据：{vp.板块理由}")
     lines += [

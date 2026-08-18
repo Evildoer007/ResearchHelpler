@@ -504,13 +504,41 @@ def _j_overbought(p):
 # ---- 轮动/相对强弱类（R）：需标的代码而非仅 profile，故走独立入口 ----
 
 def _rot_ctx(p):
-    """从 profile 里取轮动计算所需的上下文（代码/板块）。"""
+    """从 profile 里取轮动计算所需的上下文（代码/板块）。
+
+    ⚠ 这里的代码是**代表标的**（单只个股）。除 R5「龙头/跟随分化」确实要拿龙头
+    与板块对比外，其余 R 类论点要的是"本次分析对象"，应改用 `_analysis_ctx`。
+    """
     return (p.get("__code__"), p.get("__sector__"))
 
 
+def _analysis_ctx(p):
+    """R 类论点的**分析对象**：有合格分析 ETF 时用它，否则回落到代表标的。
+
+    #73 把行情类**字段**迁到了分析 ETF 口径，但 R 类判定不读 profile 字段、
+    自己调 rotation 实时取数，因而整体漏掉了那次迁移。后果实测可见：
+    SK海力士那份报告里 R6「相对大盘超额」报的 -17.54% 是代表标的兆易创新
+    **一只股票**的，而同一份报告的板块区间涨跌幅是 -8.37%，两者差 9pct；
+    读者看到"相对大盘超额"只会理解成板块的超额，成品上却没有任何痕迹
+    能看出这是单只个股（同一次触发里 R5 反而老实写了"龙头-17.54% vs 板块-8.37%"）。
+
+    返回 (代码, 口径标签)。标签会写进判定说明与证据键，让"这是哪个标的的数"
+    直接写在脸上，而不是笼统一句"本标的"——口径要由代码保证，不能指望
+    下游 writer 去猜（它收到的只有字段名与值，根本没有 source）。
+    """
+    etf = str(p.get("__etf__") or "").strip()
+    if etf:
+        from . import instruments as inst
+
+        i = next((x for x in inst.INSTRUMENTS if x.代码 == etf), None)
+        return etf, (i.简称 if i else etf)
+    code = p.get("__code__")
+    return code, (f"代表标的{code}" if code else "")
+
+
 def _j_excess_return(p):
-    """R6 相对大盘超额：本标的相对沪深300 的区间表现差。"""
-    code, _ = _rot_ctx(p)
+    """R6 相对大盘超额：**本次分析对象**相对沪深300 的区间表现差。"""
+    code, 标 = _analysis_ctx(p)
     if not code:
         return None, "缺标的代码", {}
     from . import rotation as rot
@@ -519,8 +547,9 @@ def _j_excess_return(p):
     if not r.ok:
         return None, r.error, {}
     ok = abs(r.spread) >= TH["超额_显著pct"]
-    return ok, (f"近20日 {r.a_ret:+.2f}% vs 沪深300 {r.b_ret:+.2f}%，"
-                f"超额 {r.spread:+.2f}pct"), {"本标的近20日": f"{r.a_ret:+.2f}%", "沪深300近20日": f"{r.b_ret:+.2f}%",
+    return ok, (f"{标}近20日 {r.a_ret:+.2f}% vs 沪深300 {r.b_ret:+.2f}%，"
+                f"超额 {r.spread:+.2f}pct"), {f"{标}近20日": f"{r.a_ret:+.2f}%",
+                "沪深300近20日": f"{r.b_ret:+.2f}%",
                 "相对大盘超额": f"{r.spread:+.2f}pct"}
 
 
@@ -537,7 +566,7 @@ def _j_rotation(p):
     门槛比 R2 更严——用 `轮动_扫描后胜率`（更高）而非 `规律_最低胜率`，
     这相当于一次粗糙的多重比较校正。
     """
-    code, _ = _rot_ctx(p)
+    code, 标 = _analysis_ctx(p)
     if not code:
         return None, "缺标的代码", {}
     from . import rotation as rot
@@ -552,7 +581,7 @@ def _j_rotation(p):
     hp = rot.verify_pattern(top["代码"], code, window=20,
                             threshold=abs(TH["轮动_显著pct"]),   # 该板块涨超此幅度
                             min_occurrences=int(TH["规律_最小样本数"]))
-    head = (f"本标的近20日 {s.base_ret:+.2f}%，"
+    head = (f"{标}近20日 {s.base_ret:+.2f}%，"
             f"扫描 {s.扫描数} 个标的中 {len(s.diverged)} 个反向，"
             f"最显著：{top['名称']}{top['涨跌']:+.1f}%")
     if not hp.ok:
@@ -585,7 +614,7 @@ def _j_rotation_reverse(p):
     补这条的理由是**方向配平**：R1 早已接判定而 R1b 空着，
     系统只会说"别的板块在涨"，说不了"本板块正在被资金回补"。
     """
-    code, _ = _rot_ctx(p)
+    code, 标 = _analysis_ctx(p)
     if not code:
         return None, "缺标的代码", {}
     from . import rotation as rot
@@ -597,7 +626,7 @@ def _j_rotation_reverse(p):
     th = TH["切换_显著pct"]
     反转 = 短.spread * 长.spread < 0 and abs(短.spread) >= th and abs(长.spread) >= th
     向 = "由弱转强（资金回流）" if 短.spread > 0 else "由强转弱（资金撤离）"
-    return 反转, (f"相对沪深300超额：近60日 {长.spread:+.2f}pct → 近20日 {短.spread:+.2f}pct"
+    return 反转, (f"{标}相对沪深300超额：近60日 {长.spread:+.2f}pct → 近20日 {短.spread:+.2f}pct"
                   f"（阈值 ±{th:.0f}pct）"
                   + ("；" + 向 if 反转 else "；未发生反转")), {
         "近60日超额": f"{长.spread:+.2f}pct", "近20日超额": f"{短.spread:+.2f}pct",
@@ -627,7 +656,14 @@ def _j_growth_value_switch(p):
 
 
 def _j_leader_divergence(p):
-    """R5 龙头与板块背离。板块涨跌直接用 profile 已有字段，避免重复取数。"""
+    """R5 龙头与板块背离。板块涨跌直接用 profile 已有字段，避免重复取数。
+
+    ⚠ 这条**刻意保留 `_rot_ctx`（代表标的）而不改用 `_analysis_ctx`**：
+    它的论证形状本就是"龙头个股 vs 板块整体"，两边必须是不同口径的对象，
+    换成分析 ETF 就变成"ETF vs 板块"——两者高度重合，背离度恒接近 0，
+    这条论点直接失去意义。其余 R 类（R1/R1b/R2/R2b/R6）要的是"本次分析对象"，
+    才该走 `_analysis_ctx`。
+    """
     code, sector = _rot_ctx(p)
     sec_ret = _val(p, "板块区间涨跌幅")
     if not code or sec_ret is None:
@@ -656,7 +692,7 @@ def _pattern(p):
 
     返回 (HistoryPattern 或 None, 说明)。None 表示当期情形不成立或取数失败。
     """
-    code, _ = _rot_ctx(p)
+    code, 标 = _analysis_ctx(p)
     if not code:
         return None, "缺标的代码"
     from . import rotation as rot
@@ -678,17 +714,18 @@ def _pattern(p):
                             min_occurrences=int(TH["规律_最小样本数"]))
     if not hp.ok:
         return None, hp.error
-    return hp, f"沪深300近20日 {now.b_ret:+.2f}%，已进入大盘{情形名}情形"
+    return hp, (f"沪深300近20日 {now.b_ret:+.2f}%，已进入大盘{情形名}情形"
+                f"（观察对象：{标}）")
 
 
-def _pattern_desc(hp, head: str) -> str:
+def _pattern_desc(hp, head: str, 标: str = "本标的") -> str:
     oos = ""
     if hp.样本外一致 is not None:
         oos = ("；前后两段胜率 "
                f"{hp.早期胜率:.0f}%/{hp.晚期胜率:.0f}%"
                f"（{'一致' if hp.样本外一致 else '不一致，疑过拟合'}）")
     return (f"{head}；近5年同类情形 {hp.occurrences} 次，"
-            f"本标的 {hp.b_positive} 次上涨（胜率 {hp.胜率:.1f}%），"
+            f"{标} {hp.b_positive} 次上涨（胜率 {hp.胜率:.1f}%），"
             f"平均 {hp.b_avg:+.2f}%{oos}")
 
 
@@ -701,7 +738,7 @@ def _j_pattern_verified(p):
         return None, (f"{note}；但历史仅 {hp.occurrences} 次，"
                       f"少于 {int(TH['规律_最小样本数'])} 次，胜率无统计意义"), {}
     ok = hp.胜率 >= TH["规律_最低胜率"] and hp.样本外一致 is not False
-    return ok, _pattern_desc(hp, note), {
+    return ok, _pattern_desc(hp, note, _analysis_ctx(p)[1]), {
         "历史胜率": f"{hp.胜率:.1f}%（{hp.b_positive}/{hp.occurrences}）",
         "同类情形平均涨跌": f"{hp.b_avg:+.2f}%"}
 
@@ -720,9 +757,133 @@ def _j_pattern_falsified(p):
     if not hp.样本充足:
         return None, (f"{note}；但历史仅 {hp.occurrences} 次，样本不足以证伪"), {}
     ok = hp.胜率 <= TH["规律_证伪胜率"] or hp.样本外一致 is False
-    return ok, _pattern_desc(hp, note), {
+    return ok, _pattern_desc(hp, note, _analysis_ctx(p)[1]), {
         "历史胜率": f"{hp.胜率:.1f}%（{hp.b_positive}/{hp.occurrences}）",
         "同类情形平均涨跌": f"{hp.b_avg:+.2f}%"}
+
+
+# ---------------- 研报观点 → R2 结构（C5/C6，DESIGN §7.6） ----------------
+# 把 docs.py 抽出的"事实陈述"型观点（某标的涨跌X%时，另一标的同期涨跌Y%）
+# 翻译成 verify_pattern 的输入自动做历史验证。条件不再局限于 R2 固定的"大盘"，
+# 且不受 R1 那道多重比较加严门槛约束——因为这个"标的对"不是从扫描里挑出来的，
+# 是研报这个独立来源给出的，本身就绕开了多重比较问题（同 R2 的"大盘"一样，
+# 是一个事先给定、非数据挖掘出来的条件）。
+_PATTERN_ALIASES = {
+    "大盘": "000300.SH", "沪深300": "000300.SH", "沪深三百": "000300.SH",
+    "中盘": "000905.SH", "中证500": "000905.SH",
+    "小盘": "000852.SH", "中证1000": "000852.SH",
+    "成长": "399006.SZ", "创业板指": "399006.SZ",
+    "价值": "000016.SH", "上证50": "000016.SH",
+    "科技": "000688.SH", "科创50": "000688.SH",
+}
+
+
+def _resolve_pattern_code(name: str) -> str | None:
+    """把研报里的板块/指数名解析成代码。只查已校验过的现成表，不新猜代码。
+
+    找不到（含"多个模糊命中、无法确定选哪个"）一律返回 None——
+    这条候选就此放弃升级为机器验证论点，但原始 doc 观点仍会正常出现在候选清单里。
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    if name in _PATTERN_ALIASES:
+        return _PATTERN_ALIASES[name]
+    from . import instruments as inst
+
+    obj, _note = inst.underlying_for(name)
+    if obj:
+        return obj.代码
+    hits = inst.find(name)
+    if len(hits) == 1:
+        return hits[0].代码
+    return None
+
+
+def doc_pattern_triggers(claims: list, *, provider=None) -> list["Trigger"]:
+    """把研报"事实陈述"型联动观点，翻译成 R2 结构做历史验证（C5/C6）。
+
+    双重条件，顺序同 R2 的 `_pattern()`：①条件标的**当前**是否已进入该方向的
+    极端情形（用 R2 同一个固定阈值 `规律_情形阈值pct`，不用研报原文那次具体的
+    百分比——门槛必须系统预先固定，不能从文本里挑）；不成立直接跳过，不回测。
+    ②历史规律：`verify_pattern` 回测，过样本量/胜率/样本外一致三道闸。
+
+    胜率判定方向：`hp.胜率` 恒定义为"观察标的上涨占比"，与条件/观察方向是否
+    同向无关，只取决于**观察方向本身**——b_dir=涨 时直接用 R2 的
+    `hp.胜率 >= 规律_最低胜率`；b_dir=跌 时借用 R1 `_j_rotation` 同款的倒转
+    写法 `hp.胜率 <= 100-规律_最低胜率`（对方涨、这个方向不跟涨的比例要高）。
+    **门槛统一用 `规律_最低胜率`（R2 的 60%），不用 `轮动_扫描后胜率`
+    （R1 加严的 70%）**——独立来源换来的正是这道门槛的放宽。
+
+    通过的条目构造一个动态 Thesis+Trigger，id 形如 `docR2_doc_3`，不依赖它
+    存在于 THESIS_LIBRARY.md（下游只按字段读取，没有按 id 查静态库的地方）。
+    不通过（含代码解析不到、样本不足、胜率不过、样本外不一致）一律静默跳过——
+    原始 doc 观点仍在候选清单里，只是不会升级为自动可选的机器验证论点。
+    """
+    from . import rotation as rot
+
+    out: list[Trigger] = []
+    for c in claims:
+        if getattr(c, "陈述类型", "") != "事实陈述":
+            continue
+        a_name = getattr(c, "条件标的", "")
+        b_name = getattr(c, "观察标的", "")
+        a_dir = getattr(c, "条件方向", "")
+        b_dir = getattr(c, "观察方向", "")
+        if not (a_name and b_name and a_dir in ("涨", "跌") and b_dir in ("涨", "跌")):
+            continue
+        a_code = _resolve_pattern_code(a_name)
+        b_code = _resolve_pattern_code(b_name)
+        if not a_code or not b_code or a_code == b_code:
+            continue
+
+        now = rot.current_return(a_code, window=20, provider=provider)
+        thr = TH["规律_情形阈值pct"]
+        if now is None or abs(now) < thr:
+            continue
+        当前方向 = "跌" if now <= 0 else "涨"
+        if 当前方向 != a_dir:
+            continue   # 报告说的方向此刻不成立，这条假设本次用不上
+
+        signed_thr = -thr if a_dir == "跌" else thr
+        hp = rot.verify_pattern(a_code, b_code, window=20, threshold=signed_thr,
+                                min_occurrences=int(TH["规律_最小样本数"]),
+                                provider=provider)
+        if not hp.ok or not hp.样本充足:
+            continue
+        # hp.胜率 恒定义为"B 上涨占比"，与 a_dir/b_dir 是否同向无关——
+        # 胜负判据只取决于**期望 B 往哪个方向走**（b_dir）。b_dir=涨 时直接用
+        # hp.胜率（同 R2）；b_dir=跌 时用 100-hp.胜率（同 R1 `_j_rotation`
+        # 的倒转写法：对方涨、本标的不跟涨的比例要高，即 hp.胜率 <= 上限）。
+        观察胜率 = hp.胜率 if b_dir == "涨" else 100.0 - hp.胜率
+        观察次数 = hp.b_positive if b_dir == "涨" else hp.occurrences - hp.b_positive
+        win = 观察胜率 >= TH["规律_最低胜率"]
+        if not (win and hp.样本外一致 is not False):
+            continue
+
+        观察方向词 = "上涨" if b_dir == "涨" else "下跌"
+        thesis_obj = Thesis(
+            id=f"docR2_{getattr(c, 'id', '') or a_name}",
+            名称=f"研报机制验证·{a_name}与{b_name}联动",
+            类别="轮动/相对强弱类",
+            触发条件=f"{a_name}{a_dir}超{thr:.0f}%时，历史上{b_name}同步{观察方向词}的规律",
+            所需数据="研报观点（独立来源）+ 历史行情回测",
+            可得性=AVAIL_OK,
+            特征={"方向": "看涨" if b_dir == "涨" else "看跌", "确定性": "中", "窗口": "短期"},
+        )
+        说明 = (f"研报《{c.来源}》p{c.页码} 观点：{c.观点}——"
+               f"{a_name}近20日{now:+.2f}%，已进入{a_dir}超{thr:.0f}%的情形；"
+               f"近5年同类情形共{hp.occurrences}次，{b_name}{观察方向词}{观察次数}次"
+               f"（{观察胜率:.0f}%，门槛≥{TH['规律_最低胜率']:.0f}%）")
+        证据 = {
+            "研报出处": f"{c.来源} p{c.页码}",
+            f"{a_name}近20日": f"{now:+.2f}%",
+            "历史样本数": f"{hp.occurrences}次",
+            f"{b_name}{观察方向词}胜率": f"{观察胜率:.1f}%",
+            "同类情形平均涨跌": f"{hp.b_avg:+.2f}%",
+        }
+        out.append(Trigger(thesis=thesis_obj, triggered=True, 说明=说明, 证据=证据))
+    return out
 
 
 def _peer_cmp(p, metric: str):

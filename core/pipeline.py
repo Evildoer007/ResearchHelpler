@@ -48,7 +48,15 @@ class MarketAnalysis:
     rep_code: str
     logics: list[LogicWithData] = dfield(default_factory=list)
     field_values: dict[str, FieldValue] = dfield(default_factory=dict)
-    外部事实待补: list[str] = dfield(default_factory=list)  # 我方数据源查不到，须人工填
+    外部事实待补: list[str] = dfield(default_factory=list)  # 我方数据源查不到，且尚未人工填
+    # 分析师经覆盖文件填好的外部事实（待补事项 → 内容）。与上一项互斥：
+    # 填了就从"待补"移到这里，否则 writer 仍被告知"不得编造"而回避它，等于白填。
+    外部事实已填: dict = dfield(default_factory=dict)
+    # 挂钩标的择优结果（`selection.Proposal`）。**只在板块→ETF 映射给不出答案时**
+    # 才有值——产业趋势与事件驱动这两类的分析对象本身不可交易（"AI产业景气"、
+    # "IPO的流动性冲击"都挂不了），必须映射到一只有该暴露的可交易标的上（§9.2②）。
+    # 板块类需求走 `underlying_for()` 的确定答案，不必也不该再择一次优。
+    挂钩择优: object = None
     # 研报观点自带的、已通过校验的配图数列：{逻辑id: 图表规格}。
     # 由 writer 直接采用而**不让 LLM 自拟**——图比文字更难被读者核对，
     # 一个编造的数列看起来和真的一模一样，故只画从研报里逐字校验过的数。
@@ -94,7 +102,9 @@ def _all_fields() -> list[str]:
 
 def fetch_profile(
     rep_code: str, sector: str | None = None,
-    provider: DataProvider | None = None,
+    provider: DataProvider | None = None, *,
+    trigger_code: str = "", trigger_name: str = "",
+    overrides=None,
 ) -> dict[str, FieldValue]:
     """摸底取数：先把论点库判定所需 + 画像字段查一遍，不预设最后选哪条论点。
 
@@ -119,6 +129,36 @@ def fetch_profile(
     # 以双下划线键随 profile 传递，判定函数按需取用。
     profile["__code__"] = rep_code
     profile["__sector__"] = sector or ""
+
+    # 触发实体（#74）：需求提到的事件本体，可能是境外标的，跟 rep_code 是两个角色——
+    # rep_code 是 A股响应板块的数据锚点，这里取的是"这家公司自己发生了什么"。
+    # 此前完全不取，报告因此从不分析事件本身，直接跳到"A股板块该怎么样"
+    # （用户实测发现："全程没有分析海力士本身"）。
+    if trigger_code:
+        profile["__trigger_code__"] = trigger_code
+        profile["__trigger_name__"] = trigger_name or trigger_code
+        for fv in _fetch_trigger_entity(trigger_code, provider).values():
+            profile[fv.field] = fv
+
+    # 分析ETF：与 fetch_fields 内部路由用的是同一个解析结果（#73），
+    # 这里单独存一份是为了让 writer/viewpoint/内部底稿都能拿到"这份报告
+    # 的行情数据实际来自哪只 ETF"，不必各自重新判断一遍、也不会和取数路由
+    # 判断出两个不同的答案——分析对象与最终推荐挂钩的标的必须是同一个。
+    # 会比 fetch_fields 内部那次多查一遍（各一次 series_multi 判流动性），
+    # 但单只 ETF 一年期序列成本可忽略（DESIGN §配额说明），换来的是这里
+    # 拿到的 ETF 代码不依赖 fetch_fields 的内部实现细节，两处各自独立可信。
+    if sector:
+        from . import instruments as _inst
+        _i, _note = _inst.resolve_analysis_etf(sector, provider=provider)
+        profile["__etf__"] = _i.代码 if _i else ""
+        profile["__etf_note__"] = _note
+
+    # 人工覆盖放在**最后**：先让机器尽力取，取不到的才由人补，
+    # 人工值不会挡住本来能自动取到的数据。判定字段不可覆盖（见 core/overrides.py），
+    # 合法性在 load() 时已校验，到这里的都是允许覆盖的字段。
+    if overrides is not None and not overrides.为空:
+        from . import overrides as _ov
+        profile["__overridden__"] = _ov.apply_fields(profile, overrides)
     return profile
 
 
@@ -208,6 +248,69 @@ def _subsector_detail(sector: str, provider: DataProvider | None = None) -> Fiel
         source=f"iFinD·{sector}下{len(segs)}个一级行业（各自整体法）", status="ok",
         note="子行业级数据，用于展示宽口径板块内部结构", display=text,
     )
+
+
+def _fetch_trigger_entity(code: str, provider: DataProvider | None = None) -> dict[str, FieldValue]:
+    """触发实体（事件本体，可能是境外标的）自身的市场表现。
+
+    与板块聚合、代表标的（rep_code）都无关——这里只对 `code` 自己算，
+    结果全部挂 `触发标的_` 前缀，跟板块口径的字段分得清清楚楚，写正文时
+    不会被误当成"板块整体表现"引用（同 #73 分析ETF自己数据 vs 板块聚合的道理）。
+
+    覆盖面**因市场而异，逐字段独立尝试**，不预设"境外=只有价格没有基本面"——
+    实测：韩股（SK海力士 000660.KS）基本面科目基本为空，但港股（腾讯0700.HK
+    PE15.6倍、阿里9988.HK PE19.5倍）、美股（英伟达/苹果/台积电ADR）连PE都是真数。
+    取不到的字段就不出现，不占位、不报错，不阻塞取到的那些。
+    """
+    from . import history
+
+    provider = provider or get_provider()
+    out: dict[str, FieldValue] = {}
+
+    # 价格行为：直接对该代码算，不经过任何板块聚合，函数本就是给单一代码设计的
+    v = history.volatility(code, provider=provider)
+    if v.ok:
+        out["触发标的_年化波动率"] = FieldValue(
+            "触发标的_年化波动率", v.当前, True, f"iFinD·{code}近{v.窗口}日", "", "", "ok",
+            "触发实体自身波动率，非板块数据", display=f"{v.当前:.1f}%")
+        out["触发标的_波动率历史分位"] = FieldValue(
+            "触发标的_波动率历史分位", v.分位, True, f"iFinD·{code}近3年", "", "", "ok",
+            "触发实体自身波动率分位，非板块数据", display=f"{v.分位:.1f}%分位")
+
+    rp = history.return_percentile(code, provider=provider)
+    if rp.ok:
+        out["触发标的_区间涨跌幅"] = FieldValue(
+            "触发标的_区间涨跌幅", rp.当前值, True, f"iFinD·{code}{rp.起始}", "", "", "ok",
+            "触发实体自身近20日涨跌，非板块数据", display=f"{rp.当前值:+.2f}%")
+
+    # 基本面：能拿到就拿，逐个尝试、各自独立报告成败
+    for field, ind, unit, scale in (
+        ("触发标的_PE", "ths_pe_ttm_stock", "倍", 1),
+        ("触发标的_PB", "ths_pb_latest_stock", "倍", 1),
+        ("触发标的_归母净利同比", "ths_np_atsopc_yoy_stock", "%", 1),
+        ("触发标的_总市值", "ths_market_value_stock", "亿元", 1e-8),
+    ):
+        try:
+            r = provider.get_basic([code], [ind], "")
+        except Exception:
+            continue
+        if not (r.ok and r.value not in (None, "", "--")):
+            continue
+        try:
+            val = float(r.value) * scale
+        except (TypeError, ValueError):
+            continue
+        # 0 当无效值处理：实测 000660.KS 的 ths_market_value_stock 返回
+        # errorcode=0、值=0.0——不是报错，是"取到了却是空的"，PE/PB/市值/净利同比
+        # 这几个字段业务上都不可能真为 0，当真实数据展示出去会误导人
+        # （显示"总市值 0.00亿元"，读者会以为这是真数据，而不是取数失败）。
+        if val == 0:
+            continue
+        out[field] = FieldValue(
+            field, val, True, f"iFinD·{code}", "", ind, "ok",
+            "触发实体自身数据，非板块数据",
+            display=f"{val:.2f}{unit}" if unit != "%" else f"{val:+.2f}{unit}")
+    return out
 
 
 # 字段 → (序列名, 图标题, y轴标签, 缩放, 该字段的分位是否就是"所画序列当前点"的分位)
@@ -386,16 +489,23 @@ class Candidate:
 
 def prepare(rep_code: str, sector: str | None = None,
             provider: DataProvider | None = None, *,
-            with_docs: bool = False, topic: str = "") -> Prepared:
+            with_docs: bool = False, topic: str = "",
+            trigger_code: str = "", trigger_name: str = "",
+            overrides=None) -> Prepared:
     """摸底取数 + 跑触发引擎（+ 可选抽取 sources/ 的研报），返回候选清单原料。
 
     with_docs 默认关闭：文档抽取要调 LLM、按篇计费，而自动模式根本不会用到
     文档观点（它们必须人工确认），跑了纯属浪费。只有 --pick 才打开。
+
+    overrides：人工覆盖（`core.overrides.Overrides`）。**不参与触发判定**——
+    它填的都是判定引擎不消费的字段（两者交集为空），只供 writer 引用。
     """
     from . import thesis as th
 
     provider = provider or get_provider()
-    profile = fetch_profile(rep_code, sector, provider)
+    profile = fetch_profile(rep_code, sector, provider,
+                            trigger_code=trigger_code, trigger_name=trigger_name,
+                            overrides=overrides)
     try:
         fired = th.triggered_theses(profile)
     except Exception:
@@ -425,6 +535,14 @@ def prepare(rep_code: str, sector: str | None = None,
             claims = []
         for i, c in enumerate(claims, 1):
             c.id = f"doc_{i}"
+
+        # C5/C6：研报里"事实陈述"型的板块联动观点，能翻译成 R2 结构的
+        # 自动升级为机器验证过的论点，直接汇入 fired（不再是仅供人工勾选、
+        # 原样引用的 doc 候选）。失败（含没有可用的联动观点）不阻塞主流程。
+        try:
+            fired.extend(th.doc_pattern_triggers(claims, provider=provider))
+        except Exception:
+            pass
 
     # sector 以 profile 里的为准——fetch_profile 已把主题名解析成行业名，
     # 存回来供 run() 的补充取数复用，避免两处各解析一次（结果可能不一致）
@@ -603,16 +721,19 @@ def run(
     sector: str | None = None,
     prepared: Prepared | None = None,
     chosen: list[str] | None = None,
+    overrides=None,
 ) -> MarketAnalysis:
     """prepared: 已跑过的摸底+触发结果，传入即复用（不重复取数）。
-    chosen:   人工勾选的论点 id；不传则由 planner 自动挑（保持原行为）。"""
+    chosen:   人工勾选的论点 id；不传则由 planner 自动挑（保持原行为）。
+    overrides: 人工覆盖；仅在 prepared 为空（本函数自行摸底）时生效，
+              否则覆盖已在生成那份 prepared 时并入。"""
     client = client or DeepSeekClient()
     provider = provider or get_provider()
     g = genre or gr.get_genre(topic_type)   # 类型非法会报错
 
     # ①【数据先行】摸底：先把论点库判定所需的全部字段查一遍，不预设最后选哪条论点
     if prepared is None:
-        prepared = prepare(rep_code, sector, provider)
+        prepared = prepare(rep_code, sector, provider, overrides=overrides)
     profile = prepared.profile
 
     # 被勾选的研报观点（chosen 里 doc_ 打头的那些）
@@ -717,7 +838,7 @@ def run(
         for lg in plan.logics
     ]
 
-    return MarketAnalysis(
+    ma = MarketAnalysis(
         plan=plan, rep_code=rep_code, logics=logics, field_values=fv_map,
         doc_charts={c.id: c.图表 for c in doc_chosen if c.图表},
         doc_cats={c.id: c.类别 for c in doc_chosen if c.类别},
@@ -730,10 +851,34 @@ def run(
         tokens=client.total_tokens, data_vol=getattr(provider, "total_data_vol", 0),
         ok=True,
     )
+    ma.挂钩择优 = _pick_underlying(ma, topic, topic_type, context, plan, client, provider)
+    return ma
+
+
+def _pick_underlying(ma, topic, topic_type, context, plan, client, provider):
+    """挂钩标的择优（B4 / §9.2②），**仅在板块→ETF 映射给不出答案时**才跑。
+
+    板块类需求（消费/半导体/券商…）由 `underlying_for()` 给出确定答案，
+    此时分析对象与挂钩标的本就是同一只 ETF，再择一次优只会引入不一致。
+    而产业趋势/事件驱动这两类的分析对象本身不可交易，映射是必需的一步——
+    参考模板 AI→科创50/双创50、长鑫IPO→中证500 都专门用一节讲这个映射的理由。
+
+    失败不阻塞报告：这一节空着是 A1 的既有状态，不该因为择优失败就整份报告失败。
+    """
+    if ma.field_values.get("__etf__"):
+        return None
+    from . import selection as sel
+
+    try:
+        return sel.propose(topic, topic_type, context=context,
+                           direction=getattr(plan, "整体方向", "") or "",
+                           client=client, provider=provider)
+    except Exception:
+        return None
 
 
 def prepare_from_brief(b, *, provider: DataProvider | None = None,
-                       with_docs: bool = False) -> Prepared | None:
+                       with_docs: bool = False, overrides=None) -> Prepared | None:
     """从需求解析结果做摸底+触发，供人工勾选。代表标的不可用时返回 None。"""
     t = b.代表标的
     if t is None or not t.可用:
@@ -741,13 +886,19 @@ def prepare_from_brief(b, *, provider: DataProvider | None = None,
     # 主题串给文档抽取做相关性过滤：主题 + 全部涉及板块，比只给一个板块名更全
     # （"半导体、芯片、存储芯片"三个都带上，避免研报里说"存储"就被判为不相关）
     主题 = " ".join(x for x in [b.主题, *(b.涉及板块 or [])] if x)
+    trig = getattr(b, "触发实体", None)
+    trigger_code = trig.代码 if trig is not None and trig.可用 else ""
+    trigger_name = trig.名称 if trig is not None and trig.可用 else ""
     return prepare(t.代码, (b.涉及板块[0] if b.涉及板块 else None), provider,
-                   with_docs=with_docs, topic=主题)
+                   with_docs=with_docs, topic=主题,
+                   trigger_code=trigger_code, trigger_name=trigger_name,
+                   overrides=overrides)
 
 
 def run_from_brief(
     b, *, client: DeepSeekClient | None = None, provider: DataProvider | None = None,
-    prepared: Prepared | None = None, chosen: list[str] | None = None
+    prepared: Prepared | None = None, chosen: list[str] | None = None,
+    overrides=None,
 ) -> MarketAnalysis:
     """从需求解析结果（core.brief.Brief）直接跑：混合体裁 + 需求背景 + 真实代表标的。"""
     target = b.代表标的
@@ -755,6 +906,11 @@ def run_from_brief(
         ma = MarketAnalysis(plan=None, rep_code="", ok=False,
                             error="需求中没有可用的代表标的（代码待确认）")
         return ma
+
+    # 人工已填的外部事实从"待补"移到"可引用"两侧——留在待补里 writer 会被告知
+    # "不得编造"而回避它，那就白填了；移过去才真正进入可用数据。
+    填好的 = dict(getattr(overrides, "外部事实", {}) or {})
+    仍缺 = [x for x in b.外部事实待补 if x not in 填好的]
 
     ctx = {
         "用户原始需求": b.原始需求,
@@ -764,13 +920,16 @@ def run_from_brief(
         "市场判断查证": [
             {"说法": c.说法, "查证": c.查证, "依据": c.依据} for c in b.市场判断
         ],
-        "外部事实待补(不得编造,人工填写)": b.外部事实待补,
+        "外部事实待补(不得编造,人工填写)": 仍缺,
     }
+    if 填好的:
+        ctx["外部事实_分析师已人工填写_可直接引用"] = 填好的
     ma = run(b.主题, b.主导类型, target.代码, client=client, provider=provider,
              genre=b.混合体裁, context=ctx,
              sector=(b.涉及板块[0] if b.涉及板块 else None),
-             prepared=prepared, chosen=chosen)
-    ma.外部事实待补 = list(b.外部事实待补)
+             prepared=prepared, chosen=chosen, overrides=overrides)
+    ma.外部事实待补 = 仍缺
+    ma.外部事实已填 = 填好的
     ma.rep_name = target.名称          # 正文首次提及要写名称，只有代码读者认不出
     ma.板块理由 = getattr(b, "板块理由", "")
     return ma

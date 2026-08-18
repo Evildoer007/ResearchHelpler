@@ -63,6 +63,14 @@ class Brief:
     板块理由: str = ""      # 为什么选这个板块。印进报告，让读者知道分析对象怎么来的
     市场判断: list[MarketClaim] = dfield(default_factory=list)
     候选标的: list[TargetRef] = dfield(default_factory=list)
+    # 引发这次需求的那家具体公司本身（可能是境外标的，如 SK海力士 000660.KS）。
+    # 与"候选标的"是两个角色：候选标的是 A股响应板块的代表个股，
+    # 触发实体是事件本体——此前系统完全不取它的数据，一律打包进"外部事实待补"，
+    # 报告因此从不分析事件本身，直接跳到"A股板块该怎么样"（#74 用户实测发现）。
+    # 但实测境外标的的数据覆盖并非"完全没有"：美股/港股连PE都取得到，
+    # 只是格式必须精确（港股是4位数字+.HK，不是交易所惯用的5位），
+    # 猜错格式的后果由 `_verify_code` 挡住，不会带着错代码继续跑。
+    触发实体: TargetRef | None = None
     外部事实待补: list[str] = dfield(default_factory=list)
     tokens: int = 0
     ok: bool = False
@@ -134,6 +142,20 @@ _SYSTEM = """你是券商研究部的"需求解析器"。用户（老板/销售/
    （如"SK海力士为全球第二大 DRAM 厂商，A股存储芯片板块与其同处存储产业链"）。
    这句会印进报告，让读者知道分析对象是怎么选出来的；说不清理由就说明映射有问题。
 5. 候选标的给 A 股龙头个股或板块 ETF，附证券代码（如 600030.SH / 300750.SZ）；不确定就留空，不要编代码。
+6. **若需求由一家具体公司引发**（不论是否 A 股上市），尽量给出该公司自己的证券代码，
+   填进"触发实体"——这与"候选标的"是两回事：候选标的是 A 股响应板块的代表个股，
+   触发实体是引发这次需求的那家公司**本体**。有了它，报告才能把"这家公司自己
+   发生了什么"和"A 股板块怎么响应"两条线连起来写，而不是只字不提事件本身。
+   例：需求由 SK 海力士业绩引发 → 触发实体 = {名称: "SK海力士", 代码: "000660.KS"}。
+6.1 **代码格式必须精确，写不出精确格式就把代码留空**（宁可留空，不要编）：
+     A股：xxxxxx.SH / xxxxxx.SZ
+     港股：**4 位数字** + .HK（如腾讯控股是 0700.HK，**不是** 00700.HK 或 700.HK）
+     美股：纳斯达克用 .O（如英伟达 NVDA.O），纽交所用 .N（如台积电ADR TSM.N）
+     韩股：.KS（KOSPI）或 .KQ（KOSDAQ）
+   给出的代码会被逐一校验（真实存在 + 简称匹配你给的名称），猜错的会被拦下、
+   不会带着错代码继续跑——所以格式没把握时留空比硬猜安全，不算违反"不许编"。
+6.2 需求本就没有具体触发公司的（如"消费板块最近如何"），触发实体整体留空，
+   不要为了填而拉一个不相关的公司进来。
 只输出一个 JSON 对象，不要多余文字。"""
 
 
@@ -160,6 +182,7 @@ def _build_prompt(text: str, bundle: sg.SignalBundle) -> str:
                  "依据": "引用信号中的板块与数值"}
             ],
             "候选标的": [{"名称": "标的名", "代码": "600030.SH，不确定留空"}],
+            "触发实体": {"名称": "引发需求的具体公司名，没有就留空", "代码": "见铁律6.1格式，没把握就留空"},
             "外部事实待补": ["我方数据源查不到、需人工提供的事实（如某海外公司业绩具体数据）"],
         },
     }
@@ -241,11 +264,21 @@ def parse(
         for t in (d.get("候选标的") or []) if isinstance(t, dict)
     ]
 
+    raw_trigger = d.get("触发实体")
+    if isinstance(raw_trigger, dict) and str(raw_trigger.get("名称", "")).strip():
+        b.触发实体 = TargetRef(名称=str(raw_trigger.get("名称", "")).strip(),
+                              代码=str(raw_trigger.get("代码", "")).strip())
+
     if verify_codes:
         provider = provider or get_provider()
         _resolve_broad(b, d, provider)
         for t in b.候选标的:
             t.校验 = topics._verify_code(t.代码, t.名称, provider)
+        # 触发实体走同一套校验（代码真实存在 + 简称对得上），跟候选标的同一道闸门——
+        # 猜错格式（比如港股写成5位数字）会在这里被拦下，校验不通过=可用为False，
+        # 后面摸底取数会直接跳过它，不会带着错代码去查出一堆张冠李戴的数据。
+        if b.触发实体 is not None:
+            b.触发实体.校验 = topics._verify_code(b.触发实体.代码, b.触发实体.名称, provider)
 
         # LLM 常留空或给错代码（守规矩不编，但不可用）。此时不靠模型记忆，
         # 改用 iFinD 按"涉及板块"取真实龙头（已剔除次新股，见 universe / DESIGN §9.1）。
@@ -270,7 +303,15 @@ def parse(
     return b
 
 
-def render(b: Brief) -> str:
+def render(b: Brief, *, 含外部事实: bool = True) -> str:
+    """把解析结果排成可读文本。
+
+    含外部事实=False 时略去"外部事实待补"一节——该清单**此刻无法行动**
+    （要填覆盖文件再重跑，是事后的事），而它已完整落在内部底稿里。
+    终端只留此刻能动手的内容（解析对不对、板块选没选错），
+    清单类的记录归底稿，避免同一份内容在一次运行里报三遍。
+    `python -m core.brief` 自查时仍需看到它，故默认保持 True。
+    """
     if not b.ok:
         return f"解析失败：{b.error}"
     types = "＋".join([b.主导类型] + b.附加类型) if b.附加类型 else b.主导类型
@@ -292,13 +333,17 @@ def render(b: Brief) -> str:
         lines.append(f"    依据：{universe.classification_basis(名)}")
     if b.宽口径弃用行业:
         lines.append(f"  ⚠ 拆解中被丢弃（数据源取不到成分股）：{'、'.join(b.宽口径弃用行业)}")
+    if b.触发实体 is not None:
+        t = b.触发实体
+        flag = "✔" if t.可用 else "⚠"
+        lines.append(f"  触发实体：{t.名称} {t.代码 or '（未给代码）'}  {flag}（{t.校验 or '未校验'}）")
     lines.append("  市场判断查证：")
     for c in b.市场判断:
         lines.append(f"    · {c.说法}\n        → {c.查证}：{c.依据}")
     lines.append("  候选标的：")
     for t in b.候选标的:
         lines.append(f"    · {t.名称} {t.代码}  {'✔' if t.可用 else '⚠'}（{t.校验}）")
-    if b.外部事实待补:
+    if 含外部事实 and b.外部事实待补:
         lines.append("  外部事实待补（人工填写，不得由模型编造）：")
         lines += [f"    · {x}" for x in b.外部事实待补]
     return "\n".join(lines)

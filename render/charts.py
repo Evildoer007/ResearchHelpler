@@ -13,6 +13,18 @@ from matplotlib.patches import FancyBboxPatch
 from . import style as S
 
 
+# ⚠ **图的渲染高度只由长宽比决定，与 figsize 的绝对大小无关**（#83 实测）。
+# 一页通里图是并排放的，`.chart-row .chart img { width:100% }` 把显示宽度
+# 定死在容器宽（约 363px），图画多大都会被缩到这个宽度——
+# 所以"把 figsize 整体缩小"对省版面**毫无作用**（#82 那次缩 15% 白做了）。
+# 真正管用的是**压扁**：保持宽度、降低高度，长宽比变大，渲染高度按比例下降。
+# 各图按**标注密度**分别定压缩幅度，不能一刀切：
+#   bar / line / hist_band  只有一组标注 → 压 20%（2.1 → 1.68）
+#   bar_line                柱值+线值两组，最挤 → 只压 9%（2.2 → 2.00）
+# 实测把 bar_line 也压 20% 时，"21.4"撞上轴标签、柱内值与线值糊成一片——
+# 我给标注做的"分区"方案（柱值进柱内、线值在柱顶上方）需要一定纵向余量，
+# 压太扁就没地方分了。
+
 def _fmt(v: float) -> str:
     """柱顶/点上标注的数值格式：按量级定小数位。
 
@@ -38,7 +50,7 @@ def number_cards(cards: list[dict], *, title: str | None = None, height: float =
     vmax = max((len(str(c.get("value", ""))) for c in cards), default=4)
     lmax = max((len(str(c.get("label", ""))) for c in cards), default=6)
     per = max(1.5, min(2.6, 0.16 * max(vmax, lmax * 0.8) + 0.9))
-    fig, axes = plt.subplots(1, n, figsize=(min(6.4, per * n), height))
+    fig, axes = plt.subplots(1, n, figsize=(min(5.4, per * n * 0.85), height * 0.70))
     if n == 1:
         axes = [axes]
 
@@ -74,7 +86,7 @@ def table(headers: list[str], rows: list[list], *, title: str | None = None):
     """对比表：深红表头、隔行浅底、细网格。rows 为二维文本。"""
     S.apply_style()
     nrows = len(rows) + 1
-    fig, ax = plt.subplots(figsize=(5.2, 0.42 * nrows + 0.4))
+    fig, ax = plt.subplots(figsize=(4.4, 0.30 * nrows + 0.30))
     ax.axis("off")
     tbl = ax.table(cellText=rows, colLabels=headers, loc="center", cellLoc="left")
     tbl.auto_set_font_size(False)
@@ -102,7 +114,7 @@ def bar(labels: list[str], values: list[float], *, title: str | None = None,
         ylabel: str | None = None, signed: bool = False):
     """柱状图。signed=True 时按红涨绿跌上色；柱顶直接标值。"""
     S.apply_style()
-    fig, ax = plt.subplots(figsize=(min(6.0, max(4.4, 0.8 * len(labels))), 2.5))
+    fig, ax = plt.subplots(figsize=(min(5.1, max(3.7, 0.68 * len(labels))), 1.68))
     colors = [S.signed_color(v) for v in values] if signed else [S.PRIMARY] * len(values)
     bars = ax.bar(labels, values, color=colors, width=0.6)
     for b, v in zip(bars, values):
@@ -116,6 +128,18 @@ def bar(labels: list[str], values: list[float], *, title: str | None = None,
     ax.grid(axis="x", visible=False)
     fig.tight_layout()
     return fig
+
+
+def _ylabel_top(ax, text: str) -> None:
+    """把 Y 轴单位标签**横排放在轴顶**，而不是竖排贴在轴侧。
+
+    「PB(倍)」「换手率(%)」这类标签只有三五个字，竖排后每个字转 90°，
+    读起来要歪头，而且占掉一条竖向长条的宽度（图本就只有 4.8 英寸宽）。
+    财经图表的通行做法是横排放在纵轴顶端——一眼可读，且几乎不占地方。
+    """
+    ax.set_ylabel("")
+    ax.text(0.0, 1.02, text, transform=ax.transAxes, ha="left", va="bottom",
+            fontsize=7.5, color=S.MUTED)
 
 
 def _pad_axis(ax, values: list[float], frac: float = 0.18,
@@ -144,7 +168,7 @@ def line(labels: list[str], values: list[float], *, title: str | None = None,
     研报里"当前 vs 历史中枢"这类对比全靠它。
     """
     S.apply_style()
-    fig, ax = plt.subplots(figsize=(min(6.2, max(4.6, 0.55 * len(labels))), 2.5))
+    fig, ax = plt.subplots(figsize=(min(5.3, max(3.9, 0.47 * len(labels))), 1.68))
     ax.plot(labels, values, color=S.PRIMARY, linewidth=2.0,
             marker="o", markersize=4, zorder=3)
     ax.fill_between(range(len(values)), values, min(values + [0]),
@@ -183,34 +207,59 @@ def bar_line(labels: list[str], bars: list[float], lines: list[float], *,
     单独用柱状图或折线图都表达不了两个量纲不同的序列的对比。
     """
     S.apply_style()
-    fig, ax1 = plt.subplots(figsize=(min(6.2, max(4.8, 0.8 * len(labels))), 2.6))
+    fig, ax1 = plt.subplots(figsize=(min(5.3, max(4.1, 0.68 * len(labels))), 2.00))
     colors = [S.signed_color(v) for v in bars] if signed else [S.PRIMARY] * len(bars)
     b = ax1.bar(labels, bars, color=colors, width=0.55, zorder=2)
-    for rect, v in zip(b, bars):
-        ax1.text(rect.get_x() + rect.get_width() / 2, v, _fmt(v), ha="center",
-                 va="bottom" if v >= 0 else "top", fontsize=8.5, color=S.INK)
     ax1.axhline(0, color=S.GRID, linewidth=1)
-    if bar_label:
-        ax1.set_ylabel(bar_label, fontsize=9)
 
     ax2 = ax1.twinx()
     ax2.plot(labels, lines, color=S.INK, linewidth=1.8, marker="o",
              markersize=4, zorder=3)
-    for i, v in enumerate(lines):
-        # 折线的标注往**下**偏：柱顶标注固定在上方，两者同侧必然叠字
-        # （实测"4.3327"压在"22.0109"上，六组数糊成一片）。
-        ax2.annotate(_fmt(v), (i, v), textcoords="offset points",
-                     xytext=(0, -12), ha="center", fontsize=8.5, color=S.INK)
-    if line_label:
-        ax2.set_ylabel(line_label, fontsize=9)
     ax2.grid(False)
 
     # 两轴都留出上下空白：柱顶/折线点上的数值标注否则会顶到标题或被裁掉
     _pad_axis(ax1, bars, include_zero=True)   # 柱状轴须含 0，否则负值柱会浮空
-    _pad_axis(ax2, lines)
+    _pad_axis(ax2, lines, frac=0.22)
 
+    # 柱值进**柱子内部**（白字）：柱身是深色底，对比天然够，
+    # 而柱顶以上那块要留给折线与它的标注——两者分区，不争抢同一位置。
+    # 柱太矮塞不下字时退回柱顶外侧（此时柱矮，折线通常也不在附近）。
+    y0, y1 = ax1.get_ylim()
+    span = (y1 - y0) or 1.0
+    for rect, v in zip(b, bars):
+        x = rect.get_x() + rect.get_width() / 2
+        if abs(v) / span > 0.16:
+            ax1.text(x, v - (span * 0.05 if v >= 0 else -span * 0.05), _fmt(v),
+                     ha="center", va="top" if v >= 0 else "bottom", fontsize=7.5,
+                     color="white", fontweight="bold", zorder=5)
+        else:
+            ax1.text(x, v, _fmt(v), ha="center",
+                     va="bottom" if v >= 0 else "top", fontsize=7.5,
+                     color=S.INK, zorder=5)
+
+    # 折线只标**首尾两点**，不是每点都标（沿用 `line()` 的成例）。
+    # 理由是版面：图并排后只有约 363×177px，柱值 6 个 + 线值 6 个共 12 个标注
+    # 挤在里面必然互相压——实测调过三轮偏移方向、加白底、改分区都压不住，
+    # 因为空间本身就不够。而两根轴都带刻度，中间点的值读轴即可；
+    # 首尾两点标出来是为了给"从哪来、到哪去"一个锚，这正是折线要表达的东西。
+    for i in (0, len(lines) - 1):
+        v = lines[i]
+        ax2.annotate(_fmt(v), (i, v), textcoords="offset points",
+                     xytext=(0, 9), ha="center", fontsize=7.5, color=S.INK,
+                     zorder=6,
+                     bbox=dict(boxstyle="square,pad=0.15", fc=S.SURFACE,
+                               ec="none", alpha=0.9))
+
+    # 双轴的单位标签同样横排（同 hist_band 的理由），左轴贴左上、右轴贴右上，
+    # 分列两端不会互撞；标题的 pad 相应加大，给这行标签让出位置。
+    if bar_label:
+        ax1.text(0.0, 1.06, bar_label, transform=ax1.transAxes,
+                 ha="left", va="bottom", fontsize=7.5, color=S.MUTED)
+    if line_label:
+        ax1.text(1.0, 1.06, line_label, transform=ax1.transAxes,
+                 ha="right", va="bottom", fontsize=7.5, color=S.MUTED)
     if title:
-        ax1.set_title(title, fontweight="bold", color=S.INK, pad=12)
+        ax1.set_title(title, fontweight="bold", color=S.INK, pad=22)
     ax1.grid(axis="x", visible=False)
     if len(labels) > 6:
         plt.setp(ax1.get_xticklabels(), rotation=30, ha="right", fontsize=8)
@@ -253,17 +302,21 @@ def hist_band(dates: list[str], values: list[float], *, title: str | None = None
     import statistics as st
 
     S.apply_style()
-    fig, ax = plt.subplots(figsize=(5.6, 2.5))
+    fig, ax = plt.subplots(figsize=(4.8, 1.68))
     n = len(values)
     xs = list(range(n))
 
     srt = sorted(values)
     q = [srt[int(len(srt) * f)] for f in (0.25, 0.50, 0.75)]
-    ax.axhspan(q[0], q[2], color=S.PRIMARY, alpha=0.07, zorder=1)
+    ax.axhspan(q[0], q[2], color=S.PRIMARY, alpha=0.06, zorder=1)
+    # 分位标注移到**右侧轴外**，并给白底。原先压在左侧的浅色分位带上，
+    # 灰字叠浅灰带、又与走势线抢位置，实测糊成一片认不出（#82）。
+    # 放轴外既不遮数据，也不必再跟曲线抢地方。
     for v, lab in zip(q, ("25%", "50%", "75%")):
-        ax.axhline(v, color=S.MUTED, linewidth=0.8, linestyle=":", zorder=2)
-        ax.text(n * 0.012, v, lab, va="bottom", ha="left",
-                fontsize=7, color=S.MUTED)
+        ax.axhline(v, color=S.MUTED, linewidth=0.7, linestyle=":", zorder=2)
+        ax.text(1.008, v, lab, transform=ax.get_yaxis_transform(),
+                va="center", ha="left", fontsize=6.5, color=S.MUTED, zorder=6,
+                bbox=dict(boxstyle="square,pad=0.12", fc=S.SURFACE, ec="none"))
 
     ax.plot(xs, values, color=S.PRIMARY, linewidth=1.4, zorder=3)
 
@@ -283,7 +336,7 @@ def hist_band(dates: list[str], values: list[float], *, title: str | None = None
     ax.text(0.985, 0.06 if 高位 else 0.94, lab,
             transform=ax.transAxes, ha="right",
             va="bottom" if 高位 else "top",
-            fontsize=8.5, fontweight="bold", color=S.INK,
+            fontsize=7.5, fontweight="bold", color=S.INK,
             bbox=dict(boxstyle="round,pad=0.3", fc=S.SURFACE, ec=S.GRID, lw=0.6))
 
     # x 轴只标首尾与中点：726 个交易日标满必然糊成一片
@@ -291,12 +344,13 @@ def hist_band(dates: list[str], values: list[float], *, title: str | None = None
     ax.set_xticks(ticks)
     ax.set_xticklabels([dates[i][:7] if i < len(dates) else "" for i in ticks], fontsize=8)
     if ylabel:
-        ax.set_ylabel(ylabel)
+        _ylabel_top(ax, ylabel)
     if title:
-        ax.set_title(title, fontweight="bold", color=S.INK, pad=10)
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=14)
     ax.grid(axis="x", visible=False)
     _pad_axis(ax, values + [cur])
-    fig.tight_layout()
+    # 右侧留出分位标注的位置（标注放在轴外，不留白会被 tight_layout 裁掉）
+    fig.tight_layout(rect=(0, 0, 0.955, 1))
     return fig
 
 
@@ -312,7 +366,7 @@ def scatter(points: list[dict], *, title: str | None = None,
     highlight：代表标的的标签，单独描红加名，让读者知道"我们讲的那只在哪"。
     """
     S.apply_style()
-    fig, ax = plt.subplots(figsize=(5.4, 2.9))
+    fig, ax = plt.subplots(figsize=(5.4, 2.30))
     xs = [p["x"] for p in points]
     ys = [p["y"] for p in points]
     ax.scatter(xs, ys, s=34, color=S.PRIMARY, alpha=0.55,
@@ -347,9 +401,9 @@ def scatter(points: list[dict], *, title: str | None = None,
                     color=S.PRIMARY_D if hi else S.INK)
 
     if xlabel:
-        ax.set_xlabel(xlabel, fontsize=9)
+        ax.set_xlabel(xlabel, fontsize=8)
     if ylabel:
-        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=8)
     if title:
         ax.set_title(title, fontweight="bold", color=S.INK, pad=10)
     fig.tight_layout()
@@ -365,7 +419,7 @@ def grouped_bar(labels: list[str], series: list[dict], *, title: str | None = No
     """
     S.apply_style()
     n, m = len(labels), max(1, len(series))
-    fig, ax = plt.subplots(figsize=(min(6.4, max(4.8, 0.95 * n)), 2.7))
+    fig, ax = plt.subplots(figsize=(min(6.4, max(4.8, 0.95 * n)), 2.15))
     width = 0.8 / m
     palette = [S.PRIMARY, S.PRIMARY_D, S.MUTED]
     for i, s in enumerate(series[:3]):
@@ -379,12 +433,12 @@ def grouped_bar(labels: list[str], series: list[dict], *, title: str | None = No
             ax.text(x, v, _fmt(v), ha="center",
                     va="bottom" if v >= 0 else "top", fontsize=7.5, color=S.INK)
     ax.set_xticks(range(n))
-    ax.set_xticklabels(labels, fontsize=8.5)
+    ax.set_xticklabels(labels, fontsize=7.5)
     ax.axhline(0, color=S.GRID, linewidth=1)
     if m > 1:
         ax.legend(fontsize=8, frameon=False, ncol=min(3, m), loc="upper right")
     if ylabel:
-        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_ylabel(ylabel, fontsize=8)
     if title:
         ax.set_title(title, fontweight="bold", color=S.INK, pad=10)
     ax.grid(axis="x", visible=False)
@@ -404,7 +458,7 @@ def histogram(values: list[float], *, current: float | None = None,
     对波动率这种厚尾变量差别极大，而它恰恰是期权定价的核心输入。
     """
     S.apply_style()
-    fig, ax = plt.subplots(figsize=(5.2, 2.4))
+    fig, ax = plt.subplots(figsize=(5.2, 1.92))
     ax.hist(values, bins=bins, color=S.PRIMARY, alpha=0.55,
             edgecolor="white", linewidth=0.6, zorder=2)
     cur = current if current is not None else values[-1]
@@ -412,12 +466,12 @@ def histogram(values: list[float], *, current: float | None = None,
     lab = f"当前 {cur:,.1f}"
     if pctl is not None:
         lab += f"（{pctl:.1f}%分位）"
-    ax.annotate(lab, (cur, ax.get_ylim()[1] * 0.92), ha="center", fontsize=8.5,
+    ax.annotate(lab, (cur, ax.get_ylim()[1] * 0.92), ha="center", fontsize=7.5,
                 fontweight="bold", color=S.INK,
                 bbox=dict(boxstyle="round,pad=0.3", fc=S.SURFACE, ec=S.GRID, lw=0.6))
     if xlabel:
-        ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel("交易日数", fontsize=9)
+        ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel("交易日数", fontsize=8)
     if title:
         ax.set_title(title, fontweight="bold", color=S.INK, pad=10)
     ax.grid(axis="x", visible=False)

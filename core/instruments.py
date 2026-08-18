@@ -14,7 +14,10 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field as dfield
+
+from . import config
 
 # 标签词表（供筛选与 LLM 匹配；勿随意新造，保持可控）
 # 市值风格
@@ -38,7 +41,10 @@ T_NEWENERGY = "新能源"
 T_CYCLE = "周期"
 T_MILITARY = "军工"
 T_ROBOT = "机器人"
+T_COMM = "通信"
 T_REALESTATE = "地产"
+T_MEDIA = "传媒"
+T_UTILITY = "公用事业"
 # 地域
 T_OVERSEA = "跨境"
 
@@ -112,6 +118,8 @@ INSTRUMENTS: list[Instrument] = [
                [T_AI, T_TECH, T_GROWTH], "AI 主题另一表达"),
     Instrument("512720.SH", "计算机ETF", "国泰中证计算机主题ETF", "行业ETF",
                [T_TECH, T_GROWTH], "软件与信息技术"),
+    Instrument("515050.SH", "通信ETF", "华夏中证5G通信主题ETF", "行业ETF",
+               [T_COMM, T_TECH, T_GROWTH], "5G/通信设备，日均成交15.46亿，同类流动性最好（#73核对）"),
 
     # ---- 消费 / 医药 ----
     Instrument("159928.SZ", "消费ETF", "汇添富中证主要消费ETF", "行业ETF",
@@ -146,6 +154,24 @@ INSTRUMENTS: list[Instrument] = [
                [T_CYCLE, T_GROWTH], "稀土，资源+成长双属性"),
     Instrument("512660.SH", "军工ETF", "国泰中证军工ETF", "行业ETF",
                [T_MILITARY, T_GROWTH], "国防军工，事件驱动特征明显"),
+    Instrument("159930.SZ", "能源ETF", "汇添富中证能源ETF", "行业ETF",
+               [T_CYCLE, T_VALUE], "石油石化+煤炭等能源，日均成交1.17亿（#81实测）"),
+
+    # ---- 传媒 / 公用事业 / 新能源（#81 补池）----
+    # 这三只是「无映射板块」探测中**语义对口且过流动性门槛**的。
+    # 同批被否掉的语义错配项一并记下，避免以后再搜一遍：
+    #   旅游主题ETF（1.69亿）≠ 交通运输；动漫游戏ETF（7.11亿）是传媒的子集而非传媒；
+    #   稀土产业ETF（1.74亿）≠ 石油石化；电力公用事业 ≠ 申万「电力设备」（见下）。
+    # 流动性够 ≠ 可用，口径对不上就是张冠李戴，宁可空着让择优如实报"池中无对口标的"。
+    Instrument("512980.SH", "传媒ETF", "广发中证传媒ETF", "行业ETF",
+               [T_MEDIA, T_GROWTH], "传媒板块，日均成交3.98亿，同类中流动性最好（#81实测）"),
+    # ⚠ 这是**电力公用事业**（发电与电网运营，申万「公用事业」），
+    # **不是**申万「电力设备」（光伏/风电/储能的设备制造）。两者常被混用，
+    # 但成分股几乎不重叠，映射错了整份报告的成分股就错了（同 #61 的教训）。
+    Instrument("159611.SZ", "电力ETF", "广发中证全指电力公用事业ETF", "行业ETF",
+               [T_UTILITY, T_VALUE, T_DIVIDEND], "发电与电网运营，日均成交7.21亿（#81实测）"),
+    Instrument("516160.SH", "新能源ETF", "南方中证新能源ETF", "行业ETF",
+               [T_NEWENERGY, T_GROWTH], "新能源（光伏/风电/储能），日均成交1.90亿（#81实测）"),
 
     # ---- 机器人 / 智能制造 ----
     # 同类共 7 只（均已校验代码），按近20日日均成交额取流动性最好的两只入池：
@@ -205,7 +231,10 @@ def by_tags(tags: list[str], *, match_all: bool = False) -> list[Instrument]:
     return out
 
 
-# 板块 → 该板块的**默认挂钩标的**。人工维护，理由同本模块开头：不让模型自行匹配。
+# 板块 → 该板块的**默认挂钩标的**。定义放在 `underlying_map.json`，不写死在这里——
+# 这是交易台的判断（流动性、跟踪精度、做市意愿），跟 `sector_groups.json`（研究口径）
+# 同一类考虑：业务决策应能被业务方直接维护、留下修改痕迹，不该锁进代码。
+# 文件缺失或写坏时回退到下面的内置默认值，功能不受影响。
 #
 # 为什么需要它：报告分析的是**整个板块**，观点包交给 OptionHelper 时，挂钩标的就该是
 # 能表达这个板块的可交易工具，而不是数据阶段用的那只代表个股——
@@ -215,20 +244,43 @@ def by_tags(tags: list[str], *, match_all: bool = False) -> list[Instrument]:
 # ⚠ ETF 跟踪的指数与我们的板块口径**并不完全一致**（消费ETF 跟踪中证主要消费，
 # 而我们的"消费"是六个一级行业合并），这是真实存在的基差。故 `underlying_for`
 # 会把这层不一致如实说出来，由定价方决定怎么处理，而不是假装两者等同。
-_SECTOR_UNDERLYING: dict[str, str] = {
-    # 宽口径大类
+_DEFAULT_UNDERLYING: dict[str, str] = {
     "消费": "159928.SZ", "大消费": "159928.SZ", "必选消费": "159928.SZ",
-    # 一级行业
     "食品饮料": "515170.SH", "白酒": "512690.SH", "家用电器": "159996.SZ",
     "医药生物": "512010.SH", "半导体": "159995.SZ", "证券": "512880.SH",
     "银行": "512800.SH", "计算机": "512720.SH", "软件开发": "512720.SH",
     "有色金属": "512400.SH", "煤炭": "515220.SH", "钢铁": "515210.SH",
     "基础化工": "159870.SZ", "房地产": "512200.SH", "国防军工": "512660.SH",
-    # 机器人需求最终落到"自动化设备"这个一级行业上（见 #72 的口径解析），
-    # 故两个名字都映射到机器人ETF——分析口径是行业，可交易表达是主题ETF，
-    # 两者不完全等同，`underlying_for` 会把这层基差说出来。
     "自动化设备": "562500.SH", "机械设备": "562500.SH", "机器人": "562500.SH",
 }
+
+
+def _load_underlying_map() -> dict[str, str]:
+    """读 `underlying_map.json`，展平成 {板块名或别名: ETF代码}。
+
+    与 `universe._load_groups()` 同一套防御模式：文件缺失/损坏/内容空，
+    一律回退内置默认值，绝不让"文件坏了"变成"这个功能没了"。
+    """
+    path = config._PROJECT_ROOT / "underlying_map.json"
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return dict(_DEFAULT_UNDERLYING)
+
+    flat: dict[str, str] = {}
+    for name, spec in (d.get("映射") or {}).items():
+        code = str((spec or {}).get("代码") or "").strip()
+        if not code:
+            continue
+        for key in [name, *((spec or {}).get("别名") or [])]:
+            key = str(key).strip()
+            if key:
+                flat[key] = code
+    return flat or dict(_DEFAULT_UNDERLYING)
+
+
+_SECTOR_UNDERLYING: dict[str, str] = _load_underlying_map()
 
 
 def underlying_for(sector: str) -> tuple[Instrument | None, str]:
@@ -236,6 +288,9 @@ def underlying_for(sector: str) -> tuple[Instrument | None, str]:
 
     宁可返回 None 也不硬凑一个近似标的——挂错标的的代价由定价和对冲承担，
     而"这个板块暂无合适挂钩工具"本身就是有用的结论。
+
+    不做流动性校验（那是 `resolve_analysis_etf` 的事）——这个函数只回答
+    "映射表里有没有登记"，供 `resolve_analysis_etf` 与旧调用点复用。
     """
     s = (sector or "").strip()
     code = _SECTOR_UNDERLYING.get(s)
@@ -248,6 +303,47 @@ def underlying_for(sector: str) -> tuple[Instrument | None, str]:
     if inst.跟踪指数:
         note += f"，跟踪{inst.跟踪指数}"
     return inst, note
+
+
+# 日均成交额低于此值的 ETF 不采信其"自身价格序列"代表板块——
+# 实测机器人ETF同类两只，华夏562500日均7.4亿、天弘159770只有1.8亿，
+# 成交越薄，净值波动里混进的折溢价/流动性噪声占比越高，这时候把它自己的
+# 波动率读数当成"板块的真实波动率"会失真，不是板块在动，是这只ETF不活跃。
+_MIN_ETF_DAILY_AMT = 1e8   # 1亿元/日均（近20日）
+
+
+def resolve_analysis_etf(
+    sector: str, *, min_daily_amt: float = _MIN_ETF_DAILY_AMT, provider=None,
+) -> tuple[Instrument | None, str]:
+    """板块 → 一只**流动性够格、可直接拿自己价格数据来分析**的 ETF。
+
+    这是 #73 的核心判断点：多数板块类需求（消费/港股互联网/创新药/券商……）
+    不该再造一个独立的"成分股整体法聚合"当分析对象——六份参考模板没有一份
+    这么做，它们分析的就是最终要挂钩的那只 ETF 自己的价格/波动率/资金流。
+    该判断只对**行情类**字段（波动率/涨跌幅分位/换手率/成交额分位）成立；
+    PB/ROE 这类基本面数据 ETF 和它跟踪的指数都不直接提供（实测中证消费指数
+    PB 序列 0 点），这部分永远走成分股聚合，与本函数无关。
+
+    与 `underlying_for` 是同一个来源（`_SECTOR_UNDERLYING`），但多一道
+    流动性闸门：查不到映射、或查到了但成交太薄，都返回 None——
+    此时调用方应退回成分股聚合口径，而不是拿一只不活跃的 ETF 冒充板块表现。
+    """
+    inst, note = underlying_for(sector)
+    if inst is None:
+        return None, note
+
+    from . import history as h
+
+    m, _missing = h.series_multi([inst.代码], "ths_amt_stock", years=1, provider=provider)
+    s = m.get(inst.代码) or {}
+    days = sorted(s)[-20:]
+    if len(days) < 10:
+        return None, f"{inst.简称}（{inst.代码}）成交额序列样本不足，无法判断流动性"
+    avg = sum(s[d] for d in days) / len(days)
+    if avg < min_daily_amt:
+        return None, (f"{inst.简称}（{inst.代码}）近20日日均成交额仅{avg / 1e8:.2f}亿，"
+                      f"低于{min_daily_amt / 1e8:.0f}亿门槛，成交太薄不采信其自身价格序列")
+    return inst, f"{note}（近20日日均成交{avg / 1e8:.1f}亿）"
 
 
 def catalog(for_llm: bool = True) -> list[dict]:

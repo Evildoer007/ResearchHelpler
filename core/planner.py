@@ -31,6 +31,12 @@ SRC_SPINE = "主轴"
 SRC_POOL = "可选池"
 SRC_FREE = "自由槽"
 
+# C4：这些论点对同一次报告里的所有标的判定结果完全相同——M 类只看宏观数据、
+# E4 只看法定披露日历，跟标的本身毫无关系。LLM 选主轴时按"尽量跨类别"择优，
+# 这批论点因为总来自"新类别"而显得有吸引力，实测 M3b/M6 常驻触发、频繁双双入选，
+# 挤占了真正体现标的差异化的角度。硬性限制自动模式下最多 1 条入选正文主轴。
+_MARKET_LEVEL_IDS = {"E4", "M1", "M2", "M3", "M3b", "M4", "M4b", "M6", "M7"}
+
 # 研报观点在取数清单里的字段名前缀。pipeline 据此把它们从取数层排除
 # （值不是查出来的，是研报原文），并直接包装成 FieldValue 交给 writer。
 DOC_FIELD_PREFIX = "研报依据·"
@@ -299,6 +305,45 @@ def _postprocess(topic: str, genre: dict, raw: dict,
             logics.append(new_lg)
             spine_items.append(new_lg)
             cats.add(f["类别"])
+
+    if not chosen:
+        # C4：市场级论点最多 1 条入选正文主轴，多出的降级为可选池，
+        # 并尽量用非市场级的已触发论点补回原有条数（跨类别优先），
+        # 补不到就少一条——好过让"同类论点"顶替真正区分标的的角度。
+        market_in_spine = [lg for lg in spine_items if lg.逻辑id in _MARKET_LEVEL_IDS]
+        if len(market_in_spine) > 1:
+            target = len(spine_items)
+            demoted = market_in_spine[1:]     # 保留 LLM 排在最前的一条
+            for lg in demoted:
+                lg.来源 = SRC_POOL
+            spine_items = [lg for lg in spine_items if lg not in demoted]
+            have = {lg.逻辑id for lg in spine_items} | {lg.逻辑id for lg in demoted}
+            # ① 优先从已有的可选池/自由槽里捞非市场级候选，不凭空多算一次触发
+            for lg in logics:
+                if len(spine_items) >= target:
+                    break
+                if lg.来源 == SRC_SPINE or lg.逻辑id in have or lg.逻辑id in _MARKET_LEVEL_IDS:
+                    continue
+                lg.来源 = SRC_SPINE
+                spine_items.append(lg)
+                have.add(lg.逻辑id)
+            # ② 仍不够，从触发结果里补新的（同前面 <2 分支的补法：跨类别优先）
+            if len(spine_items) < target:
+                cats = {fired_map[lg.逻辑id]["类别"] for lg in spine_items if lg.逻辑id in fired_map}
+                pending = [f for f in fired
+                          if f["论点id"] not in have and f["论点id"] not in _MARKET_LEVEL_IDS]
+                for f in sorted(pending, key=lambda x: x["类别"] in cats):
+                    if len(spine_items) >= target:
+                        break
+                    new_lg = PlanLogic(
+                        逻辑id=f["论点id"], 标题=f["名称"], 来源=SRC_SPINE,
+                        具体论点=f.get("触发依据", ""), 所需数据字段=list(f.get("所需数据字段", [])),
+                        结构方向倾向=f.get("方向", ""),
+                    )
+                    logics.append(new_lg)
+                    spine_items.append(new_lg)
+                    have.add(new_lg.逻辑id)
+                    cats.add(f["类别"])
 
     # 主轴缺字段时用论点库声明的字段依赖补齐——LLM 有时只填一两个，
     # 缺了字段这条论点在正文里就没数字可摆。

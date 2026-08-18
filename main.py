@@ -7,6 +7,10 @@
       python main.py            # 打印候选清单
       python main.py 1 4        # 生成第 1、4 个候选的一页通
 
+加 --pdf 同时导出 PDF（A2，走 QtWebEngine）：
+      python main.py -b "需求…" --pdf
+  默认只出 HTML；--pdf 会额外渲染一份 PDF 并报出**真实页数**。
+
 加 --pick 进入**人工勾选论点**模式（DESIGN §7.4）：
       python main.py -b "需求…" --pick
   先打印本次被真实数据触发的论点清单，由分析师勾选 2~3 条作正文主轴，
@@ -23,7 +27,19 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from core import brief, pipeline, thesis, topics, validator, writer
+# 终端输出含 ✓ ✗ ⚠ 与中文，而 Windows 控制台/重定向默认走 GBK，
+# 一遇到这些字符就 UnicodeEncodeError 整个进程崩掉——报告已经生成完了，
+# 却因为一句提示语打不出来而报错退出。各测试脚本一直在自己开头做这件事，
+# 入口反而漏了。放在 import 之后、任何 print 之前。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):   # 已是 utf-8 或不支持 reconfigure
+        pass
+
+_WANT_PDF = False        # 由 --pdf 打开，见 main()
+
+from core import brief, overrides as ov, pipeline, thesis, topics, validator, writer
 from render import gaps, layout
 
 
@@ -37,7 +53,11 @@ def _finish(ma, title: str) -> str | None:
         print(f"  ✗ 规划/取数失败：{ma.error}")
         return None
     auto = sum(len(lw.auto) for lw in ma.logics)
-    print(f"  · 规划 {len(ma.logics)} 条逻辑，自动取数 {auto} 项，缺口 {len(ma.gap_fields)} 项")
+    手填 = [f for f, v in ma.field_values.items() if ov.is_manual(v)]
+    print(f"  · 规划 {len(ma.logics)} 条逻辑，自动取数 {auto} 项，缺口 {len(ma.gap_fields)} 项"
+          + (f"，人工填写 {len(手填)} 项" if 手填 else ""))
+    if 手填:
+        print(f"      人工填写字段（来源见底稿）：{'、'.join(手填)}")
     if ma.gap_fields:
         # 连原因一起打印。只报字段名时排查会误判——实测把 akshare 接口故障
         # 当成了板块名匹配 bug，两者的 note 其实写得很清楚，只是没被显示出来。
@@ -45,8 +65,10 @@ def _finish(ma, title: str) -> str | None:
         for f in ma.gap_fields:
             fv = ma.field_values.get(f)
             print(f"        · {f}：{getattr(fv, 'note', '') or '原因未记录'}")
-    if ma.外部事实待补:
-        print(f"  · 外部事实待人工填写：{ma.外部事实待补}")
+    # 外部事实待补**不在终端打印**：它此刻无法行动（要填覆盖文件再重跑），
+    # 完整清单连同可复制的覆盖文件模板都在内部底稿里，末尾会给出路径。
+    if ma.外部事实已填:
+        print(f"  · 已采用人工填写的外部事实 {len(ma.外部事实已填)} 条")
 
     rc = writer.write(ma)
     if not rc.ok:
@@ -77,6 +99,20 @@ def _finish(ma, title: str) -> str | None:
     # 分析口径、观点包、缺口、复核项合成一份，不拆成多个文件让人对着看（#70）。
     gap_path = gaps.write_gap_report(ma, rc, vr, title=title, html_path=out)
     print(f"  ✓ 内部底稿：{gap_path}")
+
+    # PDF 导出（A2）。默认关闭：启动 Chromium 约 3~5 秒，批量生成时不该每份都付这个代价。
+    # 打开时顺便报**真实页数**——这是"一页通到底是不是一页"的唯一权威答案，
+    # 底稿里的版面预算只是不启动 Qt 时的粗估（见 gaps._page_budget）。
+    if _WANT_PDF:
+        try:
+            from render import pdf_out
+
+            pdf = pdf_out.html_to_pdf(out)
+            n = pdf_out.page_count(pdf)
+            flag = "" if n == 1 else f"　⚠ 一页通应为 1 页，请看底稿「版面预算」"
+            print(f"  ✓ PDF：{pdf}（{n} 页）{flag}")
+        except Exception as e:
+            print(f"  ⚠ PDF 导出失败（不影响 HTML 与底稿）：{type(e).__name__}: {e}")
     return out
 
 
@@ -138,11 +174,24 @@ def generate(cand: topics.TopicCandidate, *, pick: bool = False) -> str | None:
     return _finish(ma, cand.主题)
 
 
-def generate_from_brief(text: str, *, pick: bool = False) -> str | None:
+def generate_from_brief(text: str, *, pick: bool = False,
+                        overrides_path: str = "") -> str | None:
     """A路径【主】：人工给一段口语化需求 → 解析 → 生成一页通。"""
+    o = ov.load(overrides_path)
+    if not o.ok:
+        # 覆盖文件不合法直接停，不静默忽略——静默忽略会让分析师以为自己补上了，
+        # 而报告里那条依然是缺的，且他不会再去检查（同 resolve_sector 的 n==0 处置）。
+        print("✗ 覆盖文件不可用，已中止：")
+        for e in o.errors:
+            print(f"    · {e}")
+        print(f"  可覆盖字段共 {len(ov.overridable_fields())} 个，"
+              f"清单见 `python -m core.overrides`")
+        return None
+
     print("解析需求…")
     b = brief.parse(text)
-    print(brief.render(b))
+    # 略去"外部事实待补"：此刻无法行动，完整清单与覆盖模板都在内部底稿里
+    print(brief.render(b, 含外部事实=False))
     if not b.ok:
         return None
     t = b.代表标的
@@ -150,14 +199,18 @@ def generate_from_brief(text: str, *, pick: bool = False) -> str | None:
         print("  ⚠ 未能确定可用的代表标的，请人工指定证券代码后重试。")
         return None
     print(f"\n▶ 生成：{b.主题}  代表标的 {t.名称} {t.代码}")
+    if not o.为空:
+        print(f"  · 已载入覆盖文件 {o.path}"
+              f"（字段 {len(o.字段覆盖)} 项、外部事实 {len(o.外部事实)} 条）")
 
     prepared = chosen = None
     if pick:
         print("  摸底取数、跑触发引擎、抽取 sources/ 研报…")
-        prepared = pipeline.prepare_from_brief(b, with_docs=True)
+        prepared = pipeline.prepare_from_brief(b, with_docs=True, overrides=o)
         if prepared is not None:
             chosen = _ask_picks(prepared)
-    return _finish(pipeline.run_from_brief(b, prepared=prepared, chosen=chosen), b.主题)
+    return _finish(pipeline.run_from_brief(b, prepared=prepared, chosen=chosen,
+                                           overrides=o), b.主题)
 
 
 def main() -> None:
@@ -165,13 +218,30 @@ def main() -> None:
     pick = "--pick" in args
     args = [a for a in args if a != "--pick"]
 
+    # --pdf：导出 PDF（A2）。默认不开——启动 Chromium 约 3~5 秒，
+    # 批量生成时不该每份都付这个代价；要发给客户时再加这个开关。
+    global _WANT_PDF
+    if "--pdf" in args:
+        _WANT_PDF = True
+        args = [a for a in args if a != "--pdf"]
+
+    # --overrides 路径：人工补数文件（模板由内部底稿生成，复制填好即可）
+    overrides_path = ""
+    if "--overrides" in args:
+        i = args.index("--overrides")
+        if i + 1 >= len(args):
+            print("用法：--overrides 覆盖文件.json")
+            return
+        overrides_path = args[i + 1]
+        args = args[:i] + args[i + 2:]
+
     # A【主路径】人工给需求
     if args and args[0] in ("-b", "--brief"):
         text = " ".join(args[1:]).strip()
         if not text:
             print('用法：python main.py -b "你的需求，例如：昨晚SK海力士发了业绩……"')
             return
-        generate_from_brief(text, pick=pick)
+        generate_from_brief(text, pick=pick, overrides_path=overrides_path)
         return
 
     # B【辅路径】App 扫市场推荐候选

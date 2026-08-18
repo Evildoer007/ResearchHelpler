@@ -29,6 +29,13 @@ DEFAULT_ORG = "【机构名称】· 金融衍生品业务"
 CSS_DPI = 90
 RENDER_DPI = CSS_DPI * 2
 
+# 每条逻辑最多渲染几张图。**版面预算的硬约束**，不是审美偏好——
+# 实测每条 3 张时全篇 9 张占 1125px，而整页可用高度仅约 1160px。
+# 两张能并排共一行（约165px），第三张必然独占一行（约210px）。
+# gaps 的「图表体检」与「版面预算」也按这个数算，三处共用一个常量，
+# 避免"体检报的不是读者看到的东西"（同 `_effective_type` 那处的教训）。
+MAX_CHARTS_PER_LOGIC = 2
+
 
 def _fig_to_datauri(fig) -> str:
     buf = io.BytesIO()
@@ -98,6 +105,18 @@ def _esc(s) -> str:
     """转义进 HTML 的文本。图表标签来自 LLM 与研报原文，可能含 < & 等字符。"""
     return (str(s).replace("&", "&amp;").replace("<", "&lt;")
             .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _rich(s) -> str:
+    """正文富文本：先转义，再把 `**重点**` 渲染成加粗（#82）。
+
+    顺序不能倒——必须**先转义再解析标记**，否则正文里若出现 `<` 会被当成标签。
+    此前 `**…**` 原样印在版面上（写作要求里让模型标重点，渲染层却不认），
+    读者看到的是一堆星号；或者更糟，模型学乖了干脆不标，重点就全丢了。
+    """
+    out = _esc(s)
+    # 非贪婪，且不允许跨越换行——避免一处漏配对把后面整段吞成粗体
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
 
 
 # ---------------- HTML 原生图表 ----------------
@@ -223,14 +242,17 @@ def _one_chart(spec: dict, logic_id: str) -> str:
 
 
 def _chart_block(lc) -> str:
-    """产出该逻辑**全部**图表的 HTML（1~3 张并排），无图则空串。
+    """产出该逻辑全部图表的 HTML（1~2 张并排），无图则空串。
 
-    一条逻辑最多 3 张图，来自 writer 的 `图表规格列表`——不再固定一张。
-    并排而非竖排：每张图已按显示宽度收窄到正文宽的 53~74%（#59），
-    两三张并排仍在一页宽度内，且比竖向堆叠更省纵向版面（一页通版面寸土寸金）。
+    **上限 2 张，代码硬卡**（#81）：提示词里的"给 1~2 项"是倾向不是保证，
+    实测 LLM 会顶格给到 3/3/3，全篇 9 张图占 1125px，而整页可用高度仅约 1160px——
+    光图就把版面吃满。两张在版面上并排共一行（约165px），第三张必然独占一行
+    （约210px，相当于 580 字正文），是最不划算的一张。
+    多出来的直接丢弃而不是渲染出去：一页通的硬约束是"一页"，
+    宁可少一张图，也不要让成品变成两页。
     """
     lid = getattr(lc, "逻辑id", "?")
-    specs = (getattr(lc, "图表规格列表", None) or [])[:3]
+    specs = (getattr(lc, "图表规格列表", None) or [])[:MAX_CHARTS_PER_LOGIC]
     blocks = [b for b in (_one_chart(s or {}, lid) for s in specs) if b]
     if not blocks:
         return ""
@@ -332,70 +354,134 @@ def _chart_for(lc) -> str | None:
 
 
 _CSS = """
+/* ⚠ 思源黑体在 Windows 上的字重陷阱（#82 实测）：
+   Adobe 把 Regular/Bold 以外的字重注册成**各自独立的 GDI 家族名**——
+     Source Han Sans SC         只含 Regular(400) + Bold(700)
+     Source Han Sans SC Medium  是另一个家族
+     Source Han Sans SC Heavy   又是另一个家族
+   所以 `font-family:"Source Han Sans SC"; font-weight:500` 在这个家族里
+   找不到 Medium，浏览器**静默回落 Regular**；写 900 同理只得到 Bold。
+   两次"加粗"因此都没生效，看上去仍然细。
+   正确做法是按真实家族名引用，并把基础家族列在后面兜底：
+   命中专用家族时其自带字重生效，命中不到时由 font-weight 数值作用于基础家族。 */
+:root {
+  --f-fallback: "Noto Sans CJK SC","HarmonyOS Sans SC","Alibaba PuHuiTi","DengXian","等线",sans-serif;
+  --f-reg: "Source Han Sans SC", var(--f-fallback);
+  --f-med: "Source Han Sans SC Medium","Source Han Sans SC", var(--f-fallback);
+  --f-heavy: "Source Han Sans SC Heavy","Source Han Sans SC", var(--f-fallback);
+}
+
 * { box-sizing: border-box; }
-body { margin:0; background:#f0eeec; font-family:"Microsoft YaHei","微软雅黑",sans-serif; color:#2B2B2B; }
-.page { width:820px; margin:16px auto; background:#fff; padding:28px 34px; box-shadow:0 2px 12px rgba(0,0,0,.12); }
-.top { display:flex; justify-content:space-between; font-size:12px; color:#8A8A8A; border-bottom:1px solid #E6E3E1; padding-bottom:8px; }
-h1 { font-size:22px; color:#2B2B2B; margin:14px 0 4px; }
-h1 .accent { color:#A32C2C; }
-.sub { font-size:12px; color:#8A8A8A; margin-bottom:14px; }
-.concl { background:#F8EFEE; border-left:4px solid #A32C2C; padding:12px 14px; margin:10px 0 20px; font-size:13.5px; line-height:1.7; }
-.concl .lbl { color:#A32C2C; font-weight:bold; letter-spacing:2px; margin-right:8px; }
+/* 字体优先可商用（思源黑体/Noto/鸿蒙/普惠体，均 SIL OFL 或官方免费商用），
+   本机未装则回落等线；**不列微软雅黑**——它是方正授权给微软的，商用需另行授权，
+   而这份东西是要发给客户的。与 render/style.py 的 FONT_STACK 保持同一优先级，
+   否则图里的字和正文的字会是两种字体。 */
+/* 极淡米黄底（#82）：纯白版面在长文档里发刺眼，暖底更接近纸感；
+   外围比页面略深一档，页面才"浮"得起来。图表画布同色（style.SURFACE），
+   避免图在米黄页面上呈现为一块块白方块。 */
+body { margin:0; background:#F7F0EF; color:#2B2724;
+       font-family:var(--f-reg); }
+/* ⚠ 版面宽度必须对齐纸张（#83 实测）：原先 width:820px + padding 32px×2
+   在 content-box 下实占 884px，而 A4 在 96dpi 下只有 794px——**宽出 90px**。
+   只做 HTML 时看不出来（浏览器可横向滚），一导 PDF 就右边被裁。
+   改为 border-box + 794px：padding 含在宽内，正文净宽 794-60=734px。 */
+.page { box-sizing:border-box; width:794px; margin:14px auto; background:#FEFBFA;
+        padding:22px 30px; box-shadow:0 2px 12px rgba(0,0,0,.12); }
+
+/* 打印/导 PDF 时：纸张 A4、零边距（版面自带 padding），去掉屏幕用的投影与外底色 */
+@page { size:A4; margin:0; }
+@media print {
+  body { background:#fff; margin:0; }
+  .page { margin:0; box-shadow:none; }
+}
+/* 标题直接顶在最上面：原先上方有一行机构名+日期的页眉，已按要求去掉 */
+/* 字重（#82）：思源黑体可用 500/700/900。主标题用 900 拉开层级，
+   正文 500 保证长文可读，行内重点 <b> 直接跳到 900 —— 500→900 的
+   落差比 500→700 明显得多，重点才真正"跳"出来。 */
+h1 { font-size:16px; color:#2B2724; margin:0 0 3px; line-height:1.35;
+     font-family:var(--f-heavy); font-weight:700; }
+h1 .accent { color:#9B2226; }
+.sub { font-size:10px; color:#8A837C; margin-bottom:10px; }
+/* 正文与核心结论的字号：#80 一并下调，换取更长的论述而版面高度不涨。
+   一页通的约束是"一页"，不是"字少"——同样的高度里，小一号字能多容
+   约三成内容，而 12px/12.5px 在 820px 宽的版面上仍清晰可读。 */
+.concl { background:#FDF7F6; border-left:3px solid #9B2226; padding:9px 11px; margin:7px 0 12px; font-size:11px; line-height:1.62; font-family:var(--f-med); font-weight:500; }
+.concl .lbl { color:#9B2226; font-family:var(--f-heavy); font-weight:700; letter-spacing:2px; margin-right:8px; }
+.concl b { font-family:var(--f-heavy); font-weight:700; color:#9B2226; }
 .logic { margin:18px 0; }
-.tag { display:inline-block; background:#A32C2C; color:#fff; font-size:12px; padding:2px 10px; border-radius:2px; margin-right:8px; }
-.ltitle { font-size:16px; font-weight:bold; color:#2B2B2B; }
-.body { font-size:13px; line-height:1.75; color:#444; margin:8px 0; }
+.tag { display:inline-block; background:#9B2226; color:#fff; font-size:9.5px; padding:1px 7px; border-radius:2px; margin-right:6px; font-weight:700; }
+.ltitle { font-size:12px; font-family:var(--f-heavy); font-weight:700; color:#2B2724; }
+/* 字重 500 = 思源黑体 Medium。Regular(400) 在小字号下偏细，观感发灰；
+   Medium 更接近传统黑体的密度，正文读起来更实。重点由 <b>(700) 承担。 */
+.body { font-size:10.5px; line-height:1.62; color:#332F2B; margin:5px 0;
+        font-family:var(--f-med); font-weight:500; }
+.body b { font-family:var(--f-heavy); font-weight:700; color:#9B2226; }
 .chart { text-align:center; margin:10px 0; }
 /* 宽度由 <img width> 按 CSS_DPI 定死，这里只兜底防溢出 */
 .chart img { max-width:100%; height:auto; }
 /* 一条逻辑配 2~3 张图时并排显示（而非竖向堆叠），省纵向版面。
    每张图已收窄到正文宽的 53~74%，故用 wrap 而非硬挤一行——
    两张通常并得下，第三张若挤不下会自动换到下一行，不会溢出页面。 */
-.chart-row { display:flex; flex-wrap:wrap; justify-content:center; gap:8px; margin:10px 0; }
-.chart-row .chart, .chart-row .htmlchart { margin:0; flex:0 1 auto; }
+/* 并排是**省纵向版面**的关键，但此前没真生效：每张图按 CSS_DPI 定死了
+   width（396~576px），两张就超出 752px 的内容宽，flex-wrap 把它们全换了行——
+   实测每个 chart-row 的图宽合计 828~1440px，无一并排成功，等于一张一行。
+   改成 flex 基准宽 + img 跟随容器，两张才真能共一行（各约372px，约原宽77%，
+   图内文字仍清晰）；三张时第三张换行，靠 max-width 防止它被拉满整行。 */
+.chart-row { display:flex; flex-wrap:wrap; justify-content:center; gap:8px; margin:10px 0;
+             align-items:flex-start; }
+.chart-row .chart, .chart-row .htmlchart { margin:0; flex:1 1 340px; min-width:0; max-width:400px; }
+.chart-row .chart img { width:100%; height:auto; }
 
 /* ---- HTML 原生图表（排版型，不走 matplotlib）---- */
 /* 限宽并居中，与 matplotlib 图的显示宽度（约 55~70% 正文宽）保持一致，
    否则排版型图会通栏、数值型图偏窄，同一页里两种图一大一小很割裂 */
-.htmlchart { text-align:left; border:1px solid #E6E3E1; background:#FCFAF9; padding:10px 12px;
+.htmlchart { text-align:left; border:1px solid #E4DFD6; background:#FCFAF9; padding:10px 12px;
              max-width:560px; margin:0 auto; font-size:12px; }
-.c-title { font-size:13px; font-weight:bold; color:#A32C2C; text-align:center; margin-bottom:10px; }
+.c-title { font-size:11px; font-family:var(--f-heavy); font-weight:700; color:#9B2226; text-align:center; margin-bottom:7px; }
 
 /* 分位标尺 */
 .g-row { margin:10px 0; }
-.g-head { display:flex; justify-content:space-between; font-size:12px; color:#2B2B2B; margin-bottom:4px; }
-.g-head .g-val { color:#A32C2C; font-weight:bold; }
+.g-head { display:flex; justify-content:space-between; font-size:12px; color:#2B2724; margin-bottom:4px; }
+.g-head .g-val { color:#9B2226; font-weight:bold; }
 .g-track { position:relative; height:10px; background:#EDE8E6; border-radius:5px; }
 .g-fill { position:absolute; left:0; top:0; height:100%; background:#D9BFBF; border-radius:5px 0 0 5px; }
-.g-dot { position:absolute; top:-3px; width:4px; height:16px; background:#A32C2C; border-radius:2px; transform:translateX(-2px); }
-.g-thr { position:absolute; top:-2px; width:1px; height:14px; background:#8A8A8A; }
-.g-thrlab { position:absolute; top:14px; font-size:9px; color:#8A8A8A; transform:translateX(-50%); white-space:nowrap; }
-.g-foot { display:flex; justify-content:space-between; font-size:10px; color:#8A8A8A; margin-top:12px; }
+.g-dot { position:absolute; top:-3px; width:4px; height:16px; background:#9B2226; border-radius:2px; transform:translateX(-2px); }
+.g-thr { position:absolute; top:-2px; width:1px; height:14px; background:#8A837C; }
+.g-thrlab { position:absolute; top:14px; font-size:9px; color:#8A837C; transform:translateX(-50%); white-space:nowrap; }
+.g-foot { display:flex; justify-content:space-between; font-size:10px; color:#8A837C; margin-top:12px; }
 
 /* 两列对照 */
 .tc { display:flex; gap:12px; }
-.tc-col { flex:1; border:1px solid #E6E3E1; padding:8px 10px; }
+.tc-col { flex:1; border:1px solid #E4DFD6; padding:8px 10px; }
 .tc-col.tc-0 { background:#FBF3F2; }
 .tc-col.tc-1 { background:#F1F7F3; }
 .tc-head { font-size:12px; font-weight:bold; color:#6f6f6f; text-align:center; margin-bottom:6px; }
 .tc-col ul { list-style:none; margin:0; padding:0; }
-.tc-col li { display:flex; justify-content:space-between; font-size:12px; line-height:1.9; }
-.tc-col li b { color:#A32C2C; }
+.tc-col li { display:flex; justify-content:space-between; font-size:11.5px; line-height:1.7; }
+.tc-col li b { color:#9B2226; }
 .tc-col.tc-1 li b { color:#2E8B57; }
-.tc-note { font-size:11.5px; font-weight:bold; color:#A32C2C; text-align:center; margin-top:8px; }
+.tc-note { font-size:11.5px; font-weight:bold; color:#9B2226; text-align:center; margin-top:8px; }
 
 /* 对比卡片组 */
 .cc { display:flex; gap:10px; }
-.cc-card { flex:1; border:1px solid #E6E3E1; background:#F6F2F0; padding:10px; text-align:center; }
-.cc-card.cc-hi { border:1.5px solid #A32C2C; background:#FBF3F2; }
-.cc-h { font-size:13px; font-weight:bold; color:#2B2B2B; margin-bottom:8px; }
+.cc-card { flex:1; border:1px solid #E4DFD6; background:#F6F1E6; padding:10px; text-align:center; }
+.cc-card.cc-hi { border:1.5px solid #9B2226; background:#FBF3F2; }
+.cc-h { font-size:13px; font-weight:bold; color:#2B2724; margin-bottom:8px; }
 .cc-card ul { list-style:none; margin:0 0 8px; padding:0; }
-.cc-card li { font-size:11.5px; color:#6f6f6f; line-height:1.9; }
-.cc-card.cc-hi li { color:#2B2B2B; font-weight:bold; }
-.cc-cl { font-size:12px; font-weight:bold; color:#A32C2C; border-top:1px solid #E6E3E1; padding-top:6px; }
-.pool { font-size:12px; color:#8A8A8A; border-top:1px dashed #E6E3E1; padding-top:8px; margin-top:14px; }
-.src { font-size:11px; color:#6f6f6f; border-top:1px solid #E6E3E1; margin-top:18px; padding-top:8px; line-height:1.7; }
-.foot { font-size:11px; color:#9a9a9a; border-top:1px solid #E6E3E1; margin-top:20px; padding-top:8px; line-height:1.6; }
+.cc-card li { font-size:11px; color:#6f6f6f; line-height:1.7; }
+.cc-card.cc-hi li { color:#2B2724; font-weight:bold; }
+.cc-cl { font-size:12px; font-weight:bold; color:#9B2226; border-top:1px solid #E4DFD6; padding-top:6px; }
+.pool { font-size:11.5px; color:#8A837C; border-top:1px dashed #E4DFD6; padding-top:7px; margin-top:12px; }
+.under { border:1px solid #E0D6D2; border-left:3px solid #8E1B23; background:#FCF9F8;
+         border-radius:3px; padding:9px 12px; margin-top:14px; }
+.under .lbl { display:inline-block; font-size:11px; font-weight:700; color:#8E1B23;
+              letter-spacing:1px; margin-bottom:4px; }
+.u-main { font-size:13px; color:#2b2b2b; line-height:1.6; }
+.u-why { font-size:12px; color:#4a4a4a; line-height:1.65; margin-top:4px; }
+.u-note { font-size:11px; color:#9a9a9a; margin-top:5px; }
+.src { font-size:10.5px; color:#6f6f6f; border-top:1px solid #E4DFD6; margin-top:14px; padding-top:7px; line-height:1.55; }
+.foot { font-size:9px; color:#938C84; border-top:1px solid #E4DFD6; margin-top:15px; padding-top:7px; line-height:1.55; }
+.ft-line { margin-top:3px; }
 """
 
 _CN_NUM = ["一", "二", "三", "四", "五", "六"]
@@ -405,16 +491,30 @@ _CN_NUM = ["一", "二", "三", "四", "五", "六"]
 _MISSING_CONCL = "（核心结论缺失：撰写与补写两轮均未产出，需人工补写后再交付）"
 
 
-def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "2026年7月") -> str:
+def _today_cn() -> str:
+    """报告日期 = **生成当天**。此前写死"2026年7月"，每份成品都印同一个月份，
+    与实际生成时间无关——读者据此判断时效会被误导（行情数据是当天的）。"""
+    import datetime as _dt
+
+    d = _dt.date.today()
+    return f"{d.year}年{d.month}月{d.day}日"
+
+
+def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "") -> str:
     """正文展开"主轴"标记的 2~3 条论点，其余（可选池/自由槽）压成一行补充观察。
 
     条数与"哪几条算主轴"由 planner 依据触发结果决定（DESIGN §7.2），此处只负责呈现。
     """
+    date = date or _today_cn()
     id2plan = {lg.逻辑id: lg for lg in ma.plan.logics}
 
     def title_of(lc):
         p = id2plan.get(lc.逻辑id)
-        return (p.标题 if p else lc.逻辑id), (p.来源 if p else SRC_SPINE)
+        # 优先用 writer 自拟的一句话标题（#82）：planner 那个基本是论点库的
+        # 类型名（"估值历史低分位"），当标题用等于给读者三个术语。
+        # writer 没给时回退到 planner 的，再不行才用 id——保证版面不会空着。
+        t = (getattr(lc, "标题", "") or "").strip() or (p.标题 if p else "") or lc.逻辑id
+        return t, (p.来源 if p else SRC_SPINE)
 
     # 论述为空的逻辑不进版面。LLM 偶发只写标题、正文留空（writer 已记入 rc.空缺逻辑），
     # 若照排会在成品里留下"策略逻辑二 ▶"这样的空壳——比少一条逻辑更糟：
@@ -422,7 +522,6 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "2026年7月") -> 
     # 宁可少一条也不留空壳；终端已有 ⚠ 提示，人可据此决定重跑或补写。
     body = [lc for lc in rc.logics if (lc.论述 or "").strip()]
     spine = [lc for lc in body if title_of(lc)[1] == SRC_SPINE]
-    pool = [lc for lc in body if title_of(lc)[1] != SRC_SPINE]
 
     sections = []
     for i, lc in enumerate(spine):
@@ -434,30 +533,115 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "2026年7月") -> 
         # 由它把每条逻辑的落点汇成观点包（见 §10）。
         sections.append(f"""
         <div class="logic">
-          <span class="tag">策略逻辑{_CN_NUM[i]}</span><span class="ltitle">{t}</span>
-          <div class="body">{lc.论述}</div>
+          <span class="tag">策略逻辑{_CN_NUM[i]}</span><span class="ltitle">{_esc(t)}</span>
+          <div class="body">{_rich(lc.论述)}</div>
           {chart_html}
         </div>""")
 
-    pool_html = ""
-    if pool:
-        items = "；".join(f"{title_of(lc)[0]}（{lc.结论.replace('**','')}）" for lc in pool)
-        pool_html = f'<div class="pool">补充观察：{items}</div>'
+    # 「补充观察」已按要求删除（#82）：它把可选池逻辑的 `结论` 压成一行印在版面上，
+    # 而 `结论` 自 #59 起写的是**给 OptionHelper 的市场含义**（"方向中性、
+    # 建议等待波动收敛、若波动率飙升则…"），是产品选择环节的输入、内部口吻，
+    # 印在客户版面上既突兀又与正文重复。可选池论点仍在内部底稿的观点包里可查。
 
-    sources_html = _sources_block(ma)
-
+    # ── 「挂钩标的与推荐结构」：版面上**预留但暂不渲染** ──────────────────
+    # 参考模板里这是**一整节**：标的卡片（为什么是它、代表什么暴露）
+    # ＋ 推荐结构·参考报价表（什么结构、什么条款、什么价）。两块合起来才是
+    # 这份报告的落点，而报价必须由 OptionHelper 给（本系统既无波动率曲面
+    # 也无报价，§10）。只出卡片、不出报价，等于在客户版面上占一块地方
+    # 却仍给不出真正的落点，不如整节等齐了再上。
+    #
+    # 挂钩标的、择优维度、每个候选的实测指标与理由，**已完整落在内部底稿**
+    # （「给 OptionHelper 的观点包」+「挂钩标的择优」两节），内部照常可查。
+    #
+    # → OptionHelper 接入时：在下方 {pool_html} 与 {sources_html} 之间
+    #   调用 `_underlying_block(ma, rc)`，并在其中补上报价表。
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>{_CSS}</style></head><body>
     <div class="page">
-      <div class="top"><span>{org}</span><span>策略研究 · {date}</span></div>
       <h1>场外衍生品投资策略 <span class="accent">—— {ma.plan.主题}</span></h1>
       <div class="sub">策略研究 · {date}</div>
       <div class="concl"><span class="lbl">核心结论</span>{rc.核心结论 or _MISSING_CONCL}</div>
       {''.join(sections)}
-      {pool_html}
-      {sources_html}
-      <div class="foot">本材料仅为策略研究与信息分享，不构成投资建议或销售要约；
-      示例数据与测算不代表未来表现。投资有风险，入市需谨慎。</div>
+      {_footer_block(ma)}
     </div></body></html>"""
+
+
+def _underlying_block(ma, rc) -> str:
+    """「挂钩标的与推荐结构」一节 —— **当前未接入版面**，等 OptionHelper 补齐报价后启用。
+
+    保留本函数是因为择优链路（B4）已经跑通，缺的只是报价那一半：
+    接上 OptionHelper 后在此补一张「推荐结构·参考报价」表，
+    再从 `build_html` 调用即可，不必重写。调用点与理由见 `build_html` 内注释。
+
+    与 #70 不冲突：#70 撤掉的是**内部工作信息**（板块口径、数据代表标的、
+    自有数据源），而"建议挂钩哪个标的、为什么"恰恰是模板里印给客户看的内容，
+    也是这份成品之前唯一缺的结论落点（"有分析、没有落点"）。
+
+    两类需求在这里汇合，都经 `viewpoint.build`：
+      · 板块类   → 分析对象与挂钩标的本就是同一只 ETF，理由取板块选取依据
+      · 产业趋势/事件驱动 → 分析对象不可交易，挂钩标的经择优映射而来，
+        理由取择优理由（§9.2②）——**这层映射必须写出来**，不允许分析 A 推荐 B
+        却对两者关系只字不提（见设计理念）。
+
+    报价栏仍留空并明说原因：定价属 OptionHelper，本系统既无波动率曲面也无报价，
+    越权给结构与价格就是无依据的断言（§10）。
+    """
+    try:
+        from core import viewpoint as vp
+
+        pkg = vp.build(ma, rc)
+    except Exception:
+        return ""
+    if not getattr(pkg, "ok", False) or not pkg.标的代码:
+        return ""
+
+    理由 = pkg.挂钩理由 or pkg.板块理由 or ""
+    rows = [f'<b>{pkg.标的名称}</b>（{pkg.标的代码}）']
+    if pkg.整体方向:
+        rows.append(f"整体方向：{pkg.整体方向}")
+    if pkg.波动率看法:
+        rows.append(pkg.波动率看法)
+    head = "　｜　".join(rows)
+    body = f'<div class="u-why">{理由}</div>' if 理由 else ""
+    return (f'<div class="under"><span class="lbl">挂钩标的</span>'
+            f'<div class="u-main">{head}</div>{body}'
+            f'<div class="u-note">推荐结构与参考报价由交易台依实时波动率曲面与报价确定，'
+            f'本页不含结构建议。</div></div>')
+
+
+_DISCLAIMER = (
+    "本材料仅为策略研究与信息分享，不构成投资建议或销售要约。"
+    "所述场外衍生品结构存在本金损失风险，具体结构条款与报价以交易台正式报价为准。"
+    "文中数据与测算基于历史行情与公开信息，历史表现不代表未来。"
+    "投资者应在充分理解产品结构与风险收益特征的基础上，"
+    "结合自身风险识别能力与风险承受意愿独立决策。投资有风险，入市需谨慎。"
+)
+
+
+def _footer_block(ma) -> str:
+    """页脚：数据来源 + 风险提示与免责声明，灰字，对标模板版式。
+
+    ⚠ 与 #70「内部信息撤出版面」不冲突。#70 撤掉的是**内部工作信息**
+    （板块口径怎么定的、数据代表标的是谁、宽口径展开了哪几个行业）；
+    而"数据来源"是**对第三方内容的署名**，参考模板每一份都印在页脚
+    （"数据来源：Wind、国泰海通证券研究"），属于合规要求而非内部信息。
+    研报引用同理，仍随成品固化——`sources/` 是用完即清的工作台，
+    出处不落进产出，原 PDF 一删引用就断线。
+    """
+    from core.planner import DOC_FIELD_PREFIX
+
+    srcs = ["iFinD（同花顺）"]
+    for name, fv in (ma.field_values or {}).items():
+        if not isinstance(name, str) or not name.startswith(DOC_FIELD_PREFIX):
+            continue
+        if not getattr(fv, "ok", False):
+            continue
+        cite = f"{fv.source}".strip()
+        if cite and cite not in srcs:
+            srcs.append(cite)
+    return (f'<div class="foot">'
+            f'<div class="ft-line">数据来源：{_esc("、".join(srcs))}</div>'
+            f'<div class="ft-line">风险提示与免责声明：{_DISCLAIMER}</div>'
+            f'</div>')
 
 
 def _sources_block(ma) -> str:

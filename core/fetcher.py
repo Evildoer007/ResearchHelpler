@@ -331,10 +331,21 @@ def _fetch_derived(field: str, code: str, provider: DataProvider) -> FieldValue 
 
 
 def _fetch_one(field: str, code: str, provider: DataProvider,
-               sector: str | None = None) -> FieldValue:
-    # 已实现的 DERIVED 计算字段。板块口径优先——这些字段在报告里是以"板块如何"
-    # 的口吻被引用的，就该按板块整体法算；只有拿不到板块序列时才退回代表标的（#69）。
+               sector: str | None = None, etf_code: str | None = None) -> FieldValue:
+    # 已实现的 DERIVED 计算字段。
+    #
+    # 行情类（波动率/涨跌幅分位/换手率/成交额分位）优先级（#73）：
+    #   ① 有一只流动性够格的 ETF 能代表这个板块 → 直接用它**自己的**真实价格数据。
+    #      六份参考模板没有一份为"板块"单独造聚合篮子，分析的就是最终要挂钩的那只
+    #      ETF 自身——这样"分析对象"与"挂钩标的"天然是同一个东西，不再有基差。
+    #   ② 没有合格 ETF（或成交太薄）→ 退回板块整体法聚合（#69）。
+    # PB历史分位不参与①：ETF 和它跟踪的指数都不直接提供 PB 历史序列
+    # （实测中证消费指数 PB 序列 0 点），这是数据源的硬限制，永远走②。
     if sector and field in _SECTOR_DERIVED:
+        if field != "PB历史分位" and etf_code:
+            fv = _fetch_derived(field, etf_code, provider)
+            if fv is not None:
+                return fv
         fv = _fetch_sector_derived(field, sector, provider)
         if fv is not None:
             return fv
@@ -395,7 +406,16 @@ def fetch_fields(
     返回 (结果列表, 缺口字段列表, provider)。
     """
     provider = provider or get_provider()
-    results = [_fetch_one(f, code, provider, sector) for f in fields]
+
+    # 分析ETF只解析一次（内含一次流动性查询），不要让 6 个 _SECTOR_DERIVED
+    # 字段各自重复查一遍——那是同一个问题问 6 次。
+    etf_code = None
+    if sector and any(f in _SECTOR_DERIVED for f in fields):
+        from . import instruments as inst
+        i, _note = inst.resolve_analysis_etf(sector, provider=provider)
+        etf_code = i.代码 if i else None
+
+    results = [_fetch_one(f, code, provider, sector, etf_code) for f in fields]
     gaps = [fv.field for fv in results if not fv.ok]
     return results, gaps, provider
 
