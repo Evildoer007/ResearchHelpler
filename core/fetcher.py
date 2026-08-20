@@ -161,7 +161,7 @@ _AGGREGATABLE = {
 
 
 def _fetch_aggregated(field: str, sector: str, provider: DataProvider) -> FieldValue | None:
-    """尝试用板块聚合值。失败返回 None，由调用方回退到代表标的。"""
+    """尝试用板块聚合值。失败返回 None——#85 起调用方据此**报缺口，不再退回代表个股**。"""
     from . import aggregate as ag
 
     try:
@@ -343,13 +343,19 @@ def _fetch_one(field: str, code: str, provider: DataProvider,
     # （实测中证消费指数 PB 序列 0 点），这是数据源的硬限制，永远走②。
     if sector and field in _SECTOR_DERIVED:
         if field != "PB历史分位" and etf_code:
-            fv = _fetch_derived(field, etf_code, provider)
-            if fv is not None:
-                return fv
+            # #73：分析对象是 ETF 时，行情类分位就用这只 ETF **自身**的真实价格序列。
+            # 成功或失败都以 ETF 口径返回——失败也是 ETF 代码来源的诚实缺口，
+            # 绝不退回代表个股冒充（_fetch_derived 对已实现字段不会返回 None）。
+            return _fetch_derived(field, etf_code, provider)
         fv = _fetch_sector_derived(field, sector, provider)
         if fv is not None:
             return fv
-    fv = _fetch_derived(field, code, provider)
+        # 板块整体法（#85 起用 ETF 真实成分）也取不到：如实缺口。
+        # **不以代表个股数据冒充板块**——分析的是板块/ETF，拿一只成分股的
+        # PB/波动率顶替是张冠李戴（用户实测点名的正是这条）。
+        return FieldValue(field, None, False, f"iFinD·{sector}板块", status="需人工补充",
+                          note="板块/ETF口径历史序列取数失败；按口径要求不以个股数据替代")
+    fv = _fetch_derived(field, code, provider)   # 无板块名：纯个股分析才走到这
     if fv is not None:
         return fv
 
@@ -365,11 +371,14 @@ def _fetch_one(field: str, code: str, provider: DataProvider,
         if fv is not None:
             return fv
 
-    # 可聚合字段：有板块名时用板块整体法（口径与研报一致），失败再回退代表标的
+    # 可聚合字段：有板块名时用板块整体法（口径与研报一致，#85 起用 ETF 真实成分）。
+    # 失败**不再回退代表个股**——分析 ETF 却写茅台的 PB/ROE 是张冠李戴（用户点名）。
     if sector and field in _AGGREGATABLE:
         fv = _fetch_aggregated(field, sector, provider)
         if fv is not None:
             return fv
+        return FieldValue(field, None, False, f"iFinD·{sector}板块", status="需人工补充",
+                          note="板块整体法取数失败；按口径要求不以个股数据替代")
 
     mapping = im.get_mapping(field)
 

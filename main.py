@@ -11,6 +11,14 @@
       python main.py -b "需求…" --pdf
   默认只出 HTML；--pdf 会额外渲染一份 PDF 并报出**真实页数**。
 
+加 --optionhelper card|report 接入 OptionHelper 完整版（推荐+定价+回测+报告）：
+      python main.py -b "需求…" --optionhelper card
+  card=研究简报，report=完整研究报告。需要三项前置（见 core/config.py）：
+  OPTIONHELPER_ROOT、能装下其 requirements.lock 的独立解释器（默认用项目自带
+  的 .optionhelper_venv）、IFIND_REFRESH_TOKEN（它自己的 iFind 凭证，与本项目
+  IFIND_ACCOUNT/PASSWORD 不是同一套）。缺任一项会在终端明确报缺什么，不静默跳过；
+  失败也不阻断——客户版面退回旧版"报价由交易台确定"的措辞。
+
 加 --pick 进入**人工勾选论点**模式（DESIGN §7.4）：
       python main.py -b "需求…" --pick
   先打印本次被真实数据触发的论点清单，由分析师勾选 2~3 条作正文主轴，
@@ -38,6 +46,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 _WANT_PDF = False        # 由 --pdf 打开，见 main()
+_OH_OUTPUT = ""          # 由 --optionhelper card|report 打开，见 main()
 
 from core import brief, overrides as ov, pipeline, thesis, topics, validator, writer
 from render import gaps, layout
@@ -88,16 +97,40 @@ def _finish(ma, title: str) -> str | None:
         else:
             print(f"      ✗ [{f.位置}] {f.数字} 无匹配真值")
 
+    # OptionHelper 完整版（推荐+定价+回测+报告）。默认关闭：真实取数+路径回测
+    # 比一次 LLM 调用慢得多，且依赖外部隔离环境和 iFind Refresh Token，
+    # 不该拖累日常批量生成。开了但失败也不阻断——见 optionhelper_bridge 里的说明。
+    oh_result = None
+    if _OH_OUTPUT:
+        from core import optionhelper_bridge as ohb, viewpoint as vpmod
+
+        vp = vpmod.build(ma, rc)
+        if not vp.ok:
+            print(f"  ⚠ OptionHelper 未调用：观点包不可用（{vp.error}）")
+        else:
+            print("  · 正在调用 OptionHelper 完整版（推荐+定价+回测+报告，可能需要几分钟）…")
+            oh_result = ohb.run_full(vp, output_type=_OH_OUTPUT)
+            if oh_result.ok:
+                print(f"  ✓ OptionHelper：{oh_result.product_name}（{oh_result.product_id}）"
+                      f" · {oh_result.coverage_status or oh_result.status}")
+                if oh_result.report_path:
+                    print(f"      报告：{oh_result.report_path}")
+            else:
+                print(f"  ⚠ OptionHelper 未完成（{oh_result.stage}）：{oh_result.error}")
+                if oh_result.missing:
+                    for m in oh_result.missing:
+                        print(f"      · 缺：{m}")
+
     out_dir = Path(__file__).resolve().parent / "output"
     out_dir.mkdir(exist_ok=True)
     out = str(out_dir / f"onepager_{_safe_name(title)}.html")
     with open(out, "w", encoding="utf-8") as fh:
-        fh.write(layout.build_html(ma, rc))
+        fh.write(layout.build_html(ma, rc, oh_result=oh_result))
     print(f"  ✓ 已输出：{out}")
 
     # 内部底稿落盘：终端打印关窗即失，而"补数据/复核"往往是隔几天才回头做的事。
     # 分析口径、观点包、缺口、复核项合成一份，不拆成多个文件让人对着看（#70）。
-    gap_path = gaps.write_gap_report(ma, rc, vr, title=title, html_path=out)
+    gap_path = gaps.write_gap_report(ma, rc, vr, title=title, html_path=out, oh_result=oh_result)
     print(f"  ✓ 内部底稿：{gap_path}")
 
     # PDF 导出（A2）。默认关闭：启动 Chromium 约 3~5 秒，批量生成时不该每份都付这个代价。
@@ -224,6 +257,17 @@ def main() -> None:
     if "--pdf" in args:
         _WANT_PDF = True
         args = [a for a in args if a != "--pdf"]
+
+    # --optionhelper card|report：接入完整版（推荐+定价+回测+报告）。
+    # card=研究简报，report=完整研究报告；不加此参数则完全不调用（默认行为不变）。
+    global _OH_OUTPUT
+    if "--optionhelper" in args:
+        i = args.index("--optionhelper")
+        if i + 1 >= len(args) or args[i + 1] not in ("card", "report"):
+            print("用法：--optionhelper card|report")
+            return
+        _OH_OUTPUT = args[i + 1]
+        args = args[:i] + args[i + 2:]
 
     # --overrides 路径：人工补数文件（模板由内部底稿生成，复制填好即可）
     overrides_path = ""

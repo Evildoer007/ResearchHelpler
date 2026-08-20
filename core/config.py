@@ -89,3 +89,28 @@ def has_llm() -> bool:
 def has_ifind() -> bool:
     """是否配置了 iFinD 账户。未配置时取数层回退到 akshare。"""
     return bool(IFIND_ACCOUNT and IFIND_PASSWORD)
+
+
+# ---- OptionHelper（衍生品推荐/定价/回测/报告完整版）集成配置 ----
+# OptionHelper 是独立项目（不在本仓库内），锁定了 numpy/pandas/scipy/numba
+# 的精确版本，与本项目自己的环境混装有版本冲突风险，必须用独立解释器隔离
+# 调用（子进程，见 core/optionhelper_bridge.py），故这里只记路径，不 import。
+OPTIONHELPER_ROOT = _cred("OPTIONHELPER_ROOT")   # option-helper 项目根目录（含 scripts/tool_entry.py）
+# 默认指向随本项目一起建的隔离 venv（.optionhelper_venv，装了其 requirements.lock）；
+# 换机器/换环境时用 OPTIONHELPER_PYTHON 环境变量或 config.local.json 覆盖。
+OPTIONHELPER_PYTHON = _cred(
+    "OPTIONHELPER_PYTHON", str(_PROJECT_ROOT / ".optionhelper_venv" / "Scripts" / "python.exe"),
+)
+# OptionHelper 自己的 iFind 凭证体系是 Refresh Token（HTTP API），
+# 与本项目 IFIND_ACCOUNT/PASSWORD（同花顺 iFinD 桌面端账户）不是同一套，不能互相代替。
+OPTIONHELPER_IFIND_REFRESH_TOKEN = _cred("IFIND_REFRESH_TOKEN")
+
+
+def has_optionhelper() -> bool:
+    """OptionHelper 完整版三项前置是否都已配置：项目路径、独立解释器、iFind Token。
+    模型网关复用本项目已有的 DeepSeek key，不算在内（见 has_llm）。"""
+    return bool(
+        OPTIONHELPER_ROOT
+        and Path(OPTIONHELPER_PYTHON).exists()
+        and OPTIONHELPER_IFIND_REFRESH_TOKEN
+    )

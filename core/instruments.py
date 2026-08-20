@@ -283,6 +283,20 @@ def _load_underlying_map() -> dict[str, str]:
 _SECTOR_UNDERLYING: dict[str, str] = _load_underlying_map()
 
 
+def sector_of_etf(code: str) -> str:
+    """ETF 代码 → 它对应的**规范板块名**（`_SECTOR_UNDERLYING` 的反查）。查无返回 ""。
+
+    用户在需求里点名某只 ETF 时（#85），据此把板块名对齐到这只 ETF 真正代表的
+    那一级——否则会出现"用户要的是酒ETF（白酒），板块名却是 LLM 自由生成的
+    食品饮料"，PB/波动率用对了篮子、但板块级信号字段（资金净流入等，按板块名走
+    iwencai）仍量的是食品饮料。多个别名映射到同一代码时，取最短名（最贴近该
+    ETF 的窄口径，如 512690.SH → 白酒 而非某个更宽的别名）。
+    """
+    c = (code or "").strip()
+    names = [name for name, mapped in _SECTOR_UNDERLYING.items() if mapped == c]
+    return min(names, key=len) if names else ""
+
+
 def underlying_for(sector: str) -> tuple[Instrument | None, str]:
     """板块 → (默认挂钩标的, 口径说明)。没有对应标的时返回 (None, 原因)。
 

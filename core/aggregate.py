@@ -108,7 +108,10 @@ def sector_aggregate(
     safe = "".join(ch for ch in sector if ch.isalnum())[:24]
     path = config.DATA_CACHE_DIR / f"agg_{safe}_{top}_{date}.json"
 
-    if use_cache and path.exists():
+    # 分析篮子被 ETF 真实成分覆盖时（#85）绕过缓存：ETF 篮子与 iwencai 行业篮子
+    # 都以 sector 名当缓存键，共用会互相污染（一个把另一个的结果读成自己的）。
+    override = universe.has_basket_override(sector)
+    if use_cache and not override and path.exists():
         try:
             d = json.loads(path.read_text(encoding="utf-8"))
             return SectorAggregate(**d)
@@ -155,7 +158,7 @@ def sector_aggregate(
     agg.明细 = sorted(rows, key=lambda x: x.get("市值") or 0, reverse=True)
     agg.ok = bool(agg.指标)
 
-    if agg.ok and use_cache:
+    if agg.ok and use_cache and not override:
         path.write_text(json.dumps(agg.__dict__, ensure_ascii=False, default=str),
                         encoding="utf-8")
     return agg
@@ -296,7 +299,8 @@ def sector_dupont(sector: str, *, top: int = 15, provider: DataProvider | None =
     date = dt.date.today().strftime("%Y%m%d")
     safe = "".join(ch for ch in sector if ch.isalnum())[:24]
     path = config.DATA_CACHE_DIR / f"dupont_{safe}_{top}_{date}.json"
-    if use_cache and path.exists():
+    override = universe.has_basket_override(sector)   # #85：ETF 真实篮子不与行业篮子共用缓存
+    if use_cache and not override and path.exists():
         try:
             return SectorDupont(**json.loads(path.read_text(encoding="utf-8")))
         except Exception:
@@ -333,7 +337,7 @@ def sector_dupont(sector: str, *, top: int = 15, provider: DataProvider | None =
     out.ok = out.净利率_本期 is not None and out.ROE_本期 is not None
     if not out.ok and not out.error:
         out.error = "净利率或ROE取数不全"
-    if out.ok and use_cache:
+    if out.ok and use_cache and not override:
         config.DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(out.__dict__, ensure_ascii=False, default=str),
                         encoding="utf-8")
@@ -361,16 +365,18 @@ def sector_forward_pe(sector: str, *, top: int = 15, provider: DataProvider | No
     """板块当前PE 与 FY1一致预期PE 的对比。支撑 V7 估值切换。"""
     import time
 
+    from . import universe
+
     date = dt.date.today().strftime("%Y%m%d")
     safe = "".join(ch for ch in sector if ch.isalnum())[:24]
     path = config.DATA_CACHE_DIR / f"fwdpe_{safe}_{top}_{date}.json"
-    if use_cache and path.exists():
+    override = universe.has_basket_override(sector)   # #85
+    if use_cache and not override and path.exists():
         try:
             return ForwardPE(**json.loads(path.read_text(encoding="utf-8")))
         except Exception:
             pass
 
-    from . import universe
     from .provider import iFinDProvider
 
     out = ForwardPE(板块=sector)
@@ -414,7 +420,7 @@ def sector_forward_pe(sector: str, *, top: int = 15, provider: DataProvider | No
     out.ok = out.当前PE is not None and out.FY1预测PE is not None
     if not out.ok and not out.error:
         out.error = "缺 FY1一致预期净利润"
-    if out.ok and use_cache:
+    if out.ok and use_cache and not override:
         config.DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(out.__dict__, ensure_ascii=False, default=str),
                         encoding="utf-8")

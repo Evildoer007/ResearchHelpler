@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 from dataclasses import dataclass
@@ -28,6 +29,133 @@ class Leader:
     @property
     def 市值亿元(self) -> float | None:
         return round(self.总市值 / 1e8, 1) if self.总市值 else None
+
+
+# ── 分析篮子覆盖：分析对象是 ETF 时，成分股用它**真实跟踪指数的成分**，不再用
+#    iwencai 按行业名模糊匹配 ─────────────────────────────────────────────────
+# 背景（用户实测暴露）：问"酒ETF 512690.SH 估值如何"，此前的口径是——
+#   ① 板块名由 LLM 自由生成，飘成了"食品饮料"（比白酒宽）；
+#   ② 成分股拿"食品饮料 总市值排名前20"问 iwencai，得到的是**行业分类**口径的
+#      20 只，跟 512690 实际持有的中证酒 26 只是两个篮子；
+#   ③ 板块整体法失败时还会**退回代表个股（茅台）**，用一只股票的 PB/ROE 冒充板块。
+# 三者叠加，"分析的东西"和"挂钩的东西"根本不是一个篮子。
+#
+# 修法（#85）：分析对象是 ETF 时，把它**真实成分股**绑成本次分析篮子。所有走
+# `sector_leaders(sector)` 的聚合路径（aggregate/history/fundamentals/peers/…）
+# 都会透明地拿到这批真实成分，无需改各自签名。绑定是**进程内、按上下文限定**的
+# （`analysis_basket` 上下文管理器），不是永久全局脏状态。
+_BASKET_OVERRIDE: dict[str, list["Leader"]] = {}
+_MISSING = object()
+
+
+@contextlib.contextmanager
+def analysis_basket(sector: str, constituents: list["Leader"]):
+    """在本代码块内，把 `sector` 的成分股锁定为 `constituents`（ETF 真实成分）。
+
+    退出时恢复原状。`fetch_profile` 用它把 ETF 真实成分喂给整条聚合链路，
+    使"当前 PB"与"历史 PB 序列"、板块快照、各分位字段算的都是**同一个真实篮子**。
+    """
+    key = resolve_sector(sector) if sector else ""
+    if not key or not constituents:
+        yield
+        return
+    prev = _BASKET_OVERRIDE.get(key, _MISSING)
+    _BASKET_OVERRIDE[key] = constituents
+    try:
+        yield
+    finally:
+        if prev is _MISSING:
+            _BASKET_OVERRIDE.pop(key, None)
+        else:
+            _BASKET_OVERRIDE[key] = prev  # type: ignore[assignment]
+
+
+def has_basket_override(sector: str) -> bool:
+    """本次分析是否已把 `sector` 的成分锁定为某只 ETF 的真实成分。
+
+    aggregate/history 用它决定**跳过按板块名缓存**——ETF 真实篮子算出的结果不能
+    和 iwencai 行业篮子算出的结果共用一个缓存键，否则两者会互相污染。
+    """
+    return bool(sector) and resolve_sector(sector) in _BASKET_OVERRIDE
+
+
+def etf_constituents(etf_code: str, *, provider=None, use_cache: bool = True) -> list["Leader"]:
+    """取一只 ETF **真实跟踪指数的成分股**（按指数权重降序），失败返回 []。
+
+    两步（均为 iFinD 官方数据函数，非 iwencai 模糊问句）：
+      ① `THS_BasicData(etf, 'ths_tracking_index_code_fund')` → 跟踪指数代码；
+      ② `THS_DataPool('index', 'YYYY-MM-DD;指数代码', 'security_name:Y,thscode:Y,weight:Y')`
+         → 该指数当日成分（简称/代码/权重）。
+    实测（512690.SH→399987 中证酒）返回 26 只真实白酒股，与 iwencai
+    "食品饮料 排名前20"完全不同——后者是行业分类近似，前者才是这只 ETF 真拿的篮子。
+
+    ⚠ 日期要用交易日：传周末/节假日 DataPool 返回 errorcode=0 但 0 行（实测踩过），
+    故用"今天往前退几天"取最近一个有数据的交易日。
+    成分股慢变，按天缓存（同 sector_leaders 的配额考量）。
+    """
+    from .provider import iFinDProvider
+
+    code = (etf_code or "").strip()
+    if not code:
+        return []
+    prov = provider if isinstance(provider, iFinDProvider) else iFinDProvider()
+    if not prov.available():
+        return []
+
+    date = dt.date.today().strftime("%Y%m%d")
+    config.DATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe = "".join(ch for ch in code if ch.isalnum())[:16]
+    path = config.DATA_CACHE_DIR / f"etfcons_{safe}_{date}.json"
+    if use_cache and path.exists():
+        try:
+            return [Leader(**x) for x in json.loads(path.read_text(encoding="utf-8"))]
+        except Exception:
+            pass
+
+    prov._ensure_login()
+    import iFinDPy as ths
+
+    d = ths.THS_BasicData(code, "ths_tracking_index_code_fund", "")
+    if not isinstance(d, dict) or d.get("errorcode") != 0 or not d.get("tables"):
+        return []
+    prov.total_data_vol += int(d.get("dataVol", 0) or 0)
+    idx_vals = (d["tables"][0].get("table") or {}).get("ths_tracking_index_code_fund") or []
+    idx = str(idx_vals[0]).strip() if idx_vals else ""
+    if not idx:
+        return []
+
+    out: list[Leader] = []
+    opt = "date:Y,security_name:Y,thscode:Y,weight:Y"
+    # 从今天往前退，找到第一个有成分数据的交易日（跳过周末/节假日的空返回）。
+    for back in range(0, 8):
+        day = (dt.date.today() - dt.timedelta(days=back)).strftime("%Y-%m-%d")
+        r = ths.THS_DataPool("index", f"{day};{idx}", opt)
+        if not isinstance(r, dict) or r.get("errorcode") != 0 or not r.get("tables"):
+            continue
+        prov.total_data_vol += int(r.get("dataVol", 0) or 0)
+        t = r["tables"][0].get("table") or {}
+        codes = t.get("THSCODE") or t.get("thscode") or []
+        names = t.get("SECURITY_NAME") or t.get("security_name") or []
+        weights = t.get("WEIGHT") or t.get("weight") or []
+        if not codes:
+            continue
+        rows = []
+        for i, c in enumerate(codes):
+            w = None
+            try:
+                w = float(weights[i]) if weights and i < len(weights) and weights[i] is not None else None
+            except (TypeError, ValueError):
+                w = None
+            rows.append((str(c), str(names[i]) if i < len(names) else "", w))
+        # 按指数权重降序：这样 sector_leaders 的 top-N 截断保留的是**权重最大的**成分。
+        rows.sort(key=lambda x: (x[2] if x[2] is not None else -1), reverse=True)
+        out = [Leader(代码=c, 简称=n) for c, n, _w in rows]
+        break
+
+    if out and use_cache:
+        path.write_text(json.dumps([l.__dict__ for l in out], ensure_ascii=False),
+                        encoding="utf-8")
+    return out
 
 
 # ── 宽口径主题 → 一组一级行业 ────────────────────────────────────────────
@@ -393,6 +521,13 @@ def sector_leaders(
         return merged[:top]
 
     sector = resolve_sector(sector)
+
+    # 分析对象是 ETF 时，成分股锁定为它真实跟踪指数的成分（#85）。直接返回，
+    # 不走 iwencai、不读写按板块名的缓存——ETF 真实篮子与行业分类篮子不能混。
+    # 指数官方成分本就已剔次新，且这批没有上市日期字段，故不再套次新过滤。
+    if sector in _BASKET_OVERRIDE:
+        return list(_BASKET_OVERRIDE[sector])[:top]
+
     date = dt.date.today().strftime("%Y%m%d")
     path = _cache_path(sector, date)
     raw: list[Leader] = []

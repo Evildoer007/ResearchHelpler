@@ -37,6 +37,13 @@ __pycache__/
 .venv/
 venv/
 
+# ==== OptionHelper 完整版集成（#84）====
+# 独立隔离环境（装它自己精确锁定的 numpy/pandas/scipy/numba 版本，与本项目
+# 环境分开，不共用、不提交）；.optionhelper/ 是它自己的项目级 Store（data/
+# result/runtime），运行时生成，同样不提交。
+.optionhelper_venv/
+.optionhelper/
+
 # ==== 打包产物 ====
 build/
 dist/

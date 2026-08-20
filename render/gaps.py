@@ -247,6 +247,12 @@ _PX_CHART_ROW_2 = 197      # 并排一行（实测 189/203/197）
 _PX_FIXED = 264                 # 标题+副标题+页脚+页面内边距+外边距+各块间距（实测）
 _PX_PER_LOGIC = 20              # 每条逻辑的标题行与上下间距
 _PAGE_LIMIT = 1123              # A4 在 96dpi 下的高度（原写 1160 是按 820px 宽估的）                       # 820px 宽按 A4 比例对应的可用高度
+# 「挂钩标的」卡片（render.layout._underlying_block）：估算值，未像上面几个
+# 常量那样做过真实渲染校准（#83 那轮只测了逻辑正文和图表行）。这节 #84 才
+# 从"预留不渲染"改成常驻渲染，先按 CSS 行高粗算，等有真实成品再回来校。
+_PX_UNDERLYING_BASE = 95        # 标的行 + 报价说明，无挂钩理由/推荐结构时
+_PX_UNDERLYING_WHY = 25         # 加一行挂钩理由（择优映射类需求才有）
+_PX_UNDERLYING_STRUCT = 30      # 加一行 OptionHelper 推荐结构
 
 
 def _chart_px(n: int) -> float:
@@ -272,7 +278,25 @@ def _rendered_logics(ma, rc) -> list:
     return spine or body        # 拿不到来源信息时不至于把整份报告统计成空
 
 
-def _page_budget(ma, rc) -> list[str]:
+def _underlying_px(ma, rc, oh=None) -> float:
+    """挂钩标的卡片本次会不会渲染、渲染多高——与 render.layout._underlying_block 同一套判断条件。"""
+    try:
+        from core import viewpoint as vp
+
+        pkg = vp.build(ma, rc)
+    except Exception:
+        return 0.0
+    if not getattr(pkg, "ok", False) or not pkg.标的代码:
+        return 0.0
+    px = _PX_UNDERLYING_BASE
+    if pkg.挂钩理由 or pkg.板块理由:
+        px += _PX_UNDERLYING_WHY
+    if oh is not None and getattr(oh, "ok", False) and oh.product_name:
+        px += _PX_UNDERLYING_STRUCT
+    return px
+
+
+def _page_budget(ma, rc, oh_result=None) -> list[str]:
     """版面预算体检：估算这份成品大概占多高，超了就报警。
 
     「一页通」的硬约束是**一页**，而在此之前系统里没有任何机制保证这件事——
@@ -294,14 +318,16 @@ def _page_budget(ma, rc) -> list[str]:
     charts = sum(per_logic)
     concl = len(rc.核心结论 or "")
     chart_px = sum(_chart_px(n) for n in per_logic)
+    under_px = _underlying_px(ma, rc, oh_result)
     est = (_PX_FIXED + concl * _PX_PER_CHAR_CONCL
            + sum(bodies) * _PX_PER_CHAR_BODY
-           + len(bodies) * _PX_PER_LOGIC + chart_px)
+           + len(bodies) * _PX_PER_LOGIC + chart_px + under_px)
     pages = est / _PAGE_LIMIT
 
     out = ["### 版面预算", "",
            f"- 核心结论 {concl} 字｜正文 {bodies}（合计 {sum(bodies)} 字）"
-           f"｜配图 {per_logic}（合计 {charts} 张，占 {chart_px:.0f}px）",
+           f"｜配图 {per_logic}（合计 {charts} 张，占 {chart_px:.0f}px）"
+           + (f"｜挂钩标的卡片 {under_px:.0f}px" if under_px else ""),
            f"- 估算高度 ≈ {est:.0f}px，约 **{pages:.2f} 页**（阈值 1 页 = {_PAGE_LIMIT}px）",
            ""]
     if any(n > CAP for n in 超额):
@@ -542,10 +568,25 @@ def _viewpoint_section(ma, rc) -> list[str]:
     if not pkg.ok:
         return [f"（观点包不可用：{pkg.error}）", ""]
 
-    out = [
-        f"- **挂钩标的**：{pkg.标的名称}（{pkg.标的代码}）" if pkg.标的代码
-        else f"- **挂钩标的**：未定 —— {pkg.标的口径}",
-    ]
+    # ① 实际发送给 OptionHelper 的**原文**。这是唯一真正传出去的东西——一段自然
+    #    语言散文，不含表格、不含论点库代号、不含数据代表标的这类内部锚点字段
+    #    （它的 Recommender 是让另一个模型读文字理解观点的，那些东西只会干扰）。
+    #    照原样贴出来，分析师一眼能看到"OptionHelper 到底收到了什么"，不必猜。
+    out = ["**① 实际发送给 OptionHelper 的内容**（自然语言原文，逐字如下）：", ""]
+    try:
+        from core import optionhelper_bridge as _ohb
+
+        sent = _ohb.build_prompt(pkg)
+    except Exception as e:
+        sent = f"（无法生成发送原文：{type(e).__name__}: {e}）"
+    out += ["```", sent, "```", ""]
+
+    # ② 以下全部是**分析师核对用、不发送给 OptionHelper** 的内部信息：挂钩标的口径、
+    #    数据锚点、择优过程、每条逻辑对应的论点库代号与特征。放这儿是为了留痕与核对，
+    #    但绝不进发送原文——代号/表格/内部锚点混进去会让下游模型误读。
+    out += ["**② 分析师核对用（不发送给 OptionHelper）**", ""]
+    out.append(f"- **挂钩标的**：{pkg.标的名称}（{pkg.标的代码}）" if pkg.标的代码
+               else f"- **挂钩标的**：未定 —— {pkg.标的口径}")
     if pkg.板块:
         out.append(f"- **板块**：{pkg.板块}")
     if pkg.标的代码:
@@ -557,8 +598,6 @@ def _viewpoint_section(ma, rc) -> list[str]:
         out.append(f"- **挂钩理由**：{pkg.挂钩理由}")
     out += _selection_section(ma)
     out += [
-        f"- **整体方向**：{pkg.整体方向 or '—'}",
-        f"- **波动率看法**：{pkg.波动率看法 or '（未取到）'}",
         "",
         "| 逻辑 | 方向 | 强度 | 窗口 | 确定性 | 市场含义（方向/时间尺度/波动率/失效条件）|",
         "|---|---|---|---|---|---|",
@@ -567,11 +606,9 @@ def _viewpoint_section(ma, rc) -> list[str]:
         out.append(f"| `{lv.逻辑id}` | {lv.方向 or '—'} | {lv.强度 or '—'} | "
                    f"{lv.窗口 or '—'} | {lv.确定性 or '—'} | {lv.市场含义 or '—'} |")
     out.append("")
-    if pkg.风险提示汇总:
-        out += ["**风险提示**：" + "；".join(pkg.风险提示汇总), ""]
     out += [
         "> 观点包只重整已有数据，**不产生任何新数字**，其中每个数都能追回摸底取数或论点库判定。",
-        "> **本节只描述市场状态，不含任何产品或结构建议**——挂什么结构、什么期限、"
+        "> **只描述市场状态，不含任何产品或结构建议**——挂什么结构、什么期限、"
         "买方还是卖方，由 OptionHelper 依据实时波动率曲面与报价决定；"
         "本系统既无曲面也无报价，越权给方案就是无依据的断言。",
     ]
@@ -582,7 +619,43 @@ def _viewpoint_section(ma, rc) -> list[str]:
     return out
 
 
-def build_markdown(ma, rc, vr, *, title: str, html_path: str) -> str:
+def _optionhelper_section(oh) -> list[str]:
+    """OptionHelper 完整版（推荐+定价+回测+报告）本次调用结果——不管成败都要落一笔。
+
+    `--optionhelper` 没开时 `oh is None`，如实写"未调用"；开了但失败时把 stage/
+    error/missing 原样摊开，让分析师能直接照着补（缺 token 还是缺环境一看便知），
+    不能只在客户版面留一句"报价由交易台确定"就把真实原因吞掉。
+    """
+    if oh is None:
+        return ["（本次未调用——生成时未加 `--optionhelper` 开关）", ""]
+    if not getattr(oh, "ok", False):
+        out = [f"- **状态**：失败（{oh.stage or '未知阶段'}）", f"- **原因**：{oh.error or '（无详细信息）'}"]
+        if oh.missing:
+            out.append("- **缺失前置条件**：")
+            out += [f"  - {m}" for m in oh.missing]
+        out.append("")
+        return out
+    out = [
+        f"- **推荐结构**：{oh.product_name}" + (f"（{oh.product_id}）" if oh.product_id else ""),
+        f"- **理由**：{oh.reason or '（无）'}",
+    ]
+    if oh.main_risks:
+        out.append("- **主要风险**：" + "；".join(oh.main_risks))
+    out.append(f"- **交付状态**：{oh.status}（{'完整' if oh.coverage_status == 'complete' else oh.coverage_status or '—'}）")
+    if oh.module_failures:
+        out.append("- **未完成模块**：" + "；".join(f"{k}：{v}" for k, v in oh.module_failures.items()))
+    if oh.report_path:
+        out.append(f"- **完整报告文件**：`{oh.report_path}`")
+    if oh.assumptions:
+        out.append("- **计算假设**：" + "；".join(oh.assumptions))
+    out.append("")
+    out.append("> 结构、条款、定价、回测均由 OptionHelper 自己的 Recommender/Pricer/"
+               "Backtester 产出，本系统只转交了一段自然语言市场观点，不参与选型。")
+    out.append("")
+    return out
+
+
+def build_markdown(ma, rc, vr, *, title: str, html_path: str, oh_result=None) -> str:
     """把本次生成的缺口与复核项排成一份可留存的 Markdown。"""
     from core.planner import DOC_FIELD_PREFIX, SRC_SPINE
 
@@ -604,7 +677,9 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str) -> str:
     lines += _source_table(ma)
     lines += ["---", "", "## 二、给 OptionHelper 的观点包", ""]
     lines += _viewpoint_section(ma, rc)
-    lines += ["---", "", "## 三、需要人工补充的数据", ""]
+    lines += ["---", "", "## 三、OptionHelper 完整版调用结果", ""]
+    lines += _optionhelper_section(oh_result)
+    lines += ["---", "", "## 四、需要人工补充的数据", ""]
 
     # 1) 自动取数失败 —— **按补救路径分类**，而不是笼统列一张表。
     #    此前三种毫不相干的东西混在同一节里（重跑就好的、要改代码的、真要人填的），
@@ -642,7 +717,7 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str) -> str:
     _append_override_template(lines, ma, ext)
 
     # 3) 需人工复核
-    lines += ["---", "", "## 四、需要人工复核", ""]
+    lines += ["---", "", "## 五、需要人工复核", ""]
 
     missing_logics = list(getattr(rc, "空缺逻辑", []) or [])
     if missing_logics:
@@ -691,10 +766,10 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str) -> str:
     lines += _chart_audit(ma, rc)
 
     # 3c) 版面预算：一页通的硬约束是"一页"，而此前没有任何机制保证
-    lines += _page_budget(ma, rc)
+    lines += _page_budget(ma, rc, oh_result)
 
     # 4) 来源
-    lines += ["---", "", "## 五、本次用到的来源", "", "- 行情与财务数据：iFinD（同花顺）"]
+    lines += ["---", "", "## 六、本次用到的来源", "", "- 行情与财务数据：iFinD（同花顺）"]
     docs_used = []
     for name, fv in (ma.field_values or {}).items():
         if not isinstance(name, str) or not name.startswith(DOC_FIELD_PREFIX):
@@ -715,7 +790,7 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str) -> str:
     # 5) 实际写进正文的论点
     id2plan = {lg.逻辑id: lg for lg in ma.plan.logics}
     written = [lc for lc in rc.logics if (lc.论述 or "").strip()]
-    lines += ["---", "", "## 六、本次实际写进正文的论点", ""]
+    lines += ["---", "", "## 七、本次实际写进正文的论点", ""]
     if written:
         for lc in written:
             p = id2plan.get(lc.逻辑id)
@@ -727,10 +802,10 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str) -> str:
     return "\n".join(lines)
 
 
-def write_gap_report(ma, rc, vr, *, title: str, html_path: str) -> str:
+def write_gap_report(ma, rc, vr, *, title: str, html_path: str, oh_result=None) -> str:
     """产出内部底稿，返回路径。与一页通同名并排存放。"""
     p = Path(html_path)
     out = p.with_name(f"{p.stem}_内部底稿.md")
-    out.write_text(build_markdown(ma, rc, vr, title=title, html_path=html_path),
+    out.write_text(build_markdown(ma, rc, vr, title=title, html_path=html_path, oh_result=oh_result),
                    encoding="utf-8")
     return str(out)

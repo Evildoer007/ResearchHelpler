@@ -478,6 +478,7 @@ h1 .accent { color:#9B2226; }
               letter-spacing:1px; margin-bottom:4px; }
 .u-main { font-size:13px; color:#2b2b2b; line-height:1.6; }
 .u-why { font-size:12px; color:#4a4a4a; line-height:1.65; margin-top:4px; }
+.u-struct { font-size:12.5px; color:#2b2b2b; line-height:1.65; margin-top:6px; }
 .u-note { font-size:11px; color:#9a9a9a; margin-top:5px; }
 .src { font-size:10.5px; color:#6f6f6f; border-top:1px solid #E4DFD6; margin-top:14px; padding-top:7px; line-height:1.55; }
 .foot { font-size:9px; color:#938C84; border-top:1px solid #E4DFD6; margin-top:15px; padding-top:7px; line-height:1.55; }
@@ -500,7 +501,7 @@ def _today_cn() -> str:
     return f"{d.year}年{d.month}月{d.day}日"
 
 
-def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "") -> str:
+def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None) -> str:
     """正文展开"主轴"标记的 2~3 条论点，其余（可选池/自由槽）压成一行补充观察。
 
     条数与"哪几条算主轴"由 planner 依据触发结果决定（DESIGN §7.2），此处只负责呈现。
@@ -543,18 +544,14 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "") -> str:
     # 建议等待波动收敛、若波动率飙升则…"），是产品选择环节的输入、内部口吻，
     # 印在客户版面上既突兀又与正文重复。可选池论点仍在内部底稿的观点包里可查。
 
-    # ── 「挂钩标的与推荐结构」：版面上**预留但暂不渲染** ──────────────────
-    # 参考模板里这是**一整节**：标的卡片（为什么是它、代表什么暴露）
-    # ＋ 推荐结构·参考报价表（什么结构、什么条款、什么价）。两块合起来才是
-    # 这份报告的落点，而报价必须由 OptionHelper 给（本系统既无波动率曲面
-    # 也无报价，§10）。只出卡片、不出报价，等于在客户版面上占一块地方
-    # 却仍给不出真正的落点，不如整节等齐了再上。
-    #
-    # 挂钩标的、择优维度、每个候选的实测指标与理由，**已完整落在内部底稿**
-    # （「给 OptionHelper 的观点包」+「挂钩标的择优」两节），内部照常可查。
-    #
-    # → OptionHelper 接入时：在下方 {pool_html} 与 {sources_html} 之间
-    #   调用 `_underlying_block(ma, rc)`，并在其中补上报价表。
+    # 「挂钩标的与推荐结构」：标的卡片（为什么是它、代表什么暴露）常驻；
+    # 结构与报价那半只在传入 oh_result 时才出现——由 main.py 的 --optionhelper
+    # 开关控制是否实际调用完整版（推荐+定价+回测+报告），失败时 _underlying_block
+    # 自动退回旧版"报价由交易台确定"的措辞，不阻断客户版面生成。
+    under_html = _underlying_block(ma, rc, oh_result)
+    if under_html:
+        sections.append(under_html)
+
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>{_CSS}</style></head><body>
     <div class="page">
       <h1>场外衍生品投资策略 <span class="accent">—— {ma.plan.主题}</span></h1>
@@ -565,12 +562,8 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "") -> str:
     </div></body></html>"""
 
 
-def _underlying_block(ma, rc) -> str:
-    """「挂钩标的与推荐结构」一节 —— **当前未接入版面**，等 OptionHelper 补齐报价后启用。
-
-    保留本函数是因为择优链路（B4）已经跑通，缺的只是报价那一半：
-    接上 OptionHelper 后在此补一张「推荐结构·参考报价」表，
-    再从 `build_html` 调用即可，不必重写。调用点与理由见 `build_html` 内注释。
+def _underlying_block(ma, rc, oh=None) -> str:
+    """「挂钩标的与推荐结构」一节。标的卡片常驻；结构·报价那半来自 OptionHelper 完整版。
 
     与 #70 不冲突：#70 撤掉的是**内部工作信息**（板块口径、数据代表标的、
     自有数据源），而"建议挂钩哪个标的、为什么"恰恰是模板里印给客户看的内容，
@@ -582,8 +575,11 @@ def _underlying_block(ma, rc) -> str:
         理由取择优理由（§9.2②）——**这层映射必须写出来**，不允许分析 A 推荐 B
         却对两者关系只字不提（见设计理念）。
 
-    报价栏仍留空并明说原因：定价属 OptionHelper，本系统既无波动率曲面也无报价，
-    越权给结构与价格就是无依据的断言（§10）。
+    `oh`（`core.optionhelper_bridge.OptionHelperResult`，可为 None）决定结构·报价
+    那半怎么呈现：未调用（`oh is None`，默认——`--optionhelper` 未开）或调用失败时，
+    退回旧版"报价由交易台确定"的措辞，**不阻断客户版面生成**——OptionHelper 是
+    development_only 的外部依赖，它掉线不该拖累主流程。只有明确拿到结构才越过
+    §10 那道线：本系统自己既无波动率曲面也无报价，不能替 OptionHelper 断言结构。
     """
     try:
         from core import viewpoint as vp
@@ -602,10 +598,23 @@ def _underlying_block(ma, rc) -> str:
         rows.append(pkg.波动率看法)
     head = "　｜　".join(rows)
     body = f'<div class="u-why">{理由}</div>' if 理由 else ""
+
+    if oh is not None and getattr(oh, "ok", False) and oh.product_name:
+        struct = (f'<div class="u-struct"><b>推荐结构</b>：{_esc(oh.product_name)}'
+                  + (f'（{_esc(oh.product_id)}）' if oh.product_id else "")
+                  + (f'　{_esc(oh.reason)}' if oh.reason else "") + '</div>')
+        note = ('<div class="u-note">定价与历史回测见 OptionHelper 完整报告（路径见内部底稿）'
+                '；本页不重复展开测算过程。</div>')
+        if oh.coverage_status == "partial":
+            note = ('<div class="u-note">⚠ 部分计算模块未完成，结构与报价以 '
+                    'OptionHelper 报告的缺口标注为准，本页仅供参考。</div>')
+    else:
+        struct = ""
+        note = ('<div class="u-note">推荐结构与参考报价由交易台依实时波动率曲面与报价确定，'
+                '本页不含结构建议。</div>')
+
     return (f'<div class="under"><span class="lbl">挂钩标的</span>'
-            f'<div class="u-main">{head}</div>{body}'
-            f'<div class="u-note">推荐结构与参考报价由交易台依实时波动率曲面与报价确定，'
-            f'本页不含结构建议。</div></div>')
+            f'<div class="u-main">{head}</div>{body}{struct}{note}</div>')
 
 
 _DISCLAIMER = (

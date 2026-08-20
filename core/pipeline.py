@@ -104,6 +104,7 @@ def fetch_profile(
     rep_code: str, sector: str | None = None,
     provider: DataProvider | None = None, *,
     trigger_code: str = "", trigger_name: str = "",
+    analysis_etf: str = "",
     overrides=None,
 ) -> dict[str, FieldValue]:
     """摸底取数：先把论点库判定所需 + 画像字段查一遍，不预设最后选哪条论点。
@@ -111,20 +112,49 @@ def fetch_profile(
     **主题名在这里解析一次，下游全部拿已解析的行业名。** 不在各模块里各自解析——
     取成分股的调用方有 9 处（aggregate/fundamentals/unlock/peers/signals），
     逐个改必然漏；而且只有这里同时握有 rep_code 与 sector，能做动态解析。
+
+    analysis_etf：分析对象是某只 ETF 时的**显式指定**（用户需求里点名的、已过代码
+    校验的 ETF）。给了它就优先于板块名反推的挂钩 ETF——修的是"用户明明给了
+    酒ETF 512690.SH，板块名却被 LLM 飘成食品饮料、最终分析了另一个篮子"这个 bug。
     """
+    from . import instruments as _inst
     from . import universe
 
     provider = provider or get_provider()
+
+    # 用户点名了某只 ETF：先把板块名对齐到这只 ETF 规范代表的那一级（#85）。
+    # 否则 PB/波动率用对了 ETF 真实成分篮子，但板块级信号字段（资金净流入等，
+    # 按板块名走 iwencai）仍量的是 LLM 自由生成的宽口径板块——又是一处张冠李戴。
+    if analysis_etf:
+        aligned = _inst.sector_of_etf(analysis_etf)
+        if aligned:
+            sector = aligned
     if sector:
         sector = universe.resolve_sector(sector, rep_code=rep_code, provider=provider)
+
+    # 分析 ETF：显式指定优先；否则按板块名反推（#85）。它一旦确定，本次所有板块级
+    # 聚合（PB/波动率/分位/PE/ROE/净利同比 + 板块快照）都改用这只 ETF **真实跟踪
+    # 指数的成分股**，而不是 iwencai 按行业名模糊匹配的近似篮子——"分析的东西"与
+    # "挂钩的东西"从此是同一个篮子。取不到真实成分就退回原行为（iwencai 行业篮子）。
+    etf_code = (analysis_etf or "").strip()
+    etf_note = ""
+    if etf_code:
+        etf_note = "用户需求指定的挂钩 ETF"
+    elif sector:
+        _i, _note = _inst.resolve_analysis_etf(sector, provider=provider)
+        etf_code = _i.代码 if _i else ""
+        etf_note = _note
+    basket = universe.etf_constituents(etf_code, provider=provider) if etf_code else []
+
     fields = _all_fields()
-    results, _gaps, _prov = fetcher.fetch_fields(fields, rep_code, provider, sector)
-    profile = {fv.field: fv for fv in results}
-    if sector:
-        for fv in (_components_detail(sector, provider),
-                   _subsector_detail(sector, provider)):
-            if fv is not None:
-                profile[fv.field] = fv
+    with universe.analysis_basket(sector or "", basket):
+        results, _gaps, _prov = fetcher.fetch_fields(fields, rep_code, provider, sector)
+        profile = {fv.field: fv for fv in results}
+        if sector:
+            for fv in (_components_detail(sector, provider),
+                       _subsector_detail(sector, provider)):
+                if fv is not None:
+                    profile[fv.field] = fv
     # 轮动/相对强弱类论点（R）需要标的代码与板块名本身（不是某个字段值），
     # 以双下划线键随 profile 传递，判定函数按需取用。
     profile["__code__"] = rep_code
@@ -140,18 +170,13 @@ def fetch_profile(
         for fv in _fetch_trigger_entity(trigger_code, provider).values():
             profile[fv.field] = fv
 
-    # 分析ETF：与 fetch_fields 内部路由用的是同一个解析结果（#73），
-    # 这里单独存一份是为了让 writer/viewpoint/内部底稿都能拿到"这份报告
-    # 的行情数据实际来自哪只 ETF"，不必各自重新判断一遍、也不会和取数路由
-    # 判断出两个不同的答案——分析对象与最终推荐挂钩的标的必须是同一个。
-    # 会比 fetch_fields 内部那次多查一遍（各一次 series_multi 判流动性），
-    # 但单只 ETF 一年期序列成本可忽略（DESIGN §配额说明），换来的是这里
-    # 拿到的 ETF 代码不依赖 fetch_fields 的内部实现细节，两处各自独立可信。
-    if sector:
-        from . import instruments as _inst
-        _i, _note = _inst.resolve_analysis_etf(sector, provider=provider)
-        profile["__etf__"] = _i.代码 if _i else ""
-        profile["__etf_note__"] = _note
+    # 分析ETF：上面已确定（显式指定优先，否则板块名反推），这里落进 profile 供
+    # writer/viewpoint/内部底稿引用。#85 起它同时是本次板块聚合的**真实成分来源**：
+    # `__etf_成分数__` 记录实际拿到几只真实成分（0 表示没取到、聚合退回了行业篮子），
+    # 内部底稿据此如实标注这份报告的板块口径到底来自 ETF 真实成分还是行业近似。
+    profile["__etf__"] = etf_code
+    profile["__etf_note__"] = etf_note
+    profile["__etf_成分数__"] = len(basket)
 
     # 人工覆盖放在**最后**：先让机器尽力取，取不到的才由人补，
     # 人工值不会挡住本来能自动取到的数据。判定字段不可覆盖（见 core/overrides.py），
@@ -491,6 +516,7 @@ def prepare(rep_code: str, sector: str | None = None,
             provider: DataProvider | None = None, *,
             with_docs: bool = False, topic: str = "",
             trigger_code: str = "", trigger_name: str = "",
+            analysis_etf: str = "",
             overrides=None) -> Prepared:
     """摸底取数 + 跑触发引擎（+ 可选抽取 sources/ 的研报），返回候选清单原料。
 
@@ -505,7 +531,7 @@ def prepare(rep_code: str, sector: str | None = None,
     provider = provider or get_provider()
     profile = fetch_profile(rep_code, sector, provider,
                             trigger_code=trigger_code, trigger_name=trigger_name,
-                            overrides=overrides)
+                            analysis_etf=analysis_etf, overrides=overrides)
     try:
         fired = th.triggered_theses(profile)
     except Exception:
@@ -719,6 +745,7 @@ def run(
     genre: dict | None = None,
     context: dict | None = None,
     sector: str | None = None,
+    analysis_etf: str = "",
     prepared: Prepared | None = None,
     chosen: list[str] | None = None,
     overrides=None,
@@ -733,7 +760,8 @@ def run(
 
     # ①【数据先行】摸底：先把论点库判定所需的全部字段查一遍，不预设最后选哪条论点
     if prepared is None:
-        prepared = prepare(rep_code, sector, provider, overrides=overrides)
+        prepared = prepare(rep_code, sector, provider,
+                           analysis_etf=analysis_etf, overrides=overrides)
     profile = prepared.profile
 
     # 被勾选的研报观点（chosen 里 doc_ 打头的那些）
@@ -877,6 +905,21 @@ def _pick_underlying(ma, topic, topic_type, context, plan, client, provider):
         return None
 
 
+def _explicit_etf_from_brief(b) -> str:
+    """需求里用户**点名**的可交易 ETF（已过代码校验），作为本次分析 ETF 的显式指定。
+
+    修的是"用户给了酒ETF 512690.SH，却因板块名被 LLM 飘成食品饮料而分析了另一个
+    篮子"的 bug（用户实测暴露）。代表标的刻意选个股（供 PB/ROE 等财务字段取数），
+    这里另取候选里那只被丢弃的 ETF——它才是用户真正要分析、也要挂钩的对象。
+    """
+    from . import universe
+
+    for t in getattr(b, "候选标的", []) or []:
+        if getattr(t, "可用", False) and universe._is_fund(getattr(t, "代码", "")):
+            return t.代码
+    return ""
+
+
 def prepare_from_brief(b, *, provider: DataProvider | None = None,
                        with_docs: bool = False, overrides=None) -> Prepared | None:
     """从需求解析结果做摸底+触发，供人工勾选。代表标的不可用时返回 None。"""
@@ -892,6 +935,7 @@ def prepare_from_brief(b, *, provider: DataProvider | None = None,
     return prepare(t.代码, (b.涉及板块[0] if b.涉及板块 else None), provider,
                    with_docs=with_docs, topic=主题,
                    trigger_code=trigger_code, trigger_name=trigger_name,
+                   analysis_etf=_explicit_etf_from_brief(b),
                    overrides=overrides)
 
 
@@ -927,6 +971,7 @@ def run_from_brief(
     ma = run(b.主题, b.主导类型, target.代码, client=client, provider=provider,
              genre=b.混合体裁, context=ctx,
              sector=(b.涉及板块[0] if b.涉及板块 else None),
+             analysis_etf=_explicit_etf_from_brief(b),
              prepared=prepared, chosen=chosen, overrides=overrides)
     ma.外部事实待补 = 仍缺
     ma.外部事实已填 = 填好的

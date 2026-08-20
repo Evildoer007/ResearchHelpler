@@ -211,7 +211,10 @@ def sector_frames(sector: str, *, years: int = 3, top: int = 30,
 
     f = SectorFrames(板块=sector)
     path = _sector_cache(sector, years, top)
-    if use_cache and path.exists():
+    # 分析篮子被 ETF 真实成分覆盖时（#85）绕过缓存：与 aggregate 同理，
+    # ETF 真实篮子的历史序列不能与 iwencai 行业篮子共用按板块名的缓存键。
+    override = universe.has_basket_override(sector)
+    if use_cache and not override and path.exists():
         try:
             d = json.loads(path.read_text(encoding="utf-8"))
             return SectorFrames(**d)
@@ -283,7 +286,7 @@ def sector_frames(sector: str, *, years: int = 3, top: int = 30,
     if not f.ok:
         f.error = f"有效交易日不足({len(f.日期)}点)"
         return f
-    if use_cache:
+    if use_cache and not override:
         path.write_text(json.dumps(f.__dict__, ensure_ascii=False), encoding="utf-8")
     return f
 
