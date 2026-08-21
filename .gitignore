@@ -11,6 +11,7 @@ data_cache/
 
 # ==== 生成物 / 预览 ====
 output/
+tmp/
 _preview_*
 # 只忽略**根目录**的下划线临时脚本（_run*.py / _dbg*.py 这类一次性诊断脚本）。
 # 不能写成 `_*.py`——那会连 `core/__init__.py` 一起误伤（它也以下划线开头），
@@ -37,12 +38,14 @@ __pycache__/
 .venv/
 venv/
 
-# ==== OptionHelper 完整版集成（#84）====
-# 独立隔离环境（装它自己精确锁定的 numpy/pandas/scipy/numba 版本，与本项目
-# 环境分开，不共用、不提交）；.optionhelper/ 是它自己的项目级 Store（data/
-# result/runtime），运行时生成，同样不提交。
+# ==== OptionHelper Skill 本地运行状态 ====
+# 旧隔离环境保留忽略规则，避免历史目录误提交；新版明确选择的 Python 可在任意
+# 外部环境中。.optionhelper/ 存 Agent selection、memory 与 runtime；data/result
+# 是受控资产与正式交付 Store。三者都可能含行情、合同和本地身份信息，绝不提交。
 .optionhelper_venv/
 .optionhelper/
+/data/
+/result/
 
 # ==== 打包产物 ====
 build/

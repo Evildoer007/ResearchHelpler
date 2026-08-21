@@ -253,6 +253,9 @@ _PAGE_LIMIT = 1123              # A4 在 96dpi 下的高度（原写 1160 是按
 _PX_UNDERLYING_BASE = 95        # 标的行 + 报价说明，无挂钩理由/推荐结构时
 _PX_UNDERLYING_WHY = 25         # 加一行挂钩理由（择优映射类需求才有）
 _PX_UNDERLYING_STRUCT = 30      # 加一行 OptionHelper 推荐结构
+_PX_QUOTE_BASE = 42             # 报价节标题、组间距与表后提示
+_PX_QUOTE_GROUP = 22            # 每个挂钩标的分组标题
+_PX_QUOTE_ROW = 24              # 表头或一行报价
 
 
 def _chart_px(n: int) -> float:
@@ -296,6 +299,18 @@ def _underlying_px(ma, rc, oh=None) -> float:
     return px
 
 
+def _quote_px(oh=None) -> float:
+    """正式参考报价表估高；列数影响宽度，不影响纵向预算。"""
+    if oh is None or not getattr(oh, "ok", False):
+        return 0.0
+    groups = list(getattr(oh, "quote_groups", []) or [])
+    if not groups:
+        return 0.0
+    return (_PX_QUOTE_BASE
+            + len(groups) * (_PX_QUOTE_GROUP + _PX_QUOTE_ROW)
+            + sum(len(getattr(group, "rows", []) or []) * _PX_QUOTE_ROW for group in groups))
+
+
 def _page_budget(ma, rc, oh_result=None) -> list[str]:
     """版面预算体检：估算这份成品大概占多高，超了就报警。
 
@@ -319,15 +334,17 @@ def _page_budget(ma, rc, oh_result=None) -> list[str]:
     concl = len(rc.核心结论 or "")
     chart_px = sum(_chart_px(n) for n in per_logic)
     under_px = _underlying_px(ma, rc, oh_result)
+    quote_px = _quote_px(oh_result)
     est = (_PX_FIXED + concl * _PX_PER_CHAR_CONCL
            + sum(bodies) * _PX_PER_CHAR_BODY
-           + len(bodies) * _PX_PER_LOGIC + chart_px + under_px)
+           + len(bodies) * _PX_PER_LOGIC + chart_px + under_px + quote_px)
     pages = est / _PAGE_LIMIT
 
     out = ["### 版面预算", "",
            f"- 核心结论 {concl} 字｜正文 {bodies}（合计 {sum(bodies)} 字）"
            f"｜配图 {per_logic}（合计 {charts} 张，占 {chart_px:.0f}px）"
-           + (f"｜挂钩标的卡片 {under_px:.0f}px" if under_px else ""),
+           + (f"｜挂钩标的卡片 {under_px:.0f}px" if under_px else "")
+           + (f"｜参考报价表 {quote_px:.0f}px" if quote_px else ""),
            f"- 估算高度 ≈ {est:.0f}px，约 **{pages:.2f} 页**（阈值 1 页 = {_PAGE_LIMIT}px）",
            ""]
     if any(n > CAP for n in 超额):
@@ -568,10 +585,8 @@ def _viewpoint_section(ma, rc) -> list[str]:
     if not pkg.ok:
         return [f"（观点包不可用：{pkg.error}）", ""]
 
-    # ① 实际发送给 OptionHelper 的**原文**。这是唯一真正传出去的东西——一段自然
-    #    语言散文，不含表格、不含论点库代号、不含数据代表标的这类内部锚点字段
-    #    （它的 Recommender 是让另一个模型读文字理解观点的，那些东西只会干扰）。
-    #    照原样贴出来，分析师一眼能看到"OptionHelper 到底收到了什么"，不必猜。
+    # ① 实际发送给 OptionHelper 的原文。它仅由已验证市场事实组成，不含 writer
+    #    结论、产品建议、结构、期限或执行价；照原样贴出来便于逐字核对。
     out = ["**① 实际发送给 OptionHelper 的内容**（自然语言原文，逐字如下）：", ""]
     try:
         from core import optionhelper_bridge as _ohb
@@ -581,9 +596,8 @@ def _viewpoint_section(ma, rc) -> list[str]:
         sent = f"（无法生成发送原文：{type(e).__name__}: {e}）"
     out += ["```", sent, "```", ""]
 
-    # ② 以下全部是**分析师核对用、不发送给 OptionHelper** 的内部信息：挂钩标的口径、
-    #    数据锚点、择优过程、每条逻辑对应的论点库代号与特征。放这儿是为了留痕与核对，
-    #    但绝不进发送原文——代号/表格/内部锚点混进去会让下游模型误读。
+    # ② 以下全部是分析师核对用、不发送给 OptionHelper 的内部信息：挂钩标的口径、
+    #    数据锚点、择优过程、每条逻辑对应的论点库代号与特征。
     out += ["**② 分析师核对用（不发送给 OptionHelper）**", ""]
     out.append(f"- **挂钩标的**：{pkg.标的名称}（{pkg.标的代码}）" if pkg.标的代码
                else f"- **挂钩标的**：未定 —— {pkg.标的口径}")
@@ -596,15 +610,31 @@ def _viewpoint_section(ma, rc) -> list[str]:
                    "（仅为取数与相对强弱的锚点，**不是挂钩对象**）")
     if getattr(pkg, "挂钩理由", ""):
         out.append(f"- **挂钩理由**：{pkg.挂钩理由}")
+    if getattr(pkg, "标的选择说明", ""):
+        out.append(f"- **标的选择说明**：{pkg.标的选择说明}")
+    out += ["", "| 市场字段 | 数值 | 来源 | 截止日 |", "|---|---|---|---|"]
+    for fact in pkg.市场事实:
+        out.append(f"| {fact.标签} | {fact.数值} | {fact.来源 or '—'} | {fact.截止日 or '—'} |")
+    outlook = pkg.市场展望
+    out += ["", "**市场展望（仅市场判断，不含结构建议）**", ""]
+    out.append(f"- **预计方向**：{outlook.方向 or '—'}")
+    if outlook.窗口:
+        out.append("- **观察窗口**：" + "、".join(outlook.窗口))
+    if outlook.支持因素:
+        out.append("- **主要支持因素**：" + "、".join(outlook.支持因素))
+    if outlook.制约因素:
+        out.append("- **主要制约因素**：" + "、".join(outlook.制约因素))
+    if outlook.需验证风险:
+        out.append("- **需持续验证的风险**：" + "、".join(outlook.需验证风险))
     out += _selection_section(ma)
     out += [
         "",
-        "| 逻辑 | 方向 | 强度 | 窗口 | 确定性 | 市场含义（方向/时间尺度/波动率/失效条件）|",
+        "| 逻辑 | 方向 | 强度 | 窗口 | 确定性 | 风险点 |",
         "|---|---|---|---|---|---|",
     ]
     for lv in pkg.逻辑要点:
         out.append(f"| `{lv.逻辑id}` | {lv.方向 or '—'} | {lv.强度 or '—'} | "
-                   f"{lv.窗口 or '—'} | {lv.确定性 or '—'} | {lv.市场含义 or '—'} |")
+                   f"{lv.窗口 or '—'} | {lv.确定性 or '—'} | {lv.风险点 or '—'} |")
     out.append("")
     out += [
         "> 观点包只重整已有数据，**不产生任何新数字**，其中每个数都能追回摸底取数或论点库判定。",
@@ -620,7 +650,7 @@ def _viewpoint_section(ma, rc) -> list[str]:
 
 
 def _optionhelper_section(oh) -> list[str]:
-    """OptionHelper 完整版（推荐+定价+回测+报告）本次调用结果——不管成败都要落一笔。
+    """OptionHelper 最新 Skill 正式 Quote 的本次调用结果——不管成败都要落一笔。
 
     `--optionhelper` 没开时 `oh is None`，如实写"未调用"；开了但失败时把 stage/
     error/missing 原样摊开，让分析师能直接照着补（缺 token 还是缺环境一看便知），
@@ -645,12 +675,18 @@ def _optionhelper_section(oh) -> list[str]:
     if oh.module_failures:
         out.append("- **未完成模块**：" + "；".join(f"{k}：{v}" for k, v in oh.module_failures.items()))
     if oh.report_path:
-        out.append(f"- **完整报告文件**：`{oh.report_path}`")
+        out.append(f"- **正式 Quote 文件**：`{oh.report_path}`")
+    if getattr(oh, "designer_input_path", ""):
+        out.append(f"- **冻结报价事实**：`{oh.designer_input_path}`")
+    groups = list(getattr(oh, "quote_groups", []) or [])
+    if groups:
+        out.append(f"- **一页通表格**：{len(groups)} 组、"
+                   f"{sum(len(group.rows) for group in groups)} 行正式参考报价")
     if oh.assumptions:
         out.append("- **计算假设**：" + "；".join(oh.assumptions))
     out.append("")
-    out.append("> 结构、条款、定价、回测均由 OptionHelper 自己的 Recommender/Pricer/"
-               "Backtester 产出，本系统只转交了一段自然语言市场观点，不参与选型。")
+    out.append("> 结构选择由当前对话 Agent 按新版 Recommender 指南完成；合同、取数、"
+               "收益结构、定价与冻结交付由 OptionHelper 受控链路完成。本系统不推导表格数值。")
     out.append("")
     return out
 
@@ -677,7 +713,7 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str, oh_result=None) ->
     lines += _source_table(ma)
     lines += ["---", "", "## 二、给 OptionHelper 的观点包", ""]
     lines += _viewpoint_section(ma, rc)
-    lines += ["---", "", "## 三、OptionHelper 完整版调用结果", ""]
+    lines += ["---", "", "## 三、OptionHelper 正式参考报价调用结果", ""]
     lines += _optionhelper_section(oh_result)
     lines += ["---", "", "## 四、需要人工补充的数据", ""]
 

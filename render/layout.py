@@ -365,6 +365,26 @@ _CSS = """
    正确做法是按真实家族名引用，并把基础家族列在后面兜底：
    命中专用家族时其自带字重生效，命中不到时由 font-weight 数值作用于基础家族。 */
 :root {
+  /* 与 OptionHelper Designer 的 design_tokens.py 对齐；以下是唯一的页面色板。 */
+  --oh-brand-red: #C8102E;
+  --oh-brand-red-deep: #890D26;
+  --oh-brand-red-soft: #FBF1F3;
+  --oh-paper: #FFFDFB;
+  --oh-ground: #F5F1F0;
+  --oh-surface: #FFFFFF;
+  --oh-ink: #241D20;
+  --oh-ink-soft: #44383C;
+  --oh-muted: #6E5F63;
+  --oh-muted-soft: #75666A;
+  --oh-blue-gray: #49647D;
+  --oh-blue-gray-soft: #F3F6F8;
+  --oh-risk-gold-soft: #FBF7EE;
+  --oh-rule: #E9DADC;
+  --oh-paper-border: #E7D8DB;
+  --oh-red-border-soft: #E5C5CC;
+  --oh-red-surface: #FFFAFA;
+  --oh-table-border: #DDBCC3;
+  --oh-table-head-ink: #59353D;
   --f-fallback: "Noto Sans CJK SC","HarmonyOS Sans SC","Alibaba PuHuiTi","DengXian","等线",sans-serif;
   --f-reg: "Source Han Sans SC", var(--f-fallback);
   --f-med: "Source Han Sans SC Medium","Source Han Sans SC", var(--f-fallback);
@@ -379,43 +399,43 @@ _CSS = """
 /* 极淡米黄底（#82）：纯白版面在长文档里发刺眼，暖底更接近纸感；
    外围比页面略深一档，页面才"浮"得起来。图表画布同色（style.SURFACE），
    避免图在米黄页面上呈现为一块块白方块。 */
-body { margin:0; background:#F7F0EF; color:#2B2724;
+body { margin:0; background:var(--oh-ground); color:var(--oh-ink);
        font-family:var(--f-reg); }
 /* ⚠ 版面宽度必须对齐纸张（#83 实测）：原先 width:820px + padding 32px×2
    在 content-box 下实占 884px，而 A4 在 96dpi 下只有 794px——**宽出 90px**。
    只做 HTML 时看不出来（浏览器可横向滚），一导 PDF 就右边被裁。
    改为 border-box + 794px：padding 含在宽内，正文净宽 794-60=734px。 */
-.page { box-sizing:border-box; width:794px; margin:14px auto; background:#FEFBFA;
-        padding:22px 30px; box-shadow:0 2px 12px rgba(0,0,0,.12); }
+.page { box-sizing:border-box; width:794px; margin:14px auto; background:var(--oh-paper);
+        padding:22px 30px; box-shadow:0 2px 12px rgb(44 53 62 / .10); }
 
 /* 打印/导 PDF 时：纸张 A4、零边距（版面自带 padding），去掉屏幕用的投影与外底色 */
 @page { size:A4; margin:0; }
 @media print {
-  body { background:#fff; margin:0; }
+  body { background:var(--oh-surface); margin:0; }
   .page { margin:0; box-shadow:none; }
 }
 /* 标题直接顶在最上面：原先上方有一行机构名+日期的页眉，已按要求去掉 */
 /* 字重（#82）：思源黑体可用 500/700/900。主标题用 900 拉开层级，
    正文 500 保证长文可读，行内重点 <b> 直接跳到 900 —— 500→900 的
    落差比 500→700 明显得多，重点才真正"跳"出来。 */
-h1 { font-size:16px; color:#2B2724; margin:0 0 3px; line-height:1.35;
+h1 { font-size:16px; color:var(--oh-ink); margin:0 0 3px; line-height:1.35;
      font-family:var(--f-heavy); font-weight:700; }
-h1 .accent { color:#9B2226; }
-.sub { font-size:10px; color:#8A837C; margin-bottom:10px; }
+h1 .accent { color:var(--oh-brand-red); }
+.sub { font-size:10px; color:var(--oh-muted); margin-bottom:10px; }
 /* 正文与核心结论的字号：#80 一并下调，换取更长的论述而版面高度不涨。
    一页通的约束是"一页"，不是"字少"——同样的高度里，小一号字能多容
    约三成内容，而 12px/12.5px 在 820px 宽的版面上仍清晰可读。 */
-.concl { background:#FDF7F6; border-left:3px solid #9B2226; padding:9px 11px; margin:7px 0 12px; font-size:11px; line-height:1.62; font-family:var(--f-med); font-weight:500; }
-.concl .lbl { color:#9B2226; font-family:var(--f-heavy); font-weight:700; letter-spacing:2px; margin-right:8px; }
-.concl b { font-family:var(--f-heavy); font-weight:700; color:#9B2226; }
+.concl { background:var(--oh-brand-red-soft); border-left:3px solid var(--oh-brand-red); padding:9px 11px; margin:7px 0 12px; font-size:11px; line-height:1.62; font-family:var(--f-med); font-weight:500; }
+.concl .lbl { color:var(--oh-brand-red); font-family:var(--f-heavy); font-weight:700; letter-spacing:2px; margin-right:8px; }
+.concl b { font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red); }
 .logic { margin:18px 0; }
-.tag { display:inline-block; background:#9B2226; color:#fff; font-size:9.5px; padding:1px 7px; border-radius:2px; margin-right:6px; font-weight:700; }
-.ltitle { font-size:12px; font-family:var(--f-heavy); font-weight:700; color:#2B2724; }
+.tag { display:inline-block; background:var(--oh-brand-red); color:var(--oh-surface); font-size:9.5px; padding:1px 7px; border-radius:2px; margin-right:6px; font-weight:700; }
+.ltitle { font-size:12px; font-family:var(--f-heavy); font-weight:700; color:var(--oh-ink); }
 /* 字重 500 = 思源黑体 Medium。Regular(400) 在小字号下偏细，观感发灰；
    Medium 更接近传统黑体的密度，正文读起来更实。重点由 <b>(700) 承担。 */
-.body { font-size:10.5px; line-height:1.62; color:#332F2B; margin:5px 0;
+.body { font-size:10.5px; line-height:1.62; color:var(--oh-ink-soft); margin:5px 0;
         font-family:var(--f-med); font-weight:500; }
-.body b { font-family:var(--f-heavy); font-weight:700; color:#9B2226; }
+.body b { font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red); }
 .chart { text-align:center; margin:10px 0; }
 /* 宽度由 <img width> 按 CSS_DPI 定死，这里只兜底防溢出 */
 .chart img { max-width:100%; height:auto; }
@@ -435,53 +455,68 @@ h1 .accent { color:#9B2226; }
 /* ---- HTML 原生图表（排版型，不走 matplotlib）---- */
 /* 限宽并居中，与 matplotlib 图的显示宽度（约 55~70% 正文宽）保持一致，
    否则排版型图会通栏、数值型图偏窄，同一页里两种图一大一小很割裂 */
-.htmlchart { text-align:left; border:1px solid #E4DFD6; background:#FCFAF9; padding:10px 12px;
+.htmlchart { text-align:left; border:1px solid var(--oh-rule); background:var(--oh-surface); padding:10px 12px;
              max-width:560px; margin:0 auto; font-size:12px; }
-.c-title { font-size:11px; font-family:var(--f-heavy); font-weight:700; color:#9B2226; text-align:center; margin-bottom:7px; }
+.c-title { font-size:11px; font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red); text-align:center; margin-bottom:7px; }
 
 /* 分位标尺 */
 .g-row { margin:10px 0; }
-.g-head { display:flex; justify-content:space-between; font-size:12px; color:#2B2724; margin-bottom:4px; }
-.g-head .g-val { color:#9B2226; font-weight:bold; }
-.g-track { position:relative; height:10px; background:#EDE8E6; border-radius:5px; }
-.g-fill { position:absolute; left:0; top:0; height:100%; background:#D9BFBF; border-radius:5px 0 0 5px; }
-.g-dot { position:absolute; top:-3px; width:4px; height:16px; background:#9B2226; border-radius:2px; transform:translateX(-2px); }
-.g-thr { position:absolute; top:-2px; width:1px; height:14px; background:#8A837C; }
-.g-thrlab { position:absolute; top:14px; font-size:9px; color:#8A837C; transform:translateX(-50%); white-space:nowrap; }
-.g-foot { display:flex; justify-content:space-between; font-size:10px; color:#8A837C; margin-top:12px; }
+.g-head { display:flex; justify-content:space-between; font-size:12px; color:var(--oh-ink); margin-bottom:4px; }
+.g-head .g-val { color:var(--oh-brand-red); font-weight:bold; }
+.g-track { position:relative; height:10px; background:var(--oh-rule); border-radius:5px; }
+.g-fill { position:absolute; left:0; top:0; height:100%; background:var(--oh-red-border-soft); border-radius:5px 0 0 5px; }
+.g-dot { position:absolute; top:-3px; width:4px; height:16px; background:var(--oh-brand-red); border-radius:2px; transform:translateX(-2px); }
+.g-thr { position:absolute; top:-2px; width:1px; height:14px; background:var(--oh-muted); }
+.g-thrlab { position:absolute; top:14px; font-size:9px; color:var(--oh-muted); transform:translateX(-50%); white-space:nowrap; }
+.g-foot { display:flex; justify-content:space-between; font-size:10px; color:var(--oh-muted); margin-top:12px; }
 
 /* 两列对照 */
 .tc { display:flex; gap:12px; }
-.tc-col { flex:1; border:1px solid #E4DFD6; padding:8px 10px; }
-.tc-col.tc-0 { background:#FBF3F2; }
-.tc-col.tc-1 { background:#F1F7F3; }
-.tc-head { font-size:12px; font-weight:bold; color:#6f6f6f; text-align:center; margin-bottom:6px; }
+.tc-col { flex:1; border:1px solid var(--oh-rule); padding:8px 10px; }
+.tc-col.tc-0 { background:var(--oh-brand-red-soft); }
+.tc-col.tc-1 { background:var(--oh-blue-gray-soft); }
+.tc-head { font-size:12px; font-weight:bold; color:var(--oh-muted); text-align:center; margin-bottom:6px; }
 .tc-col ul { list-style:none; margin:0; padding:0; }
 .tc-col li { display:flex; justify-content:space-between; font-size:11.5px; line-height:1.7; }
-.tc-col li b { color:#9B2226; }
-.tc-col.tc-1 li b { color:#2E8B57; }
-.tc-note { font-size:11.5px; font-weight:bold; color:#9B2226; text-align:center; margin-top:8px; }
+.tc-col li b { color:var(--oh-brand-red); }
+.tc-col.tc-1 li b { color:var(--oh-blue-gray); }
+.tc-note { font-size:11.5px; font-weight:bold; color:var(--oh-brand-red); text-align:center; margin-top:8px; }
 
 /* 对比卡片组 */
 .cc { display:flex; gap:10px; }
-.cc-card { flex:1; border:1px solid #E4DFD6; background:#F6F1E6; padding:10px; text-align:center; }
-.cc-card.cc-hi { border:1.5px solid #9B2226; background:#FBF3F2; }
-.cc-h { font-size:13px; font-weight:bold; color:#2B2724; margin-bottom:8px; }
+.cc-card { flex:1; border:1px solid var(--oh-rule); background:var(--oh-risk-gold-soft); padding:10px; text-align:center; }
+.cc-card.cc-hi { border:1.5px solid var(--oh-brand-red); background:var(--oh-brand-red-soft); }
+.cc-h { font-size:13px; font-weight:bold; color:var(--oh-ink); margin-bottom:8px; }
 .cc-card ul { list-style:none; margin:0 0 8px; padding:0; }
-.cc-card li { font-size:11px; color:#6f6f6f; line-height:1.7; }
-.cc-card.cc-hi li { color:#2B2724; font-weight:bold; }
-.cc-cl { font-size:12px; font-weight:bold; color:#9B2226; border-top:1px solid #E4DFD6; padding-top:6px; }
-.pool { font-size:11.5px; color:#8A837C; border-top:1px dashed #E4DFD6; padding-top:7px; margin-top:12px; }
-.under { border:1px solid #E0D6D2; border-left:3px solid #8E1B23; background:#FCF9F8;
+.cc-card li { font-size:11px; color:var(--oh-muted); line-height:1.7; }
+.cc-card.cc-hi li { color:var(--oh-ink); font-weight:bold; }
+.cc-cl { font-size:12px; font-weight:bold; color:var(--oh-brand-red); border-top:1px solid var(--oh-rule); padding-top:6px; }
+.pool { font-size:11.5px; color:var(--oh-muted); border-top:1px dashed var(--oh-rule); padding-top:7px; margin-top:12px; }
+.under { border:1px solid var(--oh-paper-border); border-left:3px solid var(--oh-brand-red-deep); background:var(--oh-red-surface);
          border-radius:3px; padding:9px 12px; margin-top:14px; }
-.under .lbl { display:inline-block; font-size:11px; font-weight:700; color:#8E1B23;
+.under .lbl { display:inline-block; font-size:11px; font-weight:700; color:var(--oh-brand-red-deep);
               letter-spacing:1px; margin-bottom:4px; }
-.u-main { font-size:13px; color:#2b2b2b; line-height:1.6; }
-.u-why { font-size:12px; color:#4a4a4a; line-height:1.65; margin-top:4px; }
-.u-struct { font-size:12.5px; color:#2b2b2b; line-height:1.65; margin-top:6px; }
-.u-note { font-size:11px; color:#9a9a9a; margin-top:5px; }
-.src { font-size:10.5px; color:#6f6f6f; border-top:1px solid #E4DFD6; margin-top:14px; padding-top:7px; line-height:1.55; }
-.foot { font-size:9px; color:#938C84; border-top:1px solid #E4DFD6; margin-top:15px; padding-top:7px; line-height:1.55; }
+.u-main { font-size:13px; color:var(--oh-ink); line-height:1.6; }
+.u-why { font-size:12px; color:var(--oh-ink-soft); line-height:1.65; margin-top:4px; }
+.u-struct { font-size:12.5px; color:var(--oh-ink); line-height:1.65; margin-top:6px; }
+.u-note { font-size:11px; color:var(--oh-muted-soft); margin-top:5px; }
+/* 参考 0720 成品：报价是正文最末一块，暖灰表头、细边线、末列暗红强调。 */
+.quote { margin-top:13px; page-break-inside:avoid; }
+.q-heading { text-align:center; color:var(--oh-brand-red-deep); font-family:var(--f-heavy); font-weight:700;
+             font-size:11px; letter-spacing:3px; margin:0 0 6px; }
+.q-meta { display:flex; justify-content:space-between; align-items:flex-end; gap:8px;
+          font-size:9px; color:var(--oh-muted); margin:5px 0 3px; }
+.q-group-title { color:var(--oh-table-head-ink); font-family:var(--f-med); font-weight:500; }
+.q-table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:9px; line-height:1.35; }
+.q-table th, .q-table td { border:1px solid var(--oh-table-border); padding:4px 5px; text-align:center;
+                           vertical-align:middle; overflow-wrap:anywhere; }
+.q-table th { background:var(--oh-brand-red-soft); color:var(--oh-table-head-ink); font-family:var(--f-heavy); font-weight:700; }
+.q-table td { background:var(--oh-red-surface); color:var(--oh-ink-soft); }
+.q-table td:first-child { font-family:var(--f-heavy); font-weight:700; }
+.q-table td:last-child { color:var(--oh-brand-red-deep); font-family:var(--f-heavy); font-weight:700; }
+.q-note { font-size:8.5px; line-height:1.45; color:var(--oh-muted-soft); margin:4px 0 0; text-align:right; }
+.src { font-size:10.5px; color:var(--oh-muted); border-top:1px solid var(--oh-rule); margin-top:14px; padding-top:7px; line-height:1.55; }
+.foot { font-size:9px; color:var(--oh-muted-soft); border-top:1px solid var(--oh-rule); margin-top:15px; padding-top:7px; line-height:1.55; }
 .ft-line { margin-top:3px; }
 """
 
@@ -545,12 +580,15 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None
     # 印在客户版面上既突兀又与正文重复。可选池论点仍在内部底稿的观点包里可查。
 
     # 「挂钩标的与推荐结构」：标的卡片（为什么是它、代表什么暴露）常驻；
-    # 结构与报价那半只在传入 oh_result 时才出现——由 main.py 的 --optionhelper
-    # 开关控制是否实际调用完整版（推荐+定价+回测+报告），失败时 _underlying_block
+    # 结构与报价只在传入 oh_result 时出现——由 main.py 的 --optionhelper quote
+    # 开关控制是否实际调用新版 Skill，失败时 _underlying_block
     # 自动退回旧版"报价由交易台确定"的措辞，不阻断客户版面生成。
     under_html = _underlying_block(ma, rc, oh_result)
     if under_html:
         sections.append(under_html)
+    quote_html = _quote_block(oh_result)
+    if quote_html:
+        sections.append(quote_html)
 
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>{_CSS}</style></head><body>
     <div class="page">
@@ -563,7 +601,7 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None
 
 
 def _underlying_block(ma, rc, oh=None) -> str:
-    """「挂钩标的与推荐结构」一节。标的卡片常驻；结构·报价那半来自 OptionHelper 完整版。
+    """「挂钩标的与推荐结构」一节；正式 Quote 表由其后的 `_quote_block` 渲染。
 
     与 #70 不冲突：#70 撤掉的是**内部工作信息**（板块口径、数据代表标的、
     自有数据源），而"建议挂钩哪个标的、为什么"恰恰是模板里印给客户看的内容，
@@ -590,21 +628,23 @@ def _underlying_block(ma, rc, oh=None) -> str:
     if not getattr(pkg, "ok", False) or not pkg.标的代码:
         return ""
 
-    理由 = pkg.挂钩理由 or pkg.板块理由 or ""
+    # 只展示市场状态和为什么选这只 ETF；不在 Research Helper 卡片中夹带结构建议。
+    市场情况 = pkg.页面市场摘要 or "市场数据待补"
+    理由 = pkg.标的选择说明 or pkg.挂钩理由 or pkg.板块理由 or ""
     rows = [f'<b>{pkg.标的名称}</b>（{pkg.标的代码}）']
     if pkg.整体方向:
         rows.append(f"整体方向：{pkg.整体方向}")
     if pkg.波动率看法:
         rows.append(pkg.波动率看法)
     head = "　｜　".join(rows)
-    body = f'<div class="u-why">{理由}</div>' if 理由 else ""
+    body = (f'<div class="u-why"><b>市场情况</b>：{_esc(市场情况)}。'
+            + (f' <b>选取原因</b>：{_esc(理由)}' if 理由 else "") + '</div>')
 
     if oh is not None and getattr(oh, "ok", False) and oh.product_name:
         struct = (f'<div class="u-struct"><b>推荐结构</b>：{_esc(oh.product_name)}'
                   + (f'（{_esc(oh.product_id)}）' if oh.product_id else "")
                   + (f'　{_esc(oh.reason)}' if oh.reason else "") + '</div>')
-        note = ('<div class="u-note">定价与历史回测见 OptionHelper 完整报告（路径见内部底稿）'
-                '；本页不重复展开测算过程。</div>')
+        note = ''
         if oh.coverage_status == "partial":
             note = ('<div class="u-note">⚠ 部分计算模块未完成，结构与报价以 '
                     'OptionHelper 报告的缺口标注为准，本页仅供参考。</div>')
@@ -615,6 +655,38 @@ def _underlying_block(ma, rc, oh=None) -> str:
 
     return (f'<div class="under"><span class="lbl">挂钩标的</span>'
             f'<div class="u-main">{head}</div>{body}{struct}{note}</div>')
+
+
+def _quote_block(oh) -> str:
+    """渲染最新版 Designer 冻结的变列 Quote 表，不推导、不改写任何报价。"""
+    if oh is None or not getattr(oh, "ok", False):
+        return ""
+    groups = list(getattr(oh, "quote_groups", []) or [])
+    if not groups:
+        return ""
+    rendered: list[str] = []
+    for group in groups:
+        columns = list(getattr(group, "columns", []) or [])
+        rows = list(getattr(group, "rows", []) or [])
+        if not columns or not rows:
+            continue
+        head = "".join(f'<th scope="col">{_esc(column.label)}</th>' for column in columns)
+        body_rows = []
+        for row in rows:
+            cells = "".join(f'<td>{_esc(row.get(column.key, "—"))}</td>' for column in columns)
+            body_rows.append(f"<tr>{cells}</tr>")
+        date = f'<span>报价日期：{_esc(oh.quote_date)}</span>' if oh.quote_date else ""
+        rendered.append(
+            '<div class="q-group">'
+            f'<div class="q-meta"><span class="q-group-title">{_esc(group.title)}</span>{date}</div>'
+            f'<table class="q-table"><thead><tr>{head}</tr></thead>'
+            f'<tbody>{"".join(body_rows)}</tbody></table></div>'
+        )
+    if not rendered:
+        return ""
+    note = oh.quote_note or "以上为参考报价，实际以交易台正式报价为准。"
+    return ('<section class="quote"><div class="q-heading">推荐结构 · 参考报价</div>'
+            + "".join(rendered) + f'<p class="q-note">{_esc(note)}</p></section>')
 
 
 _DISCLAIMER = (

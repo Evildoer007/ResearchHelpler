@@ -906,16 +906,20 @@ def _pick_underlying(ma, topic, topic_type, context, plan, client, provider):
 
 
 def _explicit_etf_from_brief(b) -> str:
-    """需求里用户**点名**的可交易 ETF（已过代码校验），作为本次分析 ETF 的显式指定。
+    """仅当用户原文**实际点名**时，返回可交易 ETF 作为显式分析标的。
 
-    修的是"用户给了酒ETF 512690.SH，却因板块名被 LLM 飘成食品饮料而分析了另一个
-    篮子"的 bug（用户实测暴露）。代表标的刻意选个股（供 PB/ROE 等财务字段取数），
-    这里另取候选里那只被丢弃的 ETF——它才是用户真正要分析、也要挂钩的对象。
+    `候选标的`由需求解析器提出，不能反过来被当成用户指令。否则用户只说“消费板块”
+    时，模型若把酒ETF放进候选池，就会错误覆盖“消费 → 消费ETF”的既有映射。名称或
+    代码必须出现在原始需求中，才可优先于板块映射；代表标的仍优先选个股供基本面取数。
     """
     from . import universe
 
+    raw = str(getattr(b, "原始需求", "") or "").upper()
     for t in getattr(b, "候选标的", []) or []:
-        if getattr(t, "可用", False) and universe._is_fund(getattr(t, "代码", "")):
+        code = str(getattr(t, "代码", "") or "").upper()
+        name = str(getattr(t, "名称", "") or "").strip()
+        explicitly_named = (code and code in raw) or (name and name.upper() in raw)
+        if getattr(t, "可用", False) and explicitly_named and universe._is_fund(code):
             return t.代码
     return ""
 

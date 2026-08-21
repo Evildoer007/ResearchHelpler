@@ -154,19 +154,51 @@ python main.py -b "券商板块最近怎么样？" --pdf
 ### 调用 OptionHelper：`--optionhelper`
 
 ```bash
-python main.py -b "酒ETF估值如何，有没有配置价值？" --optionhelper card
-python main.py -b "酒ETF估值如何，有没有配置价值？" --optionhelper report --pdf
+python main.py -b "酒ETF估值如何，有没有配置价值？" --optionhelper quote
+python main.py -b "酒ETF估值如何，有没有配置价值？" --optionhelper quote --pdf
 ```
 
-`card` 生成研究简报，`report` 生成完整研究报告。研报助手只发送一段自然语言市场观点，
-不预选产品结构；OptionHelper 自己完成 Recommender → Pricer → Backtester → Reporter。
-调用成功时，客户版面展示推荐结构，完整定价与回测文件路径写入内部底稿；调用失败时，
-失败阶段和原因同样写入底稿，主流程继续生成，客户版面退回“由交易台依实时报价确定”的措辞。
+一页通只接入最新版 Skill 的 `quote` 正式交付。Research Helper 先把本次已验证的市场事实与
+市场展望交接给 OptionHelper；当前对话 Agent 再按 Recommender 指南完成 Intent / Research /
+Critic，并把已核验的产品选择写入项目级 `.optionhelper/selection.json`。Research Helper 不在
+观点包中建议产品或结构；OptionHelper 负责合同冻结、取数、收益结构、定价、Reporter 与
+Designer。调用成功时，研报助手只读取同一次 ReportRun 的 `designer-input.json`，在一页通
+最下方生成随本次结果变化的“推荐结构 · 参考报价”表；不会解析 HTML，也不会自行补价格。
+调用失败时，失败阶段和原因写入内部底稿，研究报告仍照常交付。
+
+观点包的固定边界是：`标的与选择原因`、`整体方向与历史波动率`、带来源和截止日的已验证
+市场事实，以及`市场展望`（预期方向、观察窗口、支持因素、制约因素、待验证风险）。它不包含
+产品名、结构、执行价、障碍或收益承诺。成品中的“挂钩标的”卡片也只简要罗列市场情况，并用
+一句话说明为何选取该标的。
+
+`selection.json` 使用最新版公开选择字段，例如：
+
+```json
+{
+  "selection": {
+    "product_id": "已由 Agent 核验的产品编号",
+    "underlyings": ["510300.SH"],
+    "reason": "与已确认市场情景及客户约束匹配的理由",
+    "suitable_for": [],
+    "not_suitable_for": [],
+    "main_risks": []
+  }
+}
+```
+
+若需要同一标的多行结构/参数报价，可由 Agent 额外提供新版协议支持的 `quote_variants`。
+客户在初始需求中明确的期限、最大损失、本金风险偏好应写入 `constraints`；例如
+`{"constraints": {"horizon": "6个月", "max_loss": "20%", "principal_fluctuation": true}}`。
+未填写时，Research Helper 会显式传入项目默认档案（3个月、最大损失100%、接受本金波动）；
+可在 `config.local.json` 的 `OPTIONHELPER_DEFAULT_CONSTRAINTS` 修改。客户本次输入优先于默认档案。
+执行价等已确认合同覆盖可与 `selection` 并列写入 `term_overrides`；例如
+`{"term_overrides": {"T": 0.5}}` 代表 6 个月。桥接层不自行估计价格或障碍。
+桥接层会校验 selection 的挂钩标的是否与本页一致，阻止误用上一份报告的选择。
 
 这些开关可以组合，例如：
 
 ```bash
-python main.py -b "需求…" --pick --overrides overrides.json --optionhelper report --pdf
+python main.py -b "需求…" --pick --overrides overrides.json --optionhelper quote --pdf
 ```
 
 ---
@@ -357,15 +389,19 @@ SK海力士）与代表标的、挂钩标的是三个不同角色：触发实体
 - 人工补数文件（`--overrides`），带来源留痕且禁止覆盖机械判定字段
 - PDF 导出与真实页数检查（`--pdf`）
 - 挂钩标的择优已接入；板块没有确定映射时才运行多维候选比较
-- OptionHelper 完整版桥接（`--optionhelper card|report`），支持推荐、定价、回测、报告及失败降级
+- 最新版 OptionHelper Skill Quote 桥接（`--optionhelper quote`）：消费正式冻结事实并在页底生成参考报价表
 
 **尚未完成**
 
 - 图形化人工补充面板；目前通过 JSON 覆盖文件回填并重跑
 - Word 导出
 - GUI 与 exe 打包
-- OptionHelper 仍是外部依赖：需要独立环境、自己的 iFinD Refresh Token，且输入资料或必要条款
-  不完整时可能停在 Recommender；失败不会阻断研究报告主流程
+- OptionHelper 仍是外部依赖：需要明确选择独立 Python、通过统一就绪检查、在项目 memory
+  保存 iFinD Refresh Token，并由当前对话 Agent 提供已验证 selection；失败不会阻断主流程
+- 情景收益带：基于预先冻结的市场状态筛选规则，计算相似历史状态下的未来收益分位区间；
+  由 Research Helper 生成、仅作为市场输入，OptionHelper 仍负责实时期权链和实际条款
+- 运行可观测性：主研究链路可自动完成，但命令行目前只给出阶段性输出；尚未提供 run_id、
+  结构化运行日志、逐阶段耗时、报价异步状态和失败后的交互式重试
 - “一页”尚不是硬保证：底稿会预估版面、PDF 会报告真实页数，但超页时目前仍需人工压缩内容或图表
 
 **已知短板**
@@ -379,6 +415,11 @@ SK海力士）与代表标的、挂钩标的是三个不同角色：触发实体
   自动化程度显著低于板块机会型。
 - 触发阈值多为实测拍定的经验值，仍需按实际研报口径校准。
 - 研报表格数列的自动抽取尚不稳定，图表主要仍来自行情数据。
+- OptionHelper 对含每日观察日程的产品（如双边鲨鱼鳍）目前可能在定价前被交易日日历绑定校验
+  拦截：历史数据覆盖边界与交易日历首尾交易日未完全一致时即拒绝继续。这是日期覆盖元数据
+  的一致性问题，不等同于行情缺失；不需要每日观察的普通结构不受该校验影响。长期应由
+  OptionHelper 将覆盖区间规范到实际首末交易日，或校验交易日集合完整包含；当前集成层不改写
+  OptionHelper，只记录失败并改选不依赖每日观察的已核验候选。
 
 ---
 
@@ -425,7 +466,7 @@ core/
   pipeline.py           编排：取数 → 触发 →（可选勾选）→ 规划 → 回填
   overrides.py          人工补数文件校验与回填（禁止覆盖判定字段）
   viewpoint.py          将报告重整为只描述市场状态的观点包
-  optionhelper_bridge.py OptionHelper 子进程桥接（推荐 / 定价 / 回测 / 报告）
+  optionhelper_bridge.py 最新 Skill Quote 桥接 + Designer 冻结报价事实读取
   writer.py             论述生成（证伪义务）
   validator.py          数字逐个溯源
   config.py             密钥加载与网络配置
@@ -445,21 +486,29 @@ llm/                    DeepSeek 封装
   "DEEPSEEK_API_KEY": "...",
   "IFIND_ACCOUNT": "...",
   "IFIND_PASSWORD": "...",
-  "OPTIONHELPER_ROOT": "C:/path/to/option-helper",
-  "OPTIONHELPER_PYTHON": "C:/path/to/.optionhelper_venv/Scripts/python.exe",
-  "IFIND_REFRESH_TOKEN": "..."
+  "OPTIONHELPER_SKILL_ROOT": "C:/Users/你的用户名/Desktop/option-helper_3/option-helper",
+  "OPTIONHELPER_PYTHON": "C:/明确选择的环境/python.exe"
 }
 ```
 
-前三项用于研报助手主流程。后三项只在使用 `--optionhelper` 时需要：
+前三项用于研报助手主流程。后两项只在使用 `--optionhelper quote` 时需要：
 
-- `OPTIONHELPER_ROOT` 指向包含 `scripts/tool_entry.py` 的 OptionHelper 项目根目录。
-- `OPTIONHELPER_PYTHON` 可省略；默认使用本项目 `.optionhelper_venv/Scripts/python.exe`。
-- `IFIND_REFRESH_TOKEN` 是 OptionHelper HTTP 接口自己的凭证，与本项目的
-  `IFIND_ACCOUNT` / `IFIND_PASSWORD` 不是同一套。
+- `OPTIONHELPER_SKILL_ROOT` 指向最新版 Skill 根目录；当前机器会自动发现桌面
+  `option-helper_3/option-helper`，换机时应显式配置。
+- `OPTIONHELPER_PYTHON` 不设默认值，必须先明确选择。桥接层每次正式调用前都会用同一个
+  绝对路径执行 Skill 的 `environment_check.py --check-readiness`；确认后的路径可保存在
+  被 Git 忽略的 `.optionhelper/interpreter.txt`，后续运行自动复用。
+- 正式入口会把本项目的 `.optionhelper/runtime`、`data`、`result` 分别注入为新版 Skill
+  的三个外部 Store；不会写入桌面的 Skill 安装目录，也不会沿用旧版嵌套 Store。
+- iFinD Refresh Token 不再放入 `config.local.json` 或环境变量。按 Skill 流程明确确认后，
+  使用 `environment_check.py --save-ifind-refresh-token --project-root <本项目目录>` 交互保存到
+  `.optionhelper/memory.md`；该目录已被 `.gitignore` 排除。
+- 默认从 `.optionhelper/selection.json` 读取 Agent 交接；如需更换位置，可配置
+  `OPTIONHELPER_SELECTION_PATH`。受控 Host 部署则配置 `OPTIONHELPER_HOST_URL`。
 
 LLM 使用 DeepSeek，默认模型 `deepseek-v4-pro`，可用 `DEEPSEEK_MODEL` 环境变量覆盖；
-OptionHelper 调用复用同一个 DeepSeek 模型网关。环境变量优先于 `config.local.json`。
+新版 OptionHelper 不复用该模型网关，也不会由桥接层启动第二个模型服务。环境变量优先于
+`config.local.json`。
 
 密钥不打包进 exe——可被反编译提取。分发时各人填写自己的密钥；
 若需大范围推广，走公司内网后端代理，统一充值、限流与审计。

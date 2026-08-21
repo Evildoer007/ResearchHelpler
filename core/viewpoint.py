@@ -39,7 +39,27 @@ class LogicView:
     窗口: str = ""
     确定性: str = ""
     风险点: str = ""
-    市场含义: str = ""   # lc.结论——writer 为下游归结的市场状态判断（方向/时间尺度/波动率/失效条件）
+
+
+@dataclass
+class MarketFact:
+    """可追溯的市场事实；只允许来自已验证 FieldValue。"""
+
+    标签: str
+    数值: str
+    来源: str = ""
+    截止日: str = ""
+
+
+@dataclass
+class MarketOutlook:
+    """对未来市场状态的受控表述，不包含任何产品或条款建议。"""
+
+    方向: str = ""
+    窗口: list[str] = dfield(default_factory=list)
+    支持因素: list[str] = dfield(default_factory=list)
+    制约因素: list[str] = dfield(default_factory=list)
+    需验证风险: list[str] = dfield(default_factory=list)
 
 
 @dataclass
@@ -56,6 +76,10 @@ class ViewPackage:
     板块理由: str = ""
     整体方向: str = ""              # rc.推荐方向
     波动率看法: str = ""            # 年化波动率 + 历史分位，拼成一句人可读的话
+    市场事实: list[MarketFact] = dfield(default_factory=list)
+    市场展望: MarketOutlook = dfield(default_factory=MarketOutlook)
+    页面市场摘要: str = ""          # 仅一页通使用；完整事实仍留在市场事实
+    标的选择说明: str = ""          # 为什么选择这个 ETF，不涉及产品结构
     逻辑要点: list[LogicView] = dfield(default_factory=list)
     风险提示汇总: list[str] = dfield(default_factory=list)   # 各条风险点去重保序
     ok: bool = False
@@ -117,6 +141,40 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
         整体方向=rc.推荐方向,
     )
 
+    # 观点包只选已取到的、可追溯的市场数据；不读取 writer 的结论，避免把
+    # LLM 对产品或条款的表述反向传给 OptionHelper。字段顺序同时决定下游摘要顺序。
+    fact_specs = (
+        ("PB", "PB"),
+        ("PB历史分位", "PB历史分位"),
+        ("归母净利同比", "归母净利同比"),
+        ("ROE", "ROE"),
+        ("板块区间涨跌幅", "板块区间涨跌幅"),
+        ("板块资金净流入", "板块资金净流入"),
+        ("成交额历史分位", "成交额历史分位"),
+    )
+    facts_by_field: dict[str, MarketFact] = {}
+    for field, label in fact_specs:
+        value = ma.field_values.get(field)
+        if value is None or not getattr(value, "ok", False) or not getattr(value, "display", ""):
+            continue
+        fact = MarketFact(label, value.display, value.source, value.as_of)
+        vp.市场事实.append(fact)
+        facts_by_field[field] = fact
+
+    # 卡片只占一行：优先呈现估值、盈利、资金三类互补状态；缺失时按已有事实补齐。
+    card_order = ("PB历史分位", "归母净利同比", "板块资金净流入", "PB", "ROE")
+    card_facts = [facts_by_field[field] for field in card_order if field in facts_by_field][:3]
+    if card_facts:
+        vp.页面市场摘要 = "　｜　".join(f"{item.标签} {item.数值}" for item in card_facts)
+
+    if inst is not None:
+        if 择优理由:
+            vp.标的选择说明 = 择优理由
+        else:
+            vp.标的选择说明 = (
+                f"该 ETF 与{sector or '本次'}研究主题匹配，且已通过取数阶段的流动性检查。"
+            )
+
     # 波动率是期权定价的核心输入（DESIGN §9.4 的"⑧衍生品维度"）。
     # 这两个字段本就在摸底阶段的必查清单里（required_fields 含"年化波动率"/
     # "波动率历史分位"，不依赖哪条论点触发），故这里几乎总能取到。
@@ -129,9 +187,13 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
         vp.波动率看法 = seg
 
     risks: list[str] = []
+    drivers: list[str] = []
+    headwinds: list[str] = []
+    windows: list[str] = []
     for lc in rc.logics:
         # 逻辑id 可能是论点库 id（V1/S3/R1…），也可能是研报观点（doc_N）
-        # 或自由槽（free_N）——后两者查不到论点库条目，特征留空，只保留市场含义。
+        # 或自由槽（free_N）——后两者查不到论点库条目，特征留空。这里故意
+        # 不读取 lc.结论：它由 writer/LLM 生成，且可能夹带结构或条款建议。
         t = lib.get(lc.逻辑id)
         feat = t.特征 if t else {}
         lv = LogicView(
@@ -141,12 +203,27 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
             窗口=feat.get("窗口", ""),
             确定性=feat.get("确定性", ""),
             风险点=feat.get("风险点", ""),
-            市场含义=lc.结论,
         )
         vp.逻辑要点.append(lv)
         if lv.风险点:
             risks.append(lv.风险点)
+        if lv.窗口:
+            windows.append(lv.窗口)
+        # 论点库名称与方向特征来自已触发、已校验的研究规则；它们只说明
+        # 未来市场状态的驱动和制约，不推导产品结构。
+        direction = lv.方向
+        if "看涨" in direction or direction == "涨":
+            drivers.append(t.名称 if t else lc.逻辑id)
+        elif "看跌" in direction or direction == "跌":
+            headwinds.append(t.名称 if t else lc.逻辑id)
     vp.风险提示汇总 = list(dict.fromkeys(risks))   # 去重，保留出现顺序
+    vp.市场展望 = MarketOutlook(
+        方向=vp.整体方向,
+        窗口=list(dict.fromkeys(windows))[:2],
+        支持因素=list(dict.fromkeys(drivers))[:3],
+        制约因素=list(dict.fromkeys(headwinds))[:3],
+        需验证风险=vp.风险提示汇总[:3],
+    )
 
     vp.ok = True
     return vp
@@ -173,14 +250,28 @@ def render(vp: ViewPackage) -> str:
     lines += [
         f"整体方向：{vp.整体方向 or '—'}",
         f"波动率看法：{vp.波动率看法 or '（未取到）'}",
+        f"页面市场摘要：{vp.页面市场摘要 or '（未取到）'}",
+        f"标的选择说明：{vp.标的选择说明 or '（未取到）'}",
         "",
-        "逻辑要点：",
+        "市场事实：",
     ]
+    for fact in vp.市场事实:
+        trace = " · ".join(item for item in (fact.来源, fact.截止日) if item)
+        lines.append(f"  · {fact.标签}：{fact.数值}" + (f"（{trace}）" if trace else ""))
+    outlook = vp.市场展望
+    lines += ["", "市场展望：", f"  · 方向：{outlook.方向 or '—'}"]
+    if outlook.窗口:
+        lines.append("  · 窗口：" + "、".join(outlook.窗口))
+    if outlook.支持因素:
+        lines.append("  · 支持因素：" + "、".join(outlook.支持因素))
+    if outlook.制约因素:
+        lines.append("  · 制约因素：" + "、".join(outlook.制约因素))
+    if outlook.需验证风险:
+        lines.append("  · 需验证风险：" + "、".join(outlook.需验证风险))
+    lines += ["", "逻辑特征："]
     for lv in vp.逻辑要点:
         feat = "、".join(x for x in [lv.方向, lv.强度, lv.窗口, lv.确定性] if x)
         lines.append(f"  · [{lv.逻辑id}] {feat or '（研报观点/自由槽，无论点库特征）'}")
-        if lv.市场含义:
-            lines.append(f"      市场含义：{lv.市场含义}")
         if lv.风险点:
             lines.append(f"      风险点：{lv.风险点}")
     if vp.风险提示汇总:

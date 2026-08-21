@@ -11,13 +11,10 @@
       python main.py -b "需求…" --pdf
   默认只出 HTML；--pdf 会额外渲染一份 PDF 并报出**真实页数**。
 
-加 --optionhelper card|report 接入 OptionHelper 完整版（推荐+定价+回测+报告）：
-      python main.py -b "需求…" --optionhelper card
-  card=研究简报，report=完整研究报告。需要三项前置（见 core/config.py）：
-  OPTIONHELPER_ROOT、能装下其 requirements.lock 的独立解释器（默认用项目自带
-  的 .optionhelper_venv）、IFIND_REFRESH_TOKEN（它自己的 iFind 凭证，与本项目
-  IFIND_ACCOUNT/PASSWORD 不是同一套）。缺任一项会在终端明确报缺什么，不静默跳过；
-  失败也不阻断——客户版面退回旧版"报价由交易台确定"的措辞。
+加 --optionhelper quote 接入最新版 OptionHelper Skill 的正式参考报价：
+      python main.py -b "需求…" --optionhelper quote
+  Skill 根目录、明确选择的独立解释器、项目 memory 与 Agent 已验证 selection
+  均就绪后，页面最下方展示本次冻结的报价表。失败不阻断主报告。
 
 加 --pick 进入**人工勾选论点**模式（DESIGN §7.4）：
       python main.py -b "需求…" --pick
@@ -46,7 +43,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 _WANT_PDF = False        # 由 --pdf 打开，见 main()
-_OH_OUTPUT = ""          # 由 --optionhelper card|report 打开，见 main()
+_OH_OUTPUT = ""          # 由 --optionhelper quote 打开，见 main()
 
 from core import brief, overrides as ov, pipeline, thesis, topics, validator, writer
 from render import gaps, layout
@@ -97,9 +94,7 @@ def _finish(ma, title: str) -> str | None:
         else:
             print(f"      ✗ [{f.位置}] {f.数字} 无匹配真值")
 
-    # OptionHelper 完整版（推荐+定价+回测+报告）。默认关闭：真实取数+路径回测
-    # 比一次 LLM 调用慢得多，且依赖外部隔离环境和 iFind Refresh Token，
-    # 不该拖累日常批量生成。开了但失败也不阻断——见 optionhelper_bridge 里的说明。
+    # OptionHelper 最新 Skill 的正式 Quote 交付。默认关闭；开了但失败也不阻断。
     oh_result = None
     if _OH_OUTPUT:
         from core import optionhelper_bridge as ohb, viewpoint as vpmod
@@ -108,11 +103,12 @@ def _finish(ma, title: str) -> str | None:
         if not vp.ok:
             print(f"  ⚠ OptionHelper 未调用：观点包不可用（{vp.error}）")
         else:
-            print("  · 正在调用 OptionHelper 完整版（推荐+定价+回测+报告，可能需要几分钟）…")
+            print("  · 正在调用 OptionHelper 正式参考报价链路（可能需要几分钟）…")
             oh_result = ohb.run_full(vp, output_type=_OH_OUTPUT)
             if oh_result.ok:
+                row_count = sum(len(group.rows) for group in oh_result.quote_groups)
                 print(f"  ✓ OptionHelper：{oh_result.product_name}（{oh_result.product_id}）"
-                      f" · {oh_result.coverage_status or oh_result.status}")
+                      f" · 参考报价 {row_count} 行")
                 if oh_result.report_path:
                     print(f"      报告：{oh_result.report_path}")
             else:
@@ -258,13 +254,12 @@ def main() -> None:
         _WANT_PDF = True
         args = [a for a in args if a != "--pdf"]
 
-    # --optionhelper card|report：接入完整版（推荐+定价+回测+报告）。
-    # card=研究简报，report=完整研究报告；不加此参数则完全不调用（默认行为不变）。
+    # --optionhelper quote：接入新版 Skill 的正式参考报价；不加则完全不调用。
     global _OH_OUTPUT
     if "--optionhelper" in args:
         i = args.index("--optionhelper")
-        if i + 1 >= len(args) or args[i + 1] not in ("card", "report"):
-            print("用法：--optionhelper card|report")
+        if i + 1 >= len(args) or args[i + 1] != "quote":
+            print("用法：--optionhelper quote")
             return
         _OH_OUTPUT = args[i + 1]
         args = args[:i] + args[i + 2:]
