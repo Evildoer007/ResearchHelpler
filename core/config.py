@@ -69,7 +69,7 @@ DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.co
 # ⚠ 别写回 "deepseek-chat"：实测那是旧别名，会落到 **deepseek-v4-flash**（低档模型）。
 # 项目此前一直在用 flash 跑，而 writer 那些"正文太薄、漏写逻辑"的毛病正出在这一环。
 # 账号可用模型可随时复查：GET {BASE_URL}/models
-DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", _LOCAL.get("DEEPSEEK_MODEL", "deepseek-v4-flash"))
 
 # ---- iFinD（同花顺 quant API）配置 ----
 # 数据源主力。注意：账户有周度取数上限，静态/慢变数据须缓存到本地（见 data_cache/）。

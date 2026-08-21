@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field as dfield
 
 from llm.client import DeepSeekClient
@@ -52,11 +53,18 @@ class TargetRef:
 @dataclass
 class Brief:
     原始需求: str
+    市场范围: str = "A股"  # A股 / 港股 / 跨市场；用于阻止跨市场静默映射
+    市场确认: dict | None = None       # 高风险口径经分析师确认后的本次运行契约
+    确认挂钩标的: str = ""            # 已过真实性/暴露/流动性校验；不写回全局白名单
+    确认挂钩标的类型: str = ""
     主题: str = ""
     主导类型: str = ""
     附加类型: list[str] = dfield(default_factory=list)
     触发事件: str = ""
     关注点: str = ""
+    # 客户点名的结构/报价诉求：保留作 OptionHelper 的独立输入与审计留痕，
+    # 绝不进入研究主题、研究关注点或 planner/writer 的上下文。
+    客户产品诉求: str = ""
     涉及板块: list[str] = dfield(default_factory=list)
     宽口径成分行业: list[str] = dfield(default_factory=list)  # 大类拆解，已逐个校验可取数
     宽口径弃用行业: list[str] = dfield(default_factory=list)  # 拆出来但校验没过的，须让人看见
@@ -156,6 +164,10 @@ _SYSTEM = """你是券商研究部的"需求解析器"。用户（老板/销售/
    不会带着错代码继续跑——所以格式没把握时留空比硬猜安全，不算违反"不许编"。
 6.2 需求本就没有具体触发公司的（如"消费板块最近如何"），触发实体整体留空，
    不要为了填而拉一个不相关的公司进来。
+7. **研究与产品诉求必须拆开。** 若用户提到 Call Spread、鲨鱼鳍、雪球、期权报价、
+   期限、损失限制或“推荐某结构”，这些只属于 `客户产品诉求原文摘录`；`研究主题`、
+   `研究关注点`、`触发事件`、市场判断和板块理由只描述市场对象、市场状态及待验证问题，
+   不得出现结构名称、报价、执行价或产品推荐。
 只输出一个 JSON 对象，不要多余文字。"""
 
 
@@ -169,11 +181,12 @@ def _build_prompt(text: str, bundle: sg.SignalBundle) -> str:
         },
         "可选类型": gr.list_types(),
         "输出格式": {
-            "主题": "研报标题，简洁专业，体现事件与板块",
+            "研究主题": "研报标题，简洁专业，只体现事件与板块，不得出现产品/结构词",
             "主导类型": "板块机会|产业趋势|事件驱动",
             "附加类型": ["可为空；需求同时涉及的其它类型"],
             "触发事件": "需求中的引发事件，一句话",
-            "关注点": "用户真正想知道什么",
+            "研究关注点": "用户真正想知道的市场问题，不得出现产品/结构词",
+            "客户产品诉求原文摘录": "仅摘录用户原文中与结构、报价、期限、损失或收益偏好有关的片段；无则留空，不得改写或补充",
             "涉及板块": ["A股口径板块名，优先取自信号；按业务对口而非概念联想"],
             "宽口径成分行业": ["仅当涉及板块是大类（消费/周期/科技…）时填：它由哪几个A股一级行业构成；否则空数组"],
             "板块理由": "一句话：这个板块为何与需求直接相关（会印进报告）",
@@ -187,6 +200,23 @@ def _build_prompt(text: str, bundle: sg.SignalBundle) -> str:
         },
     }
     return json.dumps(spec, ensure_ascii=False, default=str)
+
+
+_PRODUCT_RE = re.compile(
+    r"(?i)\b(?:call|put)\s*spread\b|看涨价差|看跌价差|鲨鱼鳍|雪球|期权|报价|执行价|产品|结构|"
+    r"最大损失|本金波动|收益偏好|期限")
+
+
+def _product_mentions(raw: str) -> str:
+    """只保留用户原文中实际含产品词的分句，拒绝让 LLM 补写客户诉求。"""
+    parts = [part.strip() for part in re.split(r"[，,。；;！？]", raw or "") if part.strip()]
+    return "；".join(part for part in parts if _PRODUCT_RE.search(part))
+
+
+def _research_only(value: str) -> str:
+    """解析器偶尔仍会把客户的结构词带进研究字段；作为确定性兜底剔除整句。"""
+    parts = [part.strip() for part in re.split(r"[，,。；;！？]", value or "") if part.strip()]
+    return "；".join(part for part in parts if not _PRODUCT_RE.search(part))
 
 
 def _resolve_broad(b: Brief, d: dict, provider: DataProvider) -> None:
@@ -231,7 +261,13 @@ def parse(
     verify_codes: bool = True,
 ) -> Brief:
     """解析一段口语化需求为结构化选题。"""
-    b = Brief(原始需求=text.strip())
+    raw = text.strip()
+    overseas_markers = ("全球市场", "海外市场", "美股", "韩股", "韩国市场", "日股", "欧股",
+                        "SK海力士", "英伟达", "台积电")
+    scope = ("跨市场" if (("港股" in raw and "A股" in raw)
+                         or any(marker in raw for marker in overseas_markers))
+             else ("港股" if "港股" in raw else "A股"))
+    b = Brief(原始需求=raw, 市场范围=scope)
     client = client or DeepSeekClient()
     if not client.available():
         b.error = "未配置 DeepSeek key，无法解析需求"
@@ -245,13 +281,19 @@ def parse(
         return b
 
     d = res.data
-    b.主题 = str(d.get("主题", "")).strip()
+    # 兼容旧缓存/旧模型的 `主题`、`关注点` 键，但新协议优先研究专用字段。
+    b.主题 = _research_only(str(d.get("研究主题") or d.get("主题") or "").strip())
     pt = str(d.get("主导类型", "")).strip()
     b.主导类型 = pt if pt in gr.list_types() else gr.TYPE_SECTOR
     b.附加类型 = [t for t in (d.get("附加类型") or []) if t in gr.list_types() and t != b.主导类型]
-    b.触发事件 = str(d.get("触发事件", "")).strip()
-    b.关注点 = str(d.get("关注点", "")).strip()
+    b.触发事件 = _research_only(str(d.get("触发事件", "")).strip())
+    b.关注点 = _research_only(str(d.get("研究关注点") or d.get("关注点") or "").strip())
     b.涉及板块 = [str(x).strip() for x in (d.get("涉及板块") or []) if str(x).strip()]
+    b.客户产品诉求 = _product_mentions(text)
+    if not b.主题:
+        b.主题 = f"{b.涉及板块[0]}市场情况研究" if b.涉及板块 else "市场情况研究"
+    if not b.关注点:
+        b.关注点 = f"评估{b.涉及板块[0]}当前市场状态、配置价值与风险" if b.涉及板块 else "评估当前市场状态与风险"
     b.板块理由 = str(d.get("板块理由", "")).strip()
     b.外部事实待补 = [str(x).strip() for x in (d.get("外部事实待补") or []) if str(x).strip()]
     b.市场判断 = [
@@ -317,12 +359,15 @@ def render(b: Brief, *, 含外部事实: bool = True) -> str:
     types = "＋".join([b.主导类型] + b.附加类型) if b.附加类型 else b.主导类型
     lines = [
         f"【需求解析】{b.主题}",
+        f"  市场范围：{b.市场范围}",
         f"  类型：{types}（主导：{b.主导类型}）",
         f"  触发事件：{b.触发事件}",
         f"  关注点：{b.关注点}",
         f"  涉及板块：{'、'.join(b.涉及板块) or '—'}"
         + (f"（{b.板块理由}）" if b.板块理由 else ""),
     ]
+    if b.客户产品诉求:
+        lines.append(f"  客户产品诉求（不进入研究）：{b.客户产品诉求}")
     # 宽口径必须把成分行业摊开给人看——口径是这份报告最容易被质疑的地方，
     # 尤其自动拆解出来的，得让分析师一眼能否决。
     if b.宽口径成分行业:

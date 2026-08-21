@@ -79,6 +79,11 @@ class MarketAnalysis:
     # brief 给的"为什么是这个板块"。此前成品从不交代分析对象是怎么选出来的，
     # 而板块确实选错过（芯片需求取到医疗服务成分股，#61），读者却无从察觉。
     板块理由: str = ""
+    # 仅供底稿与 OptionHelper 独立交接；planner/writer 不读取。
+    客户产品诉求: str = ""
+    市场确认: dict | None = None
+    确认挂钩标的: str = ""
+    仅研究: bool = False
     tokens: int = 0
     data_vol: int = 0
     ok: bool = False
@@ -914,6 +919,10 @@ def _explicit_etf_from_brief(b) -> str:
     """
     from . import universe
 
+    confirmed = str(getattr(b, "确认挂钩标的", "") or "").strip()
+    confirmed_type = str(getattr(b, "确认挂钩标的类型", "") or "")
+    if confirmed and "ETF" in confirmed_type.upper():
+        return confirmed
     raw = str(getattr(b, "原始需求", "") or "").upper()
     for t in getattr(b, "候选标的", []) or []:
         code = str(getattr(t, "代码", "") or "").upper()
@@ -949,6 +958,18 @@ def run_from_brief(
     overrides=None,
 ) -> MarketAnalysis:
     """从需求解析结果（core.brief.Brief）直接跑：混合体裁 + 需求背景 + 真实代表标的。"""
+    # 当前取数/ETF 白名单均为 A 股口径。港股与跨市场必须由分析师在确认页明确
+    # 指定研究口径和可交易工具，绝不能悄悄退化为代表个股所属的 A 股行业。
+    confirmation = getattr(b, "市场确认", None)
+    if getattr(b, "市场范围", "A股") != "A股":
+        return MarketAnalysis(plan=None, rep_code="", ok=False,
+            市场确认=confirmation,
+            error=(f"已确认按{b.市场范围}研究，但当前研究层尚无该市场的行业基本面数据链。"
+                   "系统已停止，不会静默映射为 A 股行业；如需继续，请在确认页明确选择 A 股研究口径。"))
+    from . import market_confirmation
+    if confirmation is None and market_confirmation.needs_confirmation(b):
+        return MarketAnalysis(plan=None, rep_code="", ok=False,
+            error="该需求属于高风险口径，必须先完成分析师确认，不能直接进入研究链。")
     target = b.代表标的
     if target is None or not target.可用:
         ma = MarketAnalysis(plan=None, rep_code="", ok=False,
@@ -961,7 +982,8 @@ def run_from_brief(
     仍缺 = [x for x in b.外部事实待补 if x not in 填好的]
 
     ctx = {
-        "用户原始需求": b.原始需求,
+        # 禁止把原始口语整段送入研究链：其中可能包含客户点名的产品结构。
+        "研究需求": b.主题,
         "触发事件": b.触发事件,
         "用户关注点": b.关注点,
         "涉及板块": b.涉及板块,
@@ -981,6 +1003,12 @@ def run_from_brief(
     ma.外部事实已填 = 填好的
     ma.rep_name = target.名称          # 正文首次提及要写名称，只有代码读者认不出
     ma.板块理由 = getattr(b, "板块理由", "")
+    ma.客户产品诉求 = getattr(b, "客户产品诉求", "")
+    ma.市场确认 = confirmation
+    ma.确认挂钩标的 = getattr(b, "确认挂钩标的", "")
+    ma.仅研究 = bool((confirmation or {}).get("research_only"))
+    if ma.确认挂钩标的 or ma.仅研究:
+        ma.挂钩择优 = None
     return ma
 
 

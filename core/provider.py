@@ -16,9 +16,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import time
 from typing import Any
 
 from . import config
+from .run_tracker import record_external
 
 
 @dataclass
@@ -122,35 +124,84 @@ class iFinDProvider(DataProvider):
             plist = [params or ""] * len(indicators)
         return ";".join(plist[: len(indicators)])
 
-    def get_basic(self, codes: list[str], indicators: list[str], params="") -> FetchResult:
-        try:
-            self._ensure_login()
-            import iFinDPy as ths
+    @staticmethod
+    def _retryable_error(error: str) -> bool:
+        """只为明确的瞬时连接故障重试，业务口径/权限错误必须直接返回。"""
+        text = (error or "").lower()
+        return any(token in text for token in (
+            "timeout", "timed out", "connection", "reset", "temporary", "unavailable",
+            "网络", "连接", "超时", "服务暂",
+        ))
 
-            code_str = ",".join(codes)
-            ind_str = ";".join(indicators)
-            d = ths.THS_BasicData(code_str, ind_str, self._join_params(indicators, params))
-            if d.get("errorcode", -1) != 0:
-                return FetchResult(False, self.name, error=f"errorcode={d.get('errorcode')} {d.get('errmsg')}")
-            vol = int(d.get("dataVol", 0) or 0)
-            self.total_data_vol += vol
-            return FetchResult(True, self.name, data=self._parse_basic(d), data_vol=vol)
-        except Exception as e:  # noqa: BLE001
-            return FetchResult(False, self.name, error=f"{type(e).__name__}: {str(e)[:200]}")
+    def get_basic(self, codes: list[str], indicators: list[str], params="") -> FetchResult:
+        for attempt in range(1, 3):
+            started = time.perf_counter()
+            try:
+                self._ensure_login()
+                import iFinDPy as ths
+
+                code_str = ",".join(codes)
+                ind_str = ";".join(indicators)
+                d = ths.THS_BasicData(code_str, ind_str, self._join_params(indicators, params))
+                if d.get("errorcode", -1) != 0:
+                    error = f"errorcode={d.get('errorcode')} {d.get('errmsg')}"
+                    record_external("iFinD THS_BasicData", status="failed",
+                                    duration_seconds=time.perf_counter() - started, attempt=attempt,
+                                    detail=f"codes={len(codes)}, indicators={len(indicators)}", error=error)
+                    if attempt < 2 and self._retryable_error(error):
+                        time.sleep(1)
+                        continue
+                    return FetchResult(False, self.name, error=error)
+                vol = int(d.get("dataVol", 0) or 0)
+                self.total_data_vol += vol
+                record_external("iFinD THS_BasicData", status="completed",
+                                duration_seconds=time.perf_counter() - started, attempt=attempt,
+                                detail=f"codes={len(codes)}, indicators={len(indicators)}, dataVol={vol}")
+                return FetchResult(True, self.name, data=self._parse_basic(d), data_vol=vol)
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {str(e)[:200]}"
+                record_external("iFinD THS_BasicData", status="failed",
+                                duration_seconds=time.perf_counter() - started, attempt=attempt,
+                                detail=f"codes={len(codes)}, indicators={len(indicators)}", error=error)
+                if attempt < 2 and self._retryable_error(error):
+                    time.sleep(1)
+                    continue
+                return FetchResult(False, self.name, error=error)
+        return FetchResult(False, self.name, error="iFinD 基础数据重试耗尽")
 
     def get_history(self, code: str, indicator: str, start: str, end: str) -> FetchResult:
-        try:
-            self._ensure_login()
-            import iFinDPy as ths
+        for attempt in range(1, 3):
+            started = time.perf_counter()
+            try:
+                self._ensure_login()
+                import iFinDPy as ths
 
-            d = ths.THS_HistoryQuotes(code, indicator, "", start, end)
-            if d.get("errorcode", -1) != 0:
-                return FetchResult(False, self.name, error=f"errorcode={d.get('errorcode')} {d.get('errmsg')}")
-            vol = int(d.get("dataVol", 0) or 0)
-            self.total_data_vol += vol
-            return FetchResult(True, self.name, data=self._parse_basic(d), data_vol=vol)
-        except Exception as e:  # noqa: BLE001
-            return FetchResult(False, self.name, error=f"{type(e).__name__}: {str(e)[:200]}")
+                d = ths.THS_HistoryQuotes(code, indicator, "", start, end)
+                if d.get("errorcode", -1) != 0:
+                    error = f"errorcode={d.get('errorcode')} {d.get('errmsg')}"
+                    record_external("iFinD THS_HistoryQuotes", status="failed",
+                                    duration_seconds=time.perf_counter() - started, attempt=attempt,
+                                    detail=f"indicator={indicator}", error=error)
+                    if attempt < 2 and self._retryable_error(error):
+                        time.sleep(1)
+                        continue
+                    return FetchResult(False, self.name, error=error)
+                vol = int(d.get("dataVol", 0) or 0)
+                self.total_data_vol += vol
+                record_external("iFinD THS_HistoryQuotes", status="completed",
+                                duration_seconds=time.perf_counter() - started, attempt=attempt,
+                                detail=f"indicator={indicator}, dataVol={vol}")
+                return FetchResult(True, self.name, data=self._parse_basic(d), data_vol=vol)
+            except Exception as e:  # noqa: BLE001
+                error = f"{type(e).__name__}: {str(e)[:200]}"
+                record_external("iFinD THS_HistoryQuotes", status="failed",
+                                duration_seconds=time.perf_counter() - started, attempt=attempt,
+                                detail=f"indicator={indicator}", error=error)
+                if attempt < 2 and self._retryable_error(error):
+                    time.sleep(1)
+                    continue
+                return FetchResult(False, self.name, error=error)
+        return FetchResult(False, self.name, error="iFinD 历史行情重试耗尽")
 
     def close(self) -> None:
         if not self._logged_in:

@@ -76,6 +76,7 @@ class ViewPackage:
     板块理由: str = ""
     整体方向: str = ""              # rc.推荐方向
     波动率看法: str = ""            # 年化波动率 + 历史分位，拼成一句人可读的话
+    情景收益带: object | None = None  # 历史相似状态的未来收益分位，非预测/非产品建议
     市场事实: list[MarketFact] = dfield(default_factory=list)
     市场展望: MarketOutlook = dfield(default_factory=MarketOutlook)
     页面市场摘要: str = ""          # 仅一页通使用；完整事实仍留在市场事实
@@ -107,8 +108,13 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
     # 否则"分析的东西"和"推荐挂钩的东西"又会变成两个不一致的对象——
     # 正是这次改造要消灭的基差问题。只有旧数据（没有这个键，如反序列化的
     # 历史 pickle）才退回当场重新解析，且那次解析不含流动性校验，仅作兜底。
+    confirmed_code = str(getattr(ma, "确认挂钩标的", "") or "")
     etf_code = ma.field_values.get("__etf__")
-    if etf_code:
+    if getattr(ma, "仅研究", False):
+        inst, note = None, "分析师选择仅研究；ETF 如有，仅作为行情/成分取数代理，不形成挂钩建议"
+    elif confirmed_code:
+        inst, note = ins.get(confirmed_code), "分析师本次确认并经数据源校验的挂钩工具"
+    elif etf_code:
         inst, note = ins.get(etf_code), ma.field_values.get("__etf_note__") or ""
     elif etf_code is None:              # 键都不存在，说明是改造前的旧数据
         inst, note = ins.underlying_for(sector)
@@ -180,11 +186,30 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
     # "波动率历史分位"，不依赖哪条论点触发），故这里几乎总能取到。
     vol = ma.field_values.get("年化波动率")
     pctl = ma.field_values.get("波动率历史分位")
-    if vol is not None and getattr(vol, "ok", False):
+    # 若确认的是指数而研究行情取自行业篮子，不能把篮子波动率冒充指数波动率。
+    same_price_object = not confirmed_code or confirmed_code == etf_code
+    if same_price_object and vol is not None and getattr(vol, "ok", False):
         seg = f"年化波动率 {vol.display}"
         if pctl is not None and getattr(pctl, "ok", False):
             seg += f"，处近3年 {pctl.display}"
         vp.波动率看法 = seg
+
+    # 情景收益带只取挂钩标的自身价格，使用固定状态规则筛历史样本；它描述历史条件分布，
+    # 不参与推荐方向，也不将某个历史分位翻译成产品结构。
+    if vp.标的代码:
+        try:
+            from . import scenario_band
+
+            candidate_band = getattr(ma, "情景收益带", None)
+            if candidate_band is None or getattr(candidate_band, "code", "") != vp.标的代码:
+                candidate_band = scenario_band.calculate(vp.标的代码)
+                # 同一份报告会被报价桥接、客户版面和内部底稿各读一次观点包；缓存本次的
+                # 纯历史计算，避免重复取同一条 ETF 价格序列。
+                ma.情景收益带 = candidate_band
+            if candidate_band.ok:
+                vp.情景收益带 = candidate_band
+        except Exception:
+            pass
 
     risks: list[str] = []
     drivers: list[str] = []
@@ -258,6 +283,10 @@ def render(vp: ViewPackage) -> str:
     for fact in vp.市场事实:
         trace = " · ".join(item for item in (fact.来源, fact.截止日) if item)
         lines.append(f"  · {fact.标签}：{fact.数值}" + (f"（{trace}）" if trace else ""))
+    if vp.情景收益带 is not None:
+        from .scenario_band import render_compact
+
+        lines += ["", "历史相似状态收益带（非预测）：", "  · " + render_compact(vp.情景收益带)]
     outlook = vp.市场展望
     lines += ["", "市场展望：", f"  · 方向：{outlook.方向 or '—'}"]
     if outlook.窗口:

@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 from dataclasses import dataclass, field as dfield
 
 from . import config
 from .provider import DataProvider, iFinDProvider
+from .run_tracker import record_external
 
 _GLOBAL_PARAM = "Days:Tradedays,Fill:Previous"   # 交易日 + 前值填充
 LOOKBACK = 60                                   # "近期"= 约 3 个月交易日，用于回落判定
@@ -54,7 +56,10 @@ def series(code: str, indicator: str, *, years: int = 10,
     path = _cache_path(code, indicator, years, drop_nonpositive)
     if use_cache and path.exists():
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            record_external("iFinD THS_DateSerial", status="cached", duration_seconds=0,
+                            detail=f"indicator={indicator}, years={years}")
+            return cached
         except Exception:
             pass
 
@@ -66,8 +71,27 @@ def series(code: str, indicator: str, *, years: int = 10,
 
     end = dt.date.today()
     begin = end.replace(year=end.year - years)
-    d = ths.THS_DateSerial(code, indicator, "", _GLOBAL_PARAM,
-                           begin.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    d = {}
+    for attempt in range(1, 3):
+        started = time.perf_counter()
+        try:
+            d = ths.THS_DateSerial(code, indicator, "", _GLOBAL_PARAM,
+                                   begin.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+            if d.get("errorcode", -1) == 0:
+                record_external("iFinD THS_DateSerial", status="completed",
+                                duration_seconds=time.perf_counter() - started, attempt=attempt,
+                                detail=f"indicator={indicator}, years={years}")
+                break
+            error = f"errorcode={d.get('errorcode')} {d.get('errmsg')}"
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        record_external("iFinD THS_DateSerial", status="failed",
+                        duration_seconds=time.perf_counter() - started, attempt=attempt,
+                        detail=f"indicator={indicator}, years={years}", error=error)
+        if attempt < 2 and iFinDProvider._retryable_error(error):
+            time.sleep(1)
+            continue
+        return []
     if d.get("errorcode", -1) != 0:
         return []
     prov.total_data_vol += int(d.get("dataVol", 0) or 0)

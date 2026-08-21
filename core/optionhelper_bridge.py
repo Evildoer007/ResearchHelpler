@@ -11,11 +11,14 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from dataclasses import dataclass, field as dfield
 from pathlib import Path
 from typing import Any, Mapping
 
 from . import config
+from .client_constraints import ClientConstraints
+from .run_tracker import record_external
 from .viewpoint import ViewPackage
 
 _TIMEOUT_S = 600
@@ -58,6 +61,28 @@ class OptionHelperResult:
     quote_groups: list[QuoteGroup] = dfield(default_factory=list)
     designer_input_path: str = ""
     raw: dict[str, Any] = dfield(default_factory=dict)
+    client_constraints: dict[str, Any] = dfield(default_factory=dict)
+    client_product_intent: str = ""
+
+    @property
+    def recovery_action(self) -> str:
+        """将已知的技术拒绝翻成不越权的下一步；绝不自动换产品。"""
+        return recovery_action_for(self.stage, self.error)
+
+
+def recovery_action_for(stage: str, error: str) -> str:
+    text = f"{stage} {error}".lower()
+    if ("日历" in text or "calendar" in text) and (
+            "dataassetref" in text or "历史行情" in text or "覆盖" in text):
+        return ("该候选需要每日观察日程，触发了 OptionHelper 的日历绑定校验；可重新完成"
+                "Recommender 审阅并选择无需每日观察的候选，或由 OptionHelper 修复交易日边界后重试。")
+    if stage == "configuration":
+        return "按错误提示完成 OptionHelper 就绪检查、解释器或凭证配置后重试。"
+    if stage == "recommender":
+        return "请重新核验本次 selection、挂钩标的和客户约束后重试；不要复用上一份报告的选择。"
+    if stage:
+        return "保留研究报告；核对该阶段错误后重试正式报价。"
+    return ""
 
 
 def missing_setup() -> list[str]:
@@ -77,7 +102,8 @@ def missing_setup() -> list[str]:
     return missing
 
 
-def build_prompt(vp: ViewPackage) -> str:
+def build_prompt(vp: ViewPackage, client_constraints: Mapping[str, Any] | None = None,
+                 client_product_intent: str = "") -> str:
     """只描述已验证市场状态；不向 OptionHelper 夹带产品或条款建议。"""
     lines: list[str] = []
     if vp.标的名称:
@@ -96,6 +122,18 @@ def build_prompt(vp: ViewPackage) -> str:
         for item in vp.市场事实:
             trace = "，".join(part for part in (item.来源, item.截止日) if part)
             lines.append(f"- {item.标签}：{item.数值}" + (f"（{trace}）" if trace else ""))
+    band = getattr(vp, "情景收益带", None)
+    if band is not None and getattr(band, "ok", False):
+        try:
+            from .scenario_band import render_compact
+
+            lines.append("历史相似状态收益带（仅为历史条件分布，非预测）：")
+            lines.append("- 当前状态：" + "；".join(item for item in (
+                getattr(band, "return_state", ""), getattr(band, "volatility_state", "")) if item))
+            lines.append(f"- 样本规则：{band.sample_rule}；样本数 {band.sample_count}")
+            lines.append("- " + render_compact(band))
+        except Exception:
+            pass
     outlook = vp.市场展望
     if any((outlook.方向, outlook.窗口, outlook.支持因素, outlook.制约因素, outlook.需验证风险)):
         lines.append("市场展望：")
@@ -109,7 +147,23 @@ def build_prompt(vp: ViewPackage) -> str:
             lines.append("- 主要制约因素：" + "、".join(outlook.制约因素))
         if outlook.需验证风险:
             lines.append("- 需持续验证的风险：" + "、".join(outlook.需验证风险))
-    lines.append("以上仅为市场状态输入，不包含产品、结构、期限或执行价建议。")
+    if client_constraints:
+        # 这是客户已声明的独立约束，不属于研究观点，也不构成产品建议。
+        parts = []
+        if client_constraints.get("horizon"):
+            parts.append(f"期限 {client_constraints['horizon']}")
+        if client_constraints.get("max_loss"):
+            parts.append(f"最大损失 {client_constraints['max_loss']}")
+        if "principal_fluctuation" in client_constraints:
+            parts.append("接受本金波动" if client_constraints["principal_fluctuation"] else "不接受本金波动")
+        if client_constraints.get("return_preference"):
+            parts.append(f"收益偏好 {client_constraints['return_preference']}")
+        if parts:
+            lines.append("客户已声明约束（不属于市场观点）：" + "；".join(parts) + "。")
+    if client_product_intent:
+        lines.append("客户已提出的产品诉求（独立于市场研究，须经 Recommender 与合规校验，不构成研究建议）："
+                     + client_product_intent)
+    lines.append("以上市场部分不包含产品、结构或执行价建议；客户约束单独列示，不由研究层推导。")
     return "\n".join(lines)
 
 
@@ -133,25 +187,34 @@ def _readiness(project_root: Path) -> tuple[bool, dict[str, Any], str]:
         "--skill-root", str(skill_root),
         "--project-root", str(project_root),
     ]
+    started = time.perf_counter()
     try:
         proc = subprocess.run(
             command, cwd=str(project_root), capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=120, env=env,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        return False, {}, f"无法完成 OptionHelper 统一就绪检查：{error}"
+        message = f"无法完成 OptionHelper 统一就绪检查：{error}"
+        record_external("OptionHelper readiness", status="failed",
+                        duration_seconds=time.perf_counter() - started, error=message)
+        return False, {}, message
     report = _json_stdout(proc)
     if report.get("ok") is True:
+        record_external("OptionHelper readiness", status="completed",
+                        duration_seconds=time.perf_counter() - started)
         return True, report, ""
     guidance = str(report.get("guidance") or "").strip()
     action = str(report.get("next_action") or "").strip()
     detail = "；".join(item for item in (guidance, f"下一步：{action}" if action else "") if item)
     if not detail:
         detail = "OptionHelper 统一就绪检查未通过。"
+    record_external("OptionHelper readiness", status="failed",
+                    duration_seconds=time.perf_counter() - started, error=detail)
     return False, report, detail
 
 
-def _selection_payload(project_root: Path, vp: ViewPackage) -> tuple[dict[str, Any], str]:
+def _selection_payload(project_root: Path, vp: ViewPackage,
+                       client_constraints: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], str]:
     """读取 Agent 的公开选择；绝不从旧模型网关自行生成一个选择。"""
     if config.OPTIONHELPER_HOST_URL:
         return {}, ""
@@ -183,7 +246,13 @@ def _selection_payload(project_root: Path, vp: ViewPackage) -> tuple[dict[str, A
     allowed = ("product_id", "underlyings", "reason", "suitable_for",
                "not_suitable_for", "main_risks")
     body: dict[str, Any] = {"selection": {key: selection[key] for key in allowed if key in selection}}
-    body["constraints"] = _effective_constraints(raw)
+    current_view = vp.市场展望.方向 or vp.整体方向
+    body["constraints"] = _effective_constraints(
+        raw,
+        client_constraints,
+        underlying=vp.标的代码,
+        market_view=current_view,
+    )
     # 执行价等受控合同覆盖只透传，不在桥接层推导条款或价格。
     for field in ("term_overrides", "pricing_config", "backtest_config"):
         value = raw.get(field)
@@ -195,12 +264,33 @@ def _selection_payload(project_root: Path, vp: ViewPackage) -> tuple[dict[str, A
     return body, ""
 
 
-def _effective_constraints(selection_file: Mapping[str, Any]) -> dict[str, Any]:
-    """返回本次显式传递的客户条件，客户输入覆盖项目默认档案。"""
+def _effective_constraints(selection_file: Mapping[str, Any],
+                           client_constraints: Mapping[str, Any] | None = None,
+                           *, underlying: str = "", market_view: str = "") -> dict[str, Any]:
+    """返回本次有效约束；标的和市场方向永远来自当前观点包。
+
+    selection 文件可以长期保留客户条件，但不能让上一份报告遗留的 ``underlying``
+    或 ``market_view`` 污染当前报价。两者是本次研究结果，不是客户默认档案。
+    """
     result = dict(config.OPTIONHELPER_DEFAULT_CONSTRAINTS)
     supplied = selection_file.get("constraints")
     if isinstance(supplied, Mapping):
-        result.update(dict(supplied))
+        result.update({str(key): value for key, value in supplied.items()
+                       if str(key) in ("horizon", "max_loss", "principal_fluctuation",
+                                       "return_preference")
+                       and value is not None and value != ""})
+    if isinstance(client_constraints, Mapping):
+        # CLI/GUI 是本次客户的最新明确输入，优先于本地旧 selection 的遗留条件。
+        result.update({str(key): value for key, value in client_constraints.items()
+                       if str(key) in ("horizon", "max_loss", "principal_fluctuation",
+                                       "return_preference")
+                       and value is not None and value != ""})
+    if underlying:
+        result["underlying"] = underlying
+    if market_view:
+        result["market_view"] = market_view
+    result["output_type"] = "quote"
+    result["format"] = "html"
     return result
 
 
@@ -252,6 +342,8 @@ def run_full(
     *,
     output_type: str = "quote",
     project_root: str | Path | None = None,
+    client_constraints: Mapping[str, Any] | ClientConstraints | None = None,
+    client_product_intent: str = "",
 ) -> OptionHelperResult:
     """执行最新版受控 Quote 链路并返回一页通需要的冻结表格事实。"""
     if output_type != "quote":
@@ -270,11 +362,16 @@ def run_full(
         return OptionHelperResult(ok=False, stage="configuration", error=readiness_error,
                                   missing=[next_action], raw=readiness)
 
-    selection_fields, selection_error = _selection_payload(root, vp)
+    supplied_constraints = (client_constraints.supplied() if isinstance(client_constraints, ClientConstraints)
+                             else dict(client_constraints or {}))
+    selection_fields, selection_error = _selection_payload(root, vp, supplied_constraints)
     if selection_error:
         return OptionHelperResult(ok=False, stage="recommender", error=selection_error)
+    prompt_constraints = dict(selection_fields.get("constraints") or {})
+    if supplied_constraints.get("return_preference"):
+        prompt_constraints["return_preference"] = supplied_constraints["return_preference"]
     body = {
-        "prompt": build_prompt(vp),
+        "prompt": build_prompt(vp, prompt_constraints, client_product_intent),
         "output_type": "quote",
         "format": "html",
         **selection_fields,
@@ -294,6 +391,7 @@ def run_full(
     if config.OPTIONHELPER_HOST_URL:
         env["OPTIONHELPER_HOST_URL"] = config.OPTIONHELPER_HOST_URL
 
+    started = time.perf_counter()
     try:
         proc = subprocess.run(
             [str(Path(config.OPTIONHELPER_PYTHON).resolve()), str(skill_root / "scripts" / "tool_entry.py"),
@@ -302,20 +400,40 @@ def run_full(
             errors="replace", timeout=_TIMEOUT_S,
         )
     except subprocess.TimeoutExpired:
-        return OptionHelperResult(ok=False, stage="host", error=f"OptionHelper 运行超过 {_TIMEOUT_S}s 未完成。")
+        message = f"OptionHelper 运行超过 {_TIMEOUT_S}s 未完成。"
+        record_external("OptionHelper formal quote", status="failed",
+                        duration_seconds=time.perf_counter() - started, error=message)
+        return OptionHelperResult(ok=False, stage="host", error=message,
+                                  client_constraints=selection_fields.get("constraints", {}),
+                                  client_product_intent=client_product_intent)
     except OSError as error:
-        return OptionHelperResult(ok=False, stage="host", error=f"无法启动 OptionHelper：{error}")
+        message = f"无法启动 OptionHelper：{error}"
+        record_external("OptionHelper formal quote", status="failed",
+                        duration_seconds=time.perf_counter() - started, error=message)
+        return OptionHelperResult(ok=False, stage="host", error=message,
+                                  client_constraints=selection_fields.get("constraints", {}),
+                                  client_product_intent=client_product_intent)
 
     out = _json_stdout(proc)
     if not out:
         tail = "\n".join(proc.stderr.strip().splitlines()[-8:]) if proc.stderr else "（无 stderr 输出）"
-        return OptionHelperResult(ok=False, stage="host",
-                                  error=f"OptionHelper 未返回可解析结果（退出码 {proc.returncode}）：{tail}")
+        message = f"OptionHelper 未返回可解析结果（退出码 {proc.returncode}）：{tail}"
+        record_external("OptionHelper formal quote", status="failed",
+                        duration_seconds=time.perf_counter() - started, error=message)
+        return OptionHelperResult(ok=False, stage="host", error=message,
+                                  client_constraints=selection_fields.get("constraints", {}),
+                                  client_product_intent=client_product_intent)
     if out.get("ok") is not True:
         raw_missing = out.get("missing") if isinstance(out.get("missing"), list) else []
+        message = str(out.get("message") or "")
+        record_external("OptionHelper formal quote", status="failed",
+                        duration_seconds=time.perf_counter() - started,
+                        detail=str(out.get("stage") or ""), error=message)
         return OptionHelperResult(
             ok=False, status=str(out.get("status") or ""), stage=str(out.get("stage") or ""),
-            error=str(out.get("message") or ""), missing=[str(item) for item in raw_missing], raw=out,
+            error=message, missing=[str(item) for item in raw_missing], raw=out,
+            client_constraints=selection_fields.get("constraints", {}),
+            client_product_intent=client_product_intent,
         )
 
     summary = out.get("user_summary") if isinstance(out.get("user_summary"), Mapping) else {}
@@ -324,11 +442,19 @@ def run_full(
     report_path = str(rep.get("path") or "")
     groups, quote_date, quote_note, facts_path = _quote_facts(report_path, root)
     if not groups:
+        record_external("OptionHelper formal quote", status="failed",
+                        duration_seconds=time.perf_counter() - started,
+                        detail="reporter", error=facts_path)
         return OptionHelperResult(ok=False, status=str(out.get("status") or ""), stage="reporter",
-                                  error=facts_path, report_path=report_path, raw=out)
+                                  error=facts_path, report_path=report_path, raw=out,
+                                  client_constraints=selection_fields.get("constraints", {}),
+                                  client_product_intent=client_product_intent)
     failures = summary.get("module_failures") if isinstance(summary.get("module_failures"), Mapping) else {}
     raw_assumptions = summary.get("assumptions") if isinstance(summary.get("assumptions"), list) else []
     raw_risks = rec.get("main_risks") if isinstance(rec.get("main_risks"), list) else []
+    record_external("OptionHelper formal quote", status="completed",
+                    duration_seconds=time.perf_counter() - started,
+                    detail=f"product={rec.get('product_id') or ''}")
     return OptionHelperResult(
         ok=True, status=str(out.get("status") or ""), message=str(out.get("message") or ""),
         product_id=str(rec.get("product_id") or ""), product_name=str(rec.get("product_name") or ""),
@@ -337,4 +463,6 @@ def run_full(
         coverage_status=str(rep.get("coverage_status") or ""), module_failures=dict(failures),
         assumptions=[str(item) for item in raw_assumptions], quote_date=quote_date,
         quote_note=quote_note, quote_groups=groups, designer_input_path=facts_path, raw=out,
+        client_constraints=selection_fields.get("constraints", {}),
+        client_product_intent=client_product_intent,
     )

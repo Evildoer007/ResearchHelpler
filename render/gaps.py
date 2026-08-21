@@ -428,34 +428,85 @@ def _trace_table(ma, vr) -> list[str]:
 
 
 def _selection_section(ma) -> list[str]:
-    """挂钩标的择优的过程与实测指标（B4/§9.2②）。
+    """ETF 分析与挂钩选择过程（仅内部底稿）。
 
-    只在板块→ETF 映射给不出答案时才有内容。把**候选池规模、择优维度、
-    每个候选的实测指标**都摊开：这一步是"分析对象 → 可交易标的"的映射，
-    是全篇最需要人复核的判断之一，只给一个结论不足以让人否决它。
+    无论 ETF 是用户点名、板块映射并通过流动性闸门，还是候选池择优得到，
+    都明确留下“怎么选、用 ETF 自身哪些数据分析”的证据。候选择优路径额外
+    展开完整候选池，避免只看到最终入选项而无法复核比较是否合理。
     """
     p = getattr(ma, "挂钩择优", None)
-    if p is None:
+    etf_code = str(ma.field_values.get("__etf__") or "").strip()
+    etf_note = str(ma.field_values.get("__etf_note__") or "").strip()
+    if not etf_code and p is None:
         return []
-    if not getattr(p, "ok", False):
-        return ["", f"> ⚠ 挂钩标的择优失败：{getattr(p, 'error', '')}"
-                    "——本节挂钩标的仍为空，需人工指定。", ""]
-    if not p.picks:
-        return ["", f"> ⚠ 候选池 {p.候选数} 个中未选出合适标的：{p.说明 or '（未说明）'}", ""]
 
-    out = ["", f"**挂钩标的择优**（候选池 {p.候选数} 个"
-                + (f"；维度：{'、'.join(p.择优维度)}" if p.择优维度 else "") + "）", ""]
-    out += ["| 选中 | 标的 | 实测指标 | 适合 | 理由 |", "|---|---|---|---|---|"]
+    out = ["", "**ETF 分析与挂钩标的选择（分析师核对，不发送给 OptionHelper）**", ""]
+    if etf_code:
+        from core import instruments as ins
+
+        item = ins.get(etf_code)
+        label = f"{item.简称}（{etf_code}）" if item else etf_code
+        out.append(f"- **最终挂钩标的**：{label}")
+        if item and item.官方名:
+            out.append(f"- **产品与跟踪口径**：{item.官方名}" +
+                       (f"；跟踪{item.跟踪指数}" if item.跟踪指数 else ""))
+        if etf_note == "用户需求指定的挂钩 ETF":
+            out.append("- **选择路径**：用户在原始需求中明确点名，系统完成代码校验后直接采用；"
+                       "不把需求解析器临时提出的候选误当成客户指定。")
+        else:
+            out.append("- **选择路径**：板块→ETF 映射表指定，并经取数阶段流动性闸门复核。"
+                       + (f"复核结果：{etf_note}" if etf_note else ""))
+
+        own_fields = ("年化波动率", "波动率历史分位", "区间涨跌幅分位",
+                      "换手率历史分位", "换手率近期高分位", "成交额历史分位")
+        rows = []
+        for name in own_fields:
+            fv = ma.field_values.get(name)
+            if fv is None or not getattr(fv, "ok", False) or not getattr(fv, "display", ""):
+                continue
+            source = str(getattr(fv, "source", "") or "")
+            # 只纳入明确是本 ETF 自身序列的行情字段，不能将板块聚合值伪装成 ETF 指标。
+            if etf_code not in source:
+                continue
+            rows.append(f"| {name} | {fv.display} | {source} |")
+        if rows:
+            out += ["", "**ETF 自身行情分析**（不含成分股聚合基本面）", "",
+                    "| 指标 | 本次实测值 | 来源 |", "|---|---|---|", *rows, ""]
+        else:
+            out += ["> ⚠ 未取得可确认属于该 ETF 自身的行情指标；不可将板块聚合数据替代。", ""]
+
+    if p is None:
+        out += ["> 本次为明确 ETF 映射/用户指定路径，未在同类候选之间进行二次择优；"
+                "上述映射、流动性复核与 ETF 自身行情即为本次选择依据。", ""]
+        return out
+    if not getattr(p, "ok", False):
+        return out + [f"> ⚠ 挂钩标的候选择优失败：{getattr(p, 'error', '')}"
+                      "——需分析师人工指定。", ""]
+    if not p.picks:
+        return out + [f"> ⚠ 候选池 {p.候选数} 个中未选出合适标的：{p.说明 or '（未说明）'}", ""]
+
+    out += [f"**候选池择优**（候选池 {p.候选数} 个"
+            + (f"；维度：{'、'.join(p.择优维度)}" if p.择优维度 else "") + "）", "",
+            "| 选中 | 标的 | 实测指标 | 适合 | 理由 |", "|---|---|---|---|---|"]
     for i, k in enumerate(p.picks):
         seg = "、".join(f"{n}{v}" for n, v in k.展示.items() if v) or "—"
         out.append(f"| {'★' if i == 0 else ''} | {k.简称}（{k.代码}）| {seg} | "
                    f"{k.适合 or '—'} | {k.理由 or '—'} |")
     out.append("")
+    candidates = getattr(p, "candidates", []) or []
+    if candidates:
+        chosen = {k.代码 for k in p.picks}
+        out += ["**完整候选池实测对照**", "",
+                "| 入选 | 标的 | 标签 | 实测指标 |", "|---|---|---|---|"]
+        for c in candidates:
+            seg = "、".join(f"{n}{v}" for n, v in c.展示.items() if v) or "—"
+            out.append(f"| {'★' if c.代码 in chosen else ''} | {c.简称}（{c.代码}） | "
+                       f"{'、'.join(c.标签) or '—'} | {seg} |")
+        out.append("")
     if p.说明:
         out += [f"> 择优结论：{p.说明}", ""]
     out += ["> 挂钩标的与分析对象**不是同一个**时（产业趋势/事件驱动类，其分析对象"
-            "本身不可交易），这层映射的理由必须成立才用得上——请重点复核上表的"
-            "「理由」是否真由实测指标支撑，以及候选池里有没有更合适而被漏掉的。", ""]
+            "本身不可交易），请复核理由是否由实测指标支撑，以及候选池里是否有更合适的标的。", ""]
     return out
 
 
@@ -509,6 +560,16 @@ def _scope_section(ma, sector: str) -> list[str]:
         f"- **数据代表标的**：{名 + ' ' if 名 else ''}{ma.rep_code}"
         "（仅供板块口径解析用的锚点，见下方「数据口径」一行）",
     ]
+    confirmation = getattr(ma, "市场确认", None) or {}
+    if confirmation:
+        mode = "仅研究" if confirmation.get("research_only") else "研究并指定挂钩工具"
+        out += [
+            f"- **分析师市场确认**：{confirmation.get('market', '—')}｜{mode}",
+            f"- **确认研究口径**：{confirmation.get('research_scope', '—')}",
+            f"- **确认挂钩标的**：{confirmation.get('underlying_name') or '—'} "
+            f"{confirmation.get('underlying_code') or ''}".rstrip(),
+            f"- **映射理由（选填）**：{confirmation.get('reason') or '未填写'}",
+        ]
     if getattr(ma, "板块理由", ""):
         out.append(f"- **选取依据**：{ma.板块理由}")
 
@@ -591,14 +652,26 @@ def _viewpoint_section(ma, rc) -> list[str]:
     try:
         from core import optionhelper_bridge as _ohb
 
-        sent = _ohb.build_prompt(pkg)
+        sent = _ohb.build_prompt(pkg, client_product_intent=getattr(ma, "客户产品诉求", ""))
     except Exception as e:
         sent = f"（无法生成发送原文：{type(e).__name__}: {e}）"
     out += ["```", sent, "```", ""]
 
+    band = getattr(pkg, "情景收益带", None)
+    if band is not None and getattr(band, "ok", False):
+        from core.scenario_band import render_compact
+
+        out += ["**历史相似状态收益带（已发送；非预测、非产品建议）**", "",
+                f"- 当前状态：{band.return_state}；{band.volatility_state}",
+                f"- 样本规则：{band.sample_rule}；样本数：{band.sample_count}",
+                f"- 后续收益分布：{render_compact(band)}", ""]
+
     # ② 以下全部是分析师核对用、不发送给 OptionHelper 的内部信息：挂钩标的口径、
     #    数据锚点、择优过程、每条逻辑对应的论点库代号与特征。
-    out += ["**② 分析师核对用（不发送给 OptionHelper）**", ""]
+    out += ["**② 分析师核对与独立交接信息**", ""]
+    intent = getattr(ma, "客户产品诉求", "")
+    if intent:
+        out.append(f"- **客户产品诉求（独立交接，不属于市场研究）**：{intent}")
     out.append(f"- **挂钩标的**：{pkg.标的名称}（{pkg.标的代码}）" if pkg.标的代码
                else f"- **挂钩标的**：未定 —— {pkg.标的口径}")
     if pkg.板块:
@@ -658,8 +731,14 @@ def _optionhelper_section(oh) -> list[str]:
     """
     if oh is None:
         return ["（本次未调用——生成时未加 `--optionhelper` 开关）", ""]
+    constraints = getattr(oh, "client_constraints", {}) or {}
     if not getattr(oh, "ok", False):
         out = [f"- **状态**：失败（{oh.stage or '未知阶段'}）", f"- **原因**：{oh.error or '（无详细信息）'}"]
+        if constraints:
+            out.append("- **本次客户约束**：" + "；".join(f"{key}={value}" for key, value in constraints.items()))
+        action = getattr(oh, "recovery_action", "")
+        if action:
+            out.append(f"- **可操作下一步**：{action}")
         if oh.missing:
             out.append("- **缺失前置条件**：")
             out += [f"  - {m}" for m in oh.missing]
@@ -669,6 +748,8 @@ def _optionhelper_section(oh) -> list[str]:
         f"- **推荐结构**：{oh.product_name}" + (f"（{oh.product_id}）" if oh.product_id else ""),
         f"- **理由**：{oh.reason or '（无）'}",
     ]
+    if constraints:
+        out.append("- **本次客户约束**：" + "；".join(f"{key}={value}" for key, value in constraints.items()))
     if oh.main_risks:
         out.append("- **主要风险**：" + "；".join(oh.main_risks))
     out.append(f"- **交付状态**：{oh.status}（{'完整' if oh.coverage_status == 'complete' else oh.coverage_status or '—'}）")

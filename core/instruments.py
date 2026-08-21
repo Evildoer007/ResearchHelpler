@@ -204,10 +204,26 @@ INSTRUMENTS: list[Instrument] = [
 ]
 
 _BY_CODE = {i.代码: i for i in INSTRUMENTS}
+_TEMP_BY_CODE: dict[str, Instrument] = {}
 
 
 def get(code: str) -> Instrument | None:
-    return _BY_CODE.get(code)
+    return _BY_CODE.get(code) or _TEMP_BY_CODE.get(code)
+
+
+def register_temporary(item: Instrument) -> Instrument:
+    """登记本次进程内已验证标的；不改 ``INSTRUMENTS`` 或任何配置文件。"""
+    if item.代码 not in _BY_CODE:
+        _TEMP_BY_CODE[item.代码] = item
+    return get(item.代码) or item
+
+
+def temporary_items() -> list[Instrument]:
+    return list(_TEMP_BY_CODE.values())
+
+
+def clear_temporary() -> None:
+    _TEMP_BY_CODE.clear()
 
 
 def find(keyword: str) -> list[Instrument]:

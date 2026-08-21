@@ -15,6 +15,8 @@
 from __future__ import annotations
 
 import json
+import time
+from threading import Event, Thread
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +24,35 @@ import requests
 
 from core import config
 from core.config import no_proxy
+from core.run_tracker import record_external
+
+
+class _WaitHeartbeat:
+    """仅在受 RunTracker 管理的正式运行中提示长时 LLM 等待。"""
+
+    def __init__(self, *, label: str, started: float, enabled: bool) -> None:
+        self.label = label
+        self.started = started
+        self.enabled = enabled
+        self._stop = Event()
+        self._thread: Thread | None = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        print(f"  · [llm] {self.label} 请求已发出，正在等待响应…")
+        self._thread = Thread(target=self._run, name="research-helper-llm-heartbeat", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(15):
+            elapsed = int(time.perf_counter() - self.started)
+            print(f"  · [llm] {self.label} 仍在响应，已等待 {elapsed}s…")
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.1)
 
 
 @dataclass
@@ -56,6 +87,7 @@ class DeepSeekClient:
         json_mode: bool = True,
         temperature: float = 0.2,
         max_tokens: int | None = None,
+        _attempt: int = 1,
     ) -> ChatResult:
         if not self.available():
             return ChatResult(False, error="未配置 DEEPSEEK_API_KEY")
@@ -71,6 +103,14 @@ class DeepSeekClient:
         if max_tokens:
             payload["max_tokens"] = max_tokens
 
+        started = time.perf_counter()
+        # 先记录“运行中”，供终端和 GUI 在 requests.post 阻塞期间显示真实状态；
+        # 每个现有的完成/失败 record_external 会原位收束该条记录。
+        record_external("DeepSeek chat/completions", status="running", duration_seconds=0,
+                        attempt=_attempt, detail=f"model={self.model}，等待响应")
+        from core.run_tracker import current
+        heartbeat = _WaitHeartbeat(label="DeepSeek", started=started, enabled=current() is not None)
+        heartbeat.start()
         try:
             with no_proxy():
                 r = requests.post(
@@ -83,7 +123,11 @@ class DeepSeekClient:
                     timeout=self.timeout,
                 )
             if r.status_code != 200:
-                return ChatResult(False, error=f"HTTP {r.status_code}: {r.text[:200]}")
+                error = f"HTTP {r.status_code}: {r.text[:200]}"
+                record_external("DeepSeek chat/completions", status="failed",
+                                duration_seconds=time.perf_counter() - started, attempt=_attempt,
+                                detail=f"HTTP {r.status_code}", error=error)
+                return ChatResult(False, error=error)
             d = r.json()
             choice = d["choices"][0]
             content = choice["message"]["content"]
@@ -102,17 +146,34 @@ class DeepSeekClient:
                         # 实测 reasoning 能占掉 2500~7000，正文再长就写不完了。
                         rt = (usage.get("completion_tokens_details") or {}).get(
                             "reasoning_tokens", 0)
+                        error = (f"输出被 max_tokens 掐断（completion "
+                                 f"{usage.get('completion_tokens')} 其中推理 {rt}）"
+                                 f"——需加大额度或压缩输出要求，重试无效")
+                        record_external("DeepSeek chat/completions", status="failed",
+                                        duration_seconds=time.perf_counter() - started, attempt=_attempt,
+                                        detail="finish_reason=length", error=error)
                         return ChatResult(
                             False, content=content, usage=usage, finish_reason=fr,
-                            error=f"输出被 max_tokens 掐断（completion "
-                                  f"{usage.get('completion_tokens')} 其中推理 {rt}）"
-                                  f"——需加大额度或压缩输出要求，重试无效")
+                            error=error)
+                    error = f"JSON 解析失败: {e}"
+                    record_external("DeepSeek chat/completions", status="failed",
+                                    duration_seconds=time.perf_counter() - started, attempt=_attempt,
+                                    detail=f"finish_reason={fr or 'unknown'}", error=error)
                     return ChatResult(False, content=content, usage=usage,
-                                      finish_reason=fr, error=f"JSON 解析失败: {e}")
+                                      finish_reason=fr, error=error)
+            record_external("DeepSeek chat/completions", status="completed",
+                            duration_seconds=time.perf_counter() - started, attempt=_attempt,
+                            detail=f"tokens={usage.get('total_tokens', 0)}")
             return ChatResult(True, content=content, data=data, usage=usage,
                               finish_reason=fr)
         except Exception as e:  # noqa: BLE001
-            return ChatResult(False, error=f"{type(e).__name__}: {str(e)[:200]}")
+            error = f"{type(e).__name__}: {str(e)[:200]}"
+            record_external("DeepSeek chat/completions", status="failed",
+                            duration_seconds=time.perf_counter() - started, attempt=_attempt,
+                            error=error)
+            return ChatResult(False, error=error)
+        finally:
+            heartbeat.close()
 
     def chat_json(self, system: str, user: str, *, temperature: float = 0.2,
                   max_tokens: int | None = None, retries: int = 2) -> ChatResult:
@@ -148,14 +209,42 @@ class DeepSeekClient:
         last = ChatResult(False, error="未执行")
         for attempt in range(retries + 1):
             last = self.chat(msgs, json_mode=True, temperature=temperature,
-                             max_tokens=max_tokens)
+                             max_tokens=max_tokens, _attempt=attempt + 1)
             if last.ok:
                 if attempt:
                     last.error = f"（第 {attempt + 1} 次尝试成功，前 {attempt} 次瞬时失败）"
                 return last
             if not self._retryable(last):
                 return last
+            # 仅对已判定的瞬时故障退避重试，避免同一时刻连续撞到上游抖动。
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 4))
+        # DeepSeek 官方已知：JSON Output 偶尔会在 finish_reason=stop 时返回空 content。
+        # 连续重试仍为空时，再发一次普通文本请求，让提示词继续约束“只输出 JSON”，
+        # 然后在本地严格解析。只对“空响应”启用；非空坏 JSON、长度截断和 4xx 不绕过。
+        if not (last.content or "").strip() and "JSON 解析失败" in (last.error or ""):
+            plain = self.chat(msgs, json_mode=False, temperature=temperature,
+                              max_tokens=max_tokens, _attempt=retries + 2)
+            if plain.ok:
+                try:
+                    plain.data = self._parse_json_text(plain.content)
+                    plain.error = f"（JSON Output 连续 {retries + 1} 次空响应，普通文本模式兜底成功）"
+                    return plain
+                except json.JSONDecodeError as error:
+                    plain.ok = False
+                    plain.error = f"普通文本兜底仍非合法 JSON: {error}"
+            return plain
         return last
+
+    @staticmethod
+    def _parse_json_text(content: str):
+        """解析普通模式返回的 JSON；只剥代码围栏，不容忍 JSON 外的解释文字。"""
+        text = (content or "").strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        return json.loads(text)
 
     @staticmethod
     def _retryable(res: "ChatResult") -> bool:

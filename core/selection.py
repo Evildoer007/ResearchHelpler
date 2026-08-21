@@ -5,7 +5,7 @@
 
 分工：
   instruments.py  提供**候选池**（人工维护、代码已校验）与标签
-  本模块          对候选取真实比较数据（PE/PB/换手/区间涨跌/市值）
+本模块          对候选取真实比较数据（PE/PB/换手/区间涨跌/市值/自身历史波动率）
   planner/writer  基于池子与数据做发散推理与择优结论（不得自造标的代码）
 
 指数与 ETF 的指标后缀不同（`_index` / `_fund`），此处按类型分派。
@@ -16,6 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field as dfield
 
 from . import fetcher as ft
+from . import history
 from . import instruments as inst
 from .provider import DataProvider, get_provider
 
@@ -102,6 +103,26 @@ def _pull_index_metrics(codes: list[str], provider: DataProvider) -> dict[str, d
     return out
 
 
+def _own_volatility_metrics(pool: list[inst.Instrument], provider: DataProvider) -> dict[str, dict[str, float]]:
+    """候选各自的实现波动率，绝不拿代表个股或跟踪指数替代 ETF。
+
+    这一步只在“板块没有确定 ETF 映射、需要择优”的 B4 路径触发。历史序列按日缓存，
+    因此重复运行通常直接复用；任一候选取不到则该维度留空，不能把缺失伪装成低波动。
+    """
+    out: dict[str, dict[str, float]] = {}
+    for item in pool:
+        try:
+            value = history.volatility(item.代码, provider=provider)
+        except Exception:
+            continue
+        if not value.ok or value.当前 is None:
+            continue
+        out[item.代码] = {"年化波动率": float(value.当前)}
+        if value.分位 is not None:
+            out[item.代码]["波动率历史分位"] = float(value.分位)
+    return out
+
+
 def compare(
     codes: list[str] | None = None, *, tags: list[str] | None = None,
     provider: DataProvider | None = None,
@@ -122,6 +143,7 @@ def compare(
 
     query_codes = {p.代码 for p in pool} | {v for v in tracking.values() if v}
     metrics = _pull_index_metrics(sorted(query_codes), provider)
+    own_vols = _own_volatility_metrics(pool, provider)
 
     out: list[Candidate] = []
     for p in pool:
@@ -130,6 +152,8 @@ def compare(
         if idx:                             # 用跟踪指数补齐估值类指标
             base = metrics.get(idx) or {}
             m = {**base, **m}              # 自身有值优先（如涨跌幅取 ETF 自己的）
+        # 波动率只属于候选自身，不以跟踪指数/代表个股补齐。
+        m = {**m, **own_vols.get(p.代码, {})}
         c = Candidate(代码=p.代码, 简称=p.简称, 类型=p.类型, 标签=list(p.标签),
                       说明=p.说明, 指标=m)
         c.展示 = {
@@ -138,17 +162,20 @@ def compare(
             "换手率": f"{m['换手率']:.2f}%" if "换手率" in m else "",
             "区间涨跌幅": f"{m['区间涨跌幅']:.2f}%" if "区间涨跌幅" in m else "",
             "总市值": ft._fmt_money(m["总市值"]) if "总市值" in m else "",
+            "年化波动率": f"{m['年化波动率']:.1f}%" if "年化波动率" in m else "",
+            "波动率历史分位": f"{m['波动率历史分位']:.1f}%分位" if "波动率历史分位" in m else "",
         }
         out.append(c)
     return out
 
 
 def render(cands: list[Candidate]) -> str:
-    lines = [f"{'标的':<12}{'代码':<12}{'PE':<10}{'PB':<9}{'换手':<8}{'涨跌':<9}标签"]
+    lines = [f"{'标的':<12}{'代码':<12}{'PE':<10}{'PB':<9}{'换手':<8}{'涨跌':<9}{'年化波动':<10}{'波动率分位':<12}标签"]
     for c in cands:
         d = c.展示
         lines.append(f"{c.简称:<12}{c.代码:<12}{d['PE']:<10}{d['PB']:<9}"
-                     f"{d['换手率']:<8}{d['区间涨跌幅']:<9}{'/'.join(c.标签)}")
+                     f"{d['换手率']:<8}{d['区间涨跌幅']:<9}{d['年化波动率']:<10}"
+                     f"{d['波动率历史分位']:<12}{'/'.join(c.标签)}")
     return "\n".join(lines)
 
 
@@ -167,6 +194,9 @@ class Pick:
 @dataclass
 class Proposal:
     picks: list[Pick] = dfield(default_factory=list)
+    # 供内部底稿复核：不能只留下 LLM 选中的 1~3 个标的，否则分析师无法判断
+    # 是否有更合适的候选被忽略。它不是给 OptionHelper 的输入。
+    candidates: list[Candidate] = dfield(default_factory=list)
     择优维度: list[str] = dfield(default_factory=list)
     说明: str = ""
     候选数: int = 0
@@ -188,7 +218,8 @@ _SYSTEM_PICK = """你是场外衍生品的"挂钩标的择优器"。
 3. 选 **1~3 个**。选多个时，必须说明每个各自**适合什么配置偏好**
    （如"集中硬科技暴露"vs"跨板均衡配置"），而不是罗列几个差不多的。
 4. **择优维度要明说**，且应贴合本次主题。典型维度：主题暴露度（该标的多大比例
-   落在本次分析的产业/板块上）、估值水平、成分股市值与流动性、波动弹性。
+   落在本次分析的产业/板块上）、估值水平、成分股市值与流动性、候选自身历史波动率。
+   波动率仅用于比较风险/弹性与当前市场状态，不得把“波动高/低”直接翻译成期权结构建议。
 5. 若池中确实没有能表达本次主题的标的，`挂钩候选` 给空数组，并在 `说明` 里
    写清为什么——**宁可承认没有合适标的，也不要硬挑一个不相关的**。
 6. 不要给期权结构、期限、报价建议——那由交易台决定，不在你的职责内。
@@ -251,6 +282,7 @@ def propose(topic: str, topic_type: str = "", *, context: dict | None = None,
 
     cands = compare(codes=[i.代码 for i in inst.INSTRUMENTS], provider=provider)
     p.候选数 = len(cands)
+    p.candidates = cands
     if not cands:
         p.error = "候选池取数失败，无法比较"
         return p
