@@ -97,6 +97,10 @@ class DeepSeekClient:
             "messages": messages,
             "temperature": temperature,
             "stream": False,
+            # 本项目所有调用最终都要求机器解析的 JSON。V4 默认开启思考模式时，
+            # 大量 token 会进入 reasoning_content，而本项目不能把推理草稿当作
+            # 可交付结论；关闭它可让模型直接返回 content，减少空内容与长等待风险。
+            "thinking": {"type": "disabled"},
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}

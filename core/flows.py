@@ -107,7 +107,7 @@ def _trend_from_series(rows: list[tuple[str, float]], lookback_days: int,
     return t
 
 
-def etf_share_trend(sector: str, *, lookback_days: int = 90,
+def etf_share_trend(sector: str, *, analysis_etf: str = "", lookback_days: int = 90,
                     provider: DataProvider | None = None) -> FlowTrend:
     """板块代表 ETF 的份额趋势（近 lookback_days 天变动）。支撑 F7/F7b。
 
@@ -121,8 +121,11 @@ def etf_share_trend(sector: str, *, lookback_days: int = 90,
     """
     from . import instruments as im
 
-    inst, _note = im.underlying_for(sector)
-    etf = inst if inst is not None else (im.find(sector) or [None])[0]
+    # 显式 ETF 与行情字段必须同口径；只有未点名 ETF 的板块请求才走默认映射。
+    etf = im.get(analysis_etf.strip()) if analysis_etf.strip() else None
+    if etf is None:
+        inst, _note = im.underlying_for(sector)
+        etf = inst if inst is not None else (im.find(sector) or [None])[0]
     if etf is None:
         t = FlowTrend(指标="ETF份额")
         t.error = f"instruments 候选池未找到「{sector}」对应的 ETF"

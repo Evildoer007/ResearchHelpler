@@ -49,6 +49,9 @@ SOURCE_PREFIX = "人工填写"
 class Overrides:
     字段覆盖: dict[str, dict] = dfield(default_factory=dict)   # 字段名 → {值, 来源, 说明}
     外部事实: dict[str, str] = dfield(default_factory=dict)     # 待补事项原文 → 分析师填的内容
+    # 事件驱动报告的事实与传导证据。它和通用“外部事实”分开，后者只是给 planner
+    # 的背景，前者会作为可溯源字段交给 writer，并受 event_evidence 的硬门校验。
+    事件证据: object = None
     path: str = ""
     errors: list[str] = dfield(default_factory=list)
 
@@ -58,7 +61,10 @@ class Overrides:
 
     @property
     def 为空(self) -> bool:
-        return not self.字段覆盖 and not self.外部事实
+        evidence = self.事件证据
+        return (not self.字段覆盖 and not self.外部事实
+                and not getattr(evidence, "event_facts", [])
+                and not getattr(evidence, "transmission_links", []))
 
 
 def judged_fields() -> set[str]:
@@ -127,6 +133,9 @@ def load(path: str | Path | None) -> Overrides:
         k, v = str(k).strip(), str(v).strip()
         if k and v:
             ov.外部事实[k] = v
+    from . import event_evidence
+    ov.事件证据 = event_evidence.parse(raw.get("事件证据"))
+    ov.errors.extend(ov.事件证据.errors)
     return ov
 
 

@@ -35,6 +35,32 @@ os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu --no-sandbox"
 # 但实测留一拍更稳——不留时偶发首图未绘制完就被截进 PDF。
 _SETTLE_MS = 1200
 _TIMEOUT_MS = 60000
+_A4_CSS_HEIGHT = 1123  # A4 @ 96dpi；仅用于定位超页区块，正式判定仍以 PDF 页数为准。
+
+
+def _layout_audit_script() -> str:
+    """返回页面内区块的位置，供超页时给分析师定位；不改动 HTML。"""
+    return f"""(() => {{
+      const page = document.querySelector('.page');
+      if (!page) return {{}};
+      const top = page.getBoundingClientRect().top;
+      const label = (el) => {{
+        if (el.matches('h1')) return '标题';
+        if (el.matches('.sub')) return '副标题';
+        if (el.matches('.concl')) return '核心结论';
+        if (el.matches('.under')) return '挂钩标的';
+        if (el.matches('.quote')) return '推荐结构·参考报价';
+        if (el.matches('.footer')) return '页脚与风险提示';
+        if (el.matches('.logic')) return (el.querySelector('.ltitle')?.innerText || '策略逻辑').trim();
+        return (el.className || el.tagName).toString();
+      }};
+      const sections = Array.from(page.children).map(el => {{
+        const rect = el.getBoundingClientRect();
+        return {{label: label(el), top: Math.round(rect.top - top), bottom: Math.round(rect.bottom - top)}};
+      }});
+      return {{page_height: Math.round(page.getBoundingClientRect().height), printable_height: {_A4_CSS_HEIGHT},
+               overflow: sections.filter(s => s.bottom > {_A4_CSS_HEIGHT}), sections}};
+    }})()"""
 
 
 def _page_layout():
@@ -48,7 +74,7 @@ def _page_layout():
 
 
 def html_to_pdf(html_path: str | pathlib.Path,
-                pdf_path: str | pathlib.Path | None = None) -> str:
+                pdf_path: str | pathlib.Path | None = None, *, layout_audit: dict | None = None) -> str:
     """把一页通 HTML 转成 PDF，返回 PDF 路径。**自建事件循环，供命令行调用。**
 
     GUI 环境下不要用这个（QApplication 只能有一个），改用 `print_page_async`。
@@ -79,8 +105,15 @@ def html_to_pdf(html_path: str | pathlib.Path,
             state["err"] = "页面加载失败"
             app.quit()
             return
-        QTimer.singleShot(_SETTLE_MS,
-                          lambda: view.page().printToPdf(on_pdf, _page_layout()))
+
+        def after_audit(result) -> None:
+            # Qt 把 JS object 映射为 Python dict；失败时保持空，页数校验仍照常执行。
+            if layout_audit is not None and isinstance(result, dict):
+                layout_audit.update(result)
+            QTimer.singleShot(_SETTLE_MS,
+                              lambda: view.page().printToPdf(on_pdf, _page_layout()))
+
+        view.page().runJavaScript(_layout_audit_script(), after_audit)
 
     view.loadFinished.connect(on_load)
     view.setUrl(QUrl.fromLocalFile(str(src)))

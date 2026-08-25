@@ -150,6 +150,9 @@ _SYSTEM = """你是场外衍生品投资策略研报的"撰稿器"。根据论�
    关联，就不要硬套一句"SK海力士区间涨跌幅-12.62%……"作为开场白——
    这种为了提而提、跟后面论证接不上的写法比不提更差。
    这个字段没给（多数板块类需求没有触发实体）时，不必强行编一个事件角度。
+3.5.1 **有“已核验事件传导证据”时，事件本体与本次 A 股行业/ETF 的因果连接只能按
+该证据写。** 不得把“同属科技/半导体”等概念相近自行扩写为供应链、竞争或受益关系；
+每次提到传导，须清楚区分“事件事实”“传导依据”“A 股市场响应”三层。
 4. 图表规格只描述"画什么"（图型、要展示的数据点、标题），不要自己画图或输出图片。
 4.0 **`图表规格列表` 给 1~2 项。判断标准是"这条论述用到了几组不同性质的数据"，
    而不是"至少给一张就够了"。** 论述里每摆出一组读者需要看见的数据，就该配一张图。
@@ -290,6 +293,7 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
     detail = None
     subs = None
     trigger_data: dict[str, str] = {}
+    transmission_data: dict[str, str] = {}
     panorama: dict[str, str] = {}
     for name, fv in (ma.field_values or {}).items():
         if not isinstance(name, str) or name.startswith("__"):
@@ -307,6 +311,9 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
         # SK海力士自己的PE说成半导体板块的PE，方向性质完全不同。
         if name.startswith("触发标的_"):
             trigger_data[name.removeprefix("触发标的_")] = fv.display or str(fv.value)
+            continue
+        if name.startswith("事件传导证据"):
+            transmission_data[name.removeprefix("事件传导证据")] = fv.display or str(fv.value)
             continue
         panorama[name] = fv.display or str(fv.value)
 
@@ -331,6 +338,8 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
         **({"触发实体自身数据_与板块全景数据严格区分": {
             "名称": trigger_name, "代码": trigger_code, "数据": trigger_data}}
            if trigger_code else {}),
+        **({"已核验事件传导证据_只可按此写因果": transmission_data}
+           if transmission_data else {}),
         # #73：波动率/涨跌幅分位/换手率/成交额分位这四个字段，只要这里给了 etf_code，
         # 就是这只 ETF 自己的真实价格数据，不是板块聚合出来的——写正文时必须归属给它
         # （"消费ETF近3年波动率处82%分位"），不能笼统写成"板块波动率"，见铁律 3.1.3。

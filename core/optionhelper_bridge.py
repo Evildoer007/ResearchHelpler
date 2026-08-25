@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field as dfield
 from pathlib import Path
 from typing import Any, Mapping
@@ -63,6 +65,19 @@ class OptionHelperResult:
     raw: dict[str, Any] = dfield(default_factory=dict)
     client_constraints: dict[str, Any] = dfield(default_factory=dict)
     client_product_intent: str = ""
+    selection_run_id: str = ""
+    selection_archive_path: str = ""
+
+
+@dataclass
+class OptionHelperRecommendation:
+    """OptionHelper Recommender 已验证的候选集合；尚未形成可执行报价。"""
+
+    ok: bool = False
+    error: str = ""
+    candidates: list[dict[str, Any]] = dfield(default_factory=list)
+    constraints: dict[str, Any] = dfield(default_factory=dict)
+    raw: dict[str, Any] = dfield(default_factory=dict)
 
     @property
     def recovery_action(self) -> str:
@@ -83,6 +98,80 @@ def recovery_action_for(stage: str, error: str) -> str:
     if stage:
         return "保留研究报告；核对该阶段错误后重试正式报价。"
     return ""
+
+
+@dataclass(frozen=True)
+class _SelectionLease:
+    """一次报价独占的一份选择；活动文件不会被其他 run 读取。"""
+
+    run_id: str
+    active_path: Path
+    archive_path: Path
+
+
+def _safe_run_id(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return safe[:120] or f"adhoc-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def _pending_selection_path(project_root: Path) -> Path:
+    configured = Path(config.OPTIONHELPER_SELECTION_PATH)
+    return configured if configured.is_absolute() else project_root / configured
+
+
+def _claim_selection(project_root: Path, run_id: str) -> tuple[_SelectionLease | None, str]:
+    """将待报价选择原子绑定到一个 run；旧选择不会自动回流到下一次运行。"""
+    if config.OPTIONHELPER_HOST_URL:
+        return None, ""
+    pending = _pending_selection_path(project_root)
+    if not pending.is_file():
+        return None, (
+            "本次报价没有一次性 selection；请由 Agent 基于本次观点包写入 "
+            f"{pending}，随后重新发起报价。旧 .optionhelper/selection.json 不再读取。"
+        )
+    safe_id = _safe_run_id(run_id)
+    base = project_root / ".optionhelper" / "selections"
+    active = base / "active" / f"{safe_id}.json"
+    archive = base / "archive" / f"{safe_id}.json"
+    if active.exists() or archive.exists():
+        return None, f"本次运行 {safe_id} 的 selection 已被占用或归档，不能重复报价。"
+    try:
+        active.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(pending, active)
+    except OSError as error:
+        return None, f"无法锁定本次 OptionHelper selection：{error}"
+    return _SelectionLease(safe_id, active, archive), ""
+
+
+def _archive_selection(lease: _SelectionLease | None, result: OptionHelperResult | None,
+                       error: str = "") -> str:
+    """报价结束即归档并失效；归档用于审计，绝不再作为任何 run 的输入。"""
+    if lease is None:
+        return ""
+    try:
+        try:
+            raw = json.loads(lease.active_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as read_error:
+            raw = {"selection_read_error": f"{type(read_error).__name__}: {read_error}"}
+        if not isinstance(raw, dict):
+            raw = {"selection_payload": raw}
+        raw["lifecycle"] = {
+            "state": "consumed",
+            "run_id": lease.run_id,
+            "consumed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "quote_status": "completed" if result is not None and result.ok else "failed",
+            "quote_stage": (result.stage if result is not None else "interrupted") or "completed",
+            "error": (result.error if result is not None else error)[:500],
+        }
+        lease.archive_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = lease.archive_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, lease.archive_path)
+        lease.active_path.unlink(missing_ok=True)
+        return str(lease.archive_path)
+    except OSError:
+        # 即使归档磁盘写失败，active 文件仍按 run_id 隔离，其他运行不会回读它。
+        return ""
 
 
 def missing_setup() -> list[str]:
@@ -167,6 +256,63 @@ def build_prompt(vp: ViewPackage, client_constraints: Mapping[str, Any] | None =
     return "\n".join(lines)
 
 
+def recommend(vp: ViewPackage, *, project_root: str | Path | None = None,
+              client_constraints: Mapping[str, Any] | None = None,
+              client_product_intent: str = "") -> OptionHelperRecommendation:
+    """运行最新版 Skill 的 Recommender，返回候选而不写 pending selection、不报价。"""
+    root = Path(project_root).resolve() if project_root else _PROJECT_ROOT
+    missing = missing_setup()
+    if missing:
+        return OptionHelperRecommendation(error="OptionHelper 新版 Skill 尚未就绪：" + "；".join(missing))
+    ready, _readiness_report, readiness_error = _readiness(root)
+    if not ready:
+        return OptionHelperRecommendation(error=readiness_error)
+    constraints = _effective_constraints(
+        {}, client_constraints, underlying=vp.标的代码,
+        market_view=vp.市场展望.方向 or vp.整体方向,
+    )
+    # Recommender 只接受客户确认的约束；取数事实和市场判断留在 prompt 中，不混写为条款。
+    payload = {
+        "skill_root": str(Path(config.OPTIONHELPER_SKILL_ROOT).resolve()),
+        "project_root": str(root),
+        "prompt": build_prompt(vp, constraints, client_product_intent),
+        "constraints": constraints,
+    }
+    env = dict(os.environ)
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"):
+        env.pop(key, None)
+    env["NO_PROXY"] = "*"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    started = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            [str(Path(config.OPTIONHELPER_PYTHON).resolve()),
+             str(root / "core" / "optionhelper_recommender_worker.py")],
+            cwd=str(root), env=env, input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=240,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        message = f"OptionHelper 结构推荐未完成：{error}"
+        record_external("OptionHelper recommender", status="failed", duration_seconds=time.perf_counter() - started, error=message)
+        return OptionHelperRecommendation(error=message)
+    output = _json_stdout(proc)
+    if proc.returncode != 0 or output.get("ok") is not True:
+        message = str(output.get("message") or "OptionHelper Recommender 未返回可用结果。")
+        record_external("OptionHelper recommender", status="failed", duration_seconds=time.perf_counter() - started, error=message)
+        return OptionHelperRecommendation(error=message, raw=output)
+    result = output.get("result") if isinstance(output.get("result"), Mapping) else {}
+    recommendation = result.get("recommendation") if isinstance(result.get("recommendation"), Mapping) else {}
+    candidates = recommendation.get("candidates") if isinstance(recommendation.get("candidates"), list) else []
+    safe_candidates = [dict(item) for item in candidates if isinstance(item, Mapping) and item.get("product_id")]
+    if not safe_candidates:
+        message = str(result.get("message") or "OptionHelper 未形成可执行的推荐候选。")
+        record_external("OptionHelper recommender", status="failed", duration_seconds=time.perf_counter() - started, error=message)
+        return OptionHelperRecommendation(error=message, raw=output)
+    record_external("OptionHelper recommender", status="completed", duration_seconds=time.perf_counter() - started)
+    return OptionHelperRecommendation(ok=True, candidates=safe_candidates, constraints=constraints, raw=output)
+
+
 def _json_stdout(proc: subprocess.CompletedProcess[str]) -> dict[str, Any]:
     try:
         value = json.loads(proc.stdout) if proc.stdout and proc.stdout.strip() else {}
@@ -214,13 +360,12 @@ def _readiness(project_root: Path) -> tuple[bool, dict[str, Any], str]:
 
 
 def _selection_payload(project_root: Path, vp: ViewPackage,
-                       client_constraints: Mapping[str, Any] | None = None) -> tuple[dict[str, Any], str]:
+                       client_constraints: Mapping[str, Any] | None = None,
+                       selection_path: Path | None = None) -> tuple[dict[str, Any], str]:
     """读取 Agent 的公开选择；绝不从旧模型网关自行生成一个选择。"""
     if config.OPTIONHELPER_HOST_URL:
         return {}, ""
-    path = Path(config.OPTIONHELPER_SELECTION_PATH)
-    if not path.is_absolute():
-        path = project_root / path
+    path = selection_path or _pending_selection_path(project_root)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -344,12 +489,47 @@ def run_full(
     project_root: str | Path | None = None,
     client_constraints: Mapping[str, Any] | ClientConstraints | None = None,
     client_product_intent: str = "",
+    run_id: str = "",
 ) -> OptionHelperResult:
-    """执行最新版受控 Quote 链路并返回一页通需要的冻结表格事实。"""
+    """执行一次性 Quote；selection 在本次尝试结束后归档并永久失效。"""
     if output_type != "quote":
         return OptionHelperResult(ok=False, stage="request", error="一页通仅接入新版 OptionHelper 的 quote 正式交付。")
     if not vp.ok or not vp.标的代码:
         return OptionHelperResult(ok=False, stage="request", error="观点包未就绪或挂钩标的未定。")
+    root = Path(project_root).resolve() if project_root else _PROJECT_ROOT
+    lease, lease_error = _claim_selection(root, run_id)
+    if lease_error:
+        return OptionHelperResult(ok=False, stage="recommender", error=lease_error)
+    result: OptionHelperResult | None = None
+    try:
+        result = _run_full_claimed(
+            vp,
+            output_type=output_type,
+            project_root=root,
+            client_constraints=client_constraints,
+            client_product_intent=client_product_intent,
+            selection_path=lease.active_path if lease is not None else None,
+        )
+    except Exception as error:
+        _archive_selection(lease, None, f"{type(error).__name__}: {error}")
+        raise
+    archived = _archive_selection(lease, result)
+    if result is not None and lease is not None:
+        result.selection_run_id = lease.run_id
+        result.selection_archive_path = archived
+    return result or OptionHelperResult(ok=False, stage="host", error="OptionHelper 未返回结果。")
+
+
+def _run_full_claimed(
+    vp: ViewPackage,
+    *,
+    output_type: str = "quote",
+    project_root: str | Path | None = None,
+    client_constraints: Mapping[str, Any] | ClientConstraints | None = None,
+    client_product_intent: str = "",
+    selection_path: Path | None = None,
+) -> OptionHelperResult:
+    """在已经锁定的一次性 selection 上执行受控 Quote 链路。"""
     missing = missing_setup()
     if missing:
         return OptionHelperResult(ok=False, stage="configuration", missing=missing,
@@ -364,7 +544,8 @@ def run_full(
 
     supplied_constraints = (client_constraints.supplied() if isinstance(client_constraints, ClientConstraints)
                              else dict(client_constraints or {}))
-    selection_fields, selection_error = _selection_payload(root, vp, supplied_constraints)
+    selection_fields, selection_error = _selection_payload(
+        root, vp, supplied_constraints, selection_path=selection_path)
     if selection_error:
         return OptionHelperResult(ok=False, stage="recommender", error=selection_error)
     prompt_constraints = dict(selection_fields.get("constraints") or {})
@@ -436,7 +617,9 @@ def run_full(
             client_product_intent=client_product_intent,
         )
 
-    summary = out.get("user_summary") if isinstance(out.get("user_summary"), Mapping) else {}
+    # 新版 OptionHelper 直接返回项目结果；旧版桥接则包在 user_summary 中。
+    # 兼容两种协议，避免已完成的正式报价被误判为缺少报告路径。
+    summary = out.get("user_summary") if isinstance(out.get("user_summary"), Mapping) else out
     rec = summary.get("recommendation") if isinstance(summary.get("recommendation"), Mapping) else {}
     rep = summary.get("report") if isinstance(summary.get("report"), Mapping) else {}
     report_path = str(rep.get("path") or "")

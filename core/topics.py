@@ -115,6 +115,20 @@ def _verify_code(code: str, name: str, provider: DataProvider) -> str:
         return f"待确认:未给标的名称(该代码为{actual})"
     if a == b or a in b or b in a:
         return f"ok:{actual}"
+    # ETF 同时有交易简称和基金全称。iFinD 往往返回后者，例如 512000.SH 的
+    # “华宝中证全指证券公司ETF”，而用户/LLM自然会写交易简称“券商ETF”。
+    # 两者并不矛盾；若代码在已校验的工具目录中，必须拿目录别名做第二次比对，
+    # 不能把真实的显式 ETF 错误拦下，再悄悄退回板块默认 ETF。
+    try:
+        from . import instruments
+        instrument = instruments.get(code)
+    except Exception:  # noqa: BLE001 - 校验目录不可用时保留原有严格行为
+        instrument = None
+    if instrument is not None:
+        aliases = [instrument.简称, instrument.官方名]
+        if any((normalized := _normalize_name(alias)) and
+               (normalized == b or normalized in b or b in normalized) for alias in aliases):
+            return f"ok:{actual}（交易简称/基金全称别名已核验）"
     return f"名称不符:代码{code}实为「{actual}」，与建议标的「{name}」不一致"
 
 

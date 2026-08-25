@@ -205,6 +205,10 @@ def _build_prompt(text: str, bundle: sg.SignalBundle) -> str:
 _PRODUCT_RE = re.compile(
     r"(?i)\b(?:call|put)\s*spread\b|看涨价差|看跌价差|鲨鱼鳍|雪球|期权|报价|执行价|产品|结构|"
     r"最大损失|本金波动|收益偏好|期限")
+# 不用 ``\b``：Python 会把中文视作 ``\w``，所以 `512000.SH推荐产品` 的 .SH 后并非
+# 单词边界，恰好会漏掉中文需求里最常见的“代码紧接文字”写法。
+_SECURITY_CODE_RE = re.compile(
+    r"(?i)(?<![A-Z0-9])(?:\d{6}\.(?:SH|SZ)|\d{4}\.HK|[A-Z]{1,6}\.(?:O|N)|\d{6}\.(?:KS|KQ))(?![A-Z0-9])")
 
 
 def _product_mentions(raw: str) -> str:
@@ -217,6 +221,59 @@ def _research_only(value: str) -> str:
     """解析器偶尔仍会把客户的结构词带进研究字段；作为确定性兜底剔除整句。"""
     parts = [part.strip() for part in re.split(r"[，,。；;！？]", value or "") if part.strip()]
     return "；".join(part for part in parts if not _PRODUCT_RE.search(part))
+
+
+def _inject_explicit_codes(b: Brief, raw: str, provider: DataProvider) -> None:
+    """把用户原文中明确写出的证券代码放进候选池，优先级高于 LLM 候选。
+
+    LLM 可以遗漏代码、把 ETF 交易简称写成基金全称，甚至完全不填候选标的；这些都不能
+    覆盖用户已经点名的交易工具。白名单内 ETF 用受控目录的交易简称校验，白名单外代码仍
+    交给数据源验证，验证不通过则保留在候选列表中供界面/日志明确报错，绝不静默换成另一只。
+    """
+    from . import instruments
+
+    codes = list(dict.fromkeys(match.group(0).upper() for match in _SECURITY_CODE_RE.finditer(raw or "")))
+    if not codes:
+        return
+    by_code = {str(item.代码 or "").upper(): item for item in b.候选标的}
+    explicit: list[TargetRef] = []
+    for code in codes:
+        inst = instruments.get(code)
+        target = by_code.get(code)
+        if target is None:
+            target = TargetRef(名称=inst.简称 if inst is not None else "", 代码=code)
+            explicit.append(target)
+        elif inst is not None:
+            # 当 LLM 写“券商ETF”、iFinD 返回基金全称时，以已校验目录的交易简称统一名称，
+            # 避免别名差异让显式输入落入“名称不符”。
+            target.名称 = inst.简称
+        if not target.名称:
+            response = provider.get_basic([code], ["ths_stock_short_name_stock"])
+            if response.ok and response.value:
+                target.名称 = str(response.value)
+    # 插到最前面，使原文点名的个股也优先于模型臆测的候选；代表标的属性仍会优先个股。
+    b.候选标的 = explicit + b.候选标的
+
+    # 用户明确点名 ETF 时，ETF 是可交易挂钩标的，不应被 LLM 随手给出的
+    # 个股（例如把券商 ETF 配成中国人寿）抢走“数据代表标的”角色。研究取数
+    # 仍需要一只同板块、已验证的成熟个股，因此按本次板块口径重新取龙头；
+    # 这只个股只作数据锚点，最终挂钩对象仍由 explicit ETF 保留。
+    from . import universe
+    explicit_funds = [code for code in codes if universe._is_fund(code)]
+    explicit_stocks = [code for code in codes if not universe._is_fund(code)]
+    if explicit_funds and not explicit_stocks and b.涉及板块:
+        # 数据锚点是增强项；iFinD 临时登录/网络失败不能否定用户明确点名的 ETF。
+        try:
+            lead = universe.pick_representative(b.涉及板块[:3], provider=provider)
+        except Exception:
+            lead = None
+        if lead and not any(str(t.代码).upper() == str(lead.代码).upper() for t in b.候选标的):
+            # 显式 ETF 仍保持候选列表第一项，供挂钩标的识别；数据锚点排在其后，
+            # `Brief.代表标的` 会按“个股优先”选择它。
+            b.候选标的.insert(len(explicit), TargetRef(
+                名称=lead.简称, 代码=lead.代码,
+                校验=f"ok:{lead.简称}（用户点名 ETF 后按板块重选数据锚点·市值{lead.市值亿元}亿）",
+            ))
 
 
 def _resolve_broad(b: Brief, d: dict, provider: DataProvider) -> None:
@@ -314,6 +371,7 @@ def parse(
     if verify_codes:
         provider = provider or get_provider()
         _resolve_broad(b, d, provider)
+        _inject_explicit_codes(b, text, provider)
         for t in b.候选标的:
             t.校验 = topics._verify_code(t.代码, t.名称, provider)
         # 触发实体走同一套校验（代码真实存在 + 简称对得上），跟候选标的同一道闸门——

@@ -405,8 +405,8 @@ body { margin:0; background:var(--oh-ground); color:var(--oh-ink);
    在 content-box 下实占 884px，而 A4 在 96dpi 下只有 794px——**宽出 90px**。
    只做 HTML 时看不出来（浏览器可横向滚），一导 PDF 就右边被裁。
    改为 border-box + 794px：padding 含在宽内，正文净宽 794-60=734px。 */
-.page { box-sizing:border-box; width:794px; margin:14px auto; background:var(--oh-paper);
-        padding:22px 30px; box-shadow:0 2px 12px rgb(44 53 62 / .10); }
+.page { box-sizing:border-box; width:794px; margin:10px auto; background:var(--oh-paper);
+        padding:18px 28px; box-shadow:0 2px 12px rgb(44 53 62 / .10); }
 
 /* 打印/导 PDF 时：纸张 A4、零边距（版面自带 padding），去掉屏幕用的投影与外底色 */
 @page { size:A4; margin:0; }
@@ -421,22 +421,22 @@ body { margin:0; background:var(--oh-ground); color:var(--oh-ink);
 h1 { font-size:16px; color:var(--oh-ink); margin:0 0 3px; line-height:1.35;
      font-family:var(--f-heavy); font-weight:700; }
 h1 .accent { color:var(--oh-brand-red); }
-.sub { font-size:10px; color:var(--oh-muted); margin-bottom:10px; }
+.sub { font-size:10px; color:var(--oh-muted); margin-bottom:6px; }
 /* 正文与核心结论的字号：#80 一并下调，换取更长的论述而版面高度不涨。
    一页通的约束是"一页"，不是"字少"——同样的高度里，小一号字能多容
    约三成内容，而 12px/12.5px 在 820px 宽的版面上仍清晰可读。 */
-.concl { background:var(--oh-brand-red-soft); border-left:3px solid var(--oh-brand-red); padding:9px 11px; margin:7px 0 12px; font-size:11px; line-height:1.62; font-family:var(--f-med); font-weight:500; }
+.concl { background:var(--oh-brand-red-soft); border-left:3px solid var(--oh-brand-red); padding:7px 10px; margin:5px 0 8px; font-size:11px; line-height:1.52; font-family:var(--f-med); font-weight:500; }
 .concl .lbl { color:var(--oh-brand-red); font-family:var(--f-heavy); font-weight:700; letter-spacing:2px; margin-right:8px; }
 .concl b { font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red); }
-.logic { margin:18px 0; }
+.logic { margin:12px 0; }
 .tag { display:inline-block; background:var(--oh-brand-red); color:var(--oh-surface); font-size:9.5px; padding:1px 7px; border-radius:2px; margin-right:6px; font-weight:700; }
 .ltitle { font-size:12px; font-family:var(--f-heavy); font-weight:700; color:var(--oh-ink); }
 /* 字重 500 = 思源黑体 Medium。Regular(400) 在小字号下偏细，观感发灰；
    Medium 更接近传统黑体的密度，正文读起来更实。重点由 <b>(700) 承担。 */
-.body { font-size:10.5px; line-height:1.62; color:var(--oh-ink-soft); margin:5px 0;
+.body { font-size:10.5px; line-height:1.52; color:var(--oh-ink-soft); margin:4px 0;
         font-family:var(--f-med); font-weight:500; }
 .body b { font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red); }
-.chart { text-align:center; margin:10px 0; }
+.chart { text-align:center; margin:7px 0; }
 /* 宽度由 <img width> 按 CSS_DPI 定死，这里只兜底防溢出 */
 .chart img { max-width:100%; height:auto; }
 /* 一条逻辑配 2~3 张图时并排显示（而非竖向堆叠），省纵向版面。
@@ -447,7 +447,7 @@ h1 .accent { color:var(--oh-brand-red); }
    实测每个 chart-row 的图宽合计 828~1440px，无一并排成功，等于一张一行。
    改成 flex 基准宽 + img 跟随容器，两张才真能共一行（各约372px，约原宽77%，
    图内文字仍清晰）；三张时第三张换行，靠 max-width 防止它被拉满整行。 */
-.chart-row { display:flex; flex-wrap:wrap; justify-content:center; gap:8px; margin:10px 0;
+.chart-row { display:flex; flex-wrap:wrap; justify-content:center; gap:6px; margin:7px 0;
              align-items:flex-start; }
 .chart-row .chart, .chart-row .htmlchart { margin:0; flex:1 1 340px; min-width:0; max-width:400px; }
 .chart-row .chart img { width:100%; height:auto; }
@@ -493,30 +493,42 @@ h1 .accent { color:var(--oh-brand-red); }
 .cc-cl { font-size:12px; font-weight:bold; color:var(--oh-brand-red); border-top:1px solid var(--oh-rule); padding-top:6px; }
 .pool { font-size:11.5px; color:var(--oh-muted); border-top:1px dashed var(--oh-rule); padding-top:7px; margin-top:12px; }
 .under { border:1px solid var(--oh-paper-border); border-left:3px solid var(--oh-brand-red-deep); background:var(--oh-red-surface);
-         border-radius:3px; padding:9px 12px; margin-top:14px; }
-.under .lbl { display:inline-block; font-size:11px; font-weight:700; color:var(--oh-brand-red-deep);
-              letter-spacing:1px; margin-bottom:4px; }
-.u-main { font-size:13px; color:var(--oh-ink); line-height:1.6; }
-.u-why { font-size:12px; color:var(--oh-ink-soft); line-height:1.65; margin-top:4px; }
-.u-struct { font-size:12.5px; color:var(--oh-ink); line-height:1.65; margin-top:6px; }
-.u-note { font-size:11px; color:var(--oh-muted-soft); margin-top:5px; }
+         border-radius:3px; padding:7px 10px; margin-top:8px; }
+/* 标题与标的身份强制同行，避免“挂钩标的”孤悬一行造成额外高度。 */
+.u-line { display:flex; align-items:baseline; gap:10px; min-width:0; }
+/* 挂钩标的卡片是页末收束信息：统一 10px，仍保留可读的 1.45 行高。 */
+.under .lbl, .u-main, .u-why, .u-struct, .u-note { font-size:10px; line-height:1.45; }
+.under .lbl { flex:0 0 auto; font-weight:700; color:var(--oh-brand-red-deep); letter-spacing:1px; white-space:nowrap; }
+.u-main { min-width:0; white-space:nowrap; }
+.u-main, .u-why { color:var(--oh-ink); }
+.u-why { margin-top:1px; }
+.u-struct { color:var(--oh-ink); margin-top:2px; }
+.u-note { color:var(--oh-muted-soft); margin-top:2px; }
+/* 正式报价由 OptionHelper 返回后，独立展示已确认的结构和适配理由；研究层不生成这块。 */
+.recommendation { border:1px solid var(--oh-paper-border); background:var(--oh-brand-red-soft);
+                  border-left:3px solid var(--oh-brand-red); border-radius:3px; padding:6px 10px;
+                  margin-top:7px; font-size:10px; line-height:1.45; color:var(--oh-ink); }
+.recommendation .r-label { font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red-deep);
+                           letter-spacing:1px; margin-right:8px; }
+.recommendation .r-name { font-family:var(--f-heavy); font-weight:700; }
+.recommendation .r-reason { color:var(--oh-ink-soft); }
 /* 参考 0720 成品：报价是正文最末一块，暖灰表头、细边线、末列暗红强调。 */
-.quote { margin-top:13px; page-break-inside:avoid; }
+.quote { margin-top:8px; page-break-inside:avoid; }
 .q-heading { text-align:center; color:var(--oh-brand-red-deep); font-family:var(--f-heavy); font-weight:700;
              font-size:11px; letter-spacing:3px; margin:0 0 6px; }
 .q-meta { display:flex; justify-content:space-between; align-items:flex-end; gap:8px;
           font-size:9px; color:var(--oh-muted); margin:5px 0 3px; }
 .q-group-title { color:var(--oh-table-head-ink); font-family:var(--f-med); font-weight:500; }
 .q-table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:9px; line-height:1.35; }
-.q-table th, .q-table td { border:1px solid var(--oh-table-border); padding:4px 5px; text-align:center;
+.q-table th, .q-table td { border:1px solid var(--oh-table-border); padding:3px 4px; text-align:center;
                            vertical-align:middle; overflow-wrap:anywhere; }
 .q-table th { background:var(--oh-brand-red-soft); color:var(--oh-table-head-ink); font-family:var(--f-heavy); font-weight:700; }
 .q-table td { background:var(--oh-red-surface); color:var(--oh-ink-soft); }
 .q-table td:first-child { font-family:var(--f-heavy); font-weight:700; }
 .q-table td:last-child { color:var(--oh-brand-red-deep); font-family:var(--f-heavy); font-weight:700; }
 .q-note { font-size:8.5px; line-height:1.45; color:var(--oh-muted-soft); margin:4px 0 0; text-align:right; }
-.src { font-size:10.5px; color:var(--oh-muted); border-top:1px solid var(--oh-rule); margin-top:14px; padding-top:7px; line-height:1.55; }
-.foot { font-size:9px; color:var(--oh-muted-soft); border-top:1px solid var(--oh-rule); margin-top:15px; padding-top:7px; line-height:1.55; }
+.src { font-size:10px; color:var(--oh-muted); border-top:1px solid var(--oh-rule); margin-top:8px; padding-top:4px; line-height:1.45; }
+.foot { font-size:8.5px; color:var(--oh-muted-soft); border-top:1px solid var(--oh-rule); margin-top:9px; padding-top:4px; line-height:1.45; }
 .ft-line { margin-top:3px; }
 """
 
@@ -586,6 +598,9 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None
     under_html = _underlying_block(ma, rc, oh_result)
     if under_html:
         sections.append(under_html)
+    recommendation_html = _recommendation_block(oh_result)
+    if recommendation_html:
+        sections.append(recommendation_html)
     quote_html = _quote_block(oh_result)
     if quote_html:
         sections.append(quote_html)
@@ -628,8 +643,7 @@ def _underlying_block(ma, rc, oh=None) -> str:
     if not getattr(pkg, "ok", False) or not pkg.标的代码:
         return ""
 
-    # 只展示市场状态和为什么选这只 ETF；不在 Research Helper 卡片中夹带结构建议。
-    市场情况 = pkg.页面市场摘要 or "市场数据待补"
+    # 客户版不再重复正文中的市场情况；这里只保留标的身份、核心状态和选取原因。
     理由 = pkg.标的选择说明 or pkg.挂钩理由 or pkg.板块理由 or ""
     rows = [f'<b>{pkg.标的名称}</b>（{pkg.标的代码}）']
     if pkg.整体方向:
@@ -637,24 +651,25 @@ def _underlying_block(ma, rc, oh=None) -> str:
     if pkg.波动率看法:
         rows.append(pkg.波动率看法)
     head = "　｜　".join(rows)
-    body = (f'<div class="u-why"><b>市场情况</b>：{_esc(市场情况)}。'
-            + (f' <b>选取原因</b>：{_esc(理由)}' if 理由 else "") + '</div>')
+    body = (f'<div class="u-why"><b>选取原因</b>：{_esc(理由)}</div>' if 理由 else "")
 
-    if oh is not None and getattr(oh, "ok", False) and oh.product_name:
-        struct = (f'<div class="u-struct"><b>推荐结构</b>：{_esc(oh.product_name)}'
-                  + (f'（{_esc(oh.product_id)}）' if oh.product_id else "")
-                  + (f'　{_esc(oh.reason)}' if oh.reason else "") + '</div>')
-        note = ''
-        if oh.coverage_status == "partial":
-            note = ('<div class="u-note">⚠ 部分计算模块未完成，结构与报价以 '
-                    'OptionHelper 报告的缺口标注为准，本页仅供参考。</div>')
-    else:
-        struct = ""
-        note = ('<div class="u-note">推荐结构与参考报价由交易台依实时波动率曲面与报价确定，'
-                '本页不含结构建议。</div>')
+    return (f'<div class="under"><div class="u-line"><span class="lbl">挂钩标的</span>'
+            f'<span class="u-main">{head}</span></div>{body}</div>')
 
-    return (f'<div class="under"><span class="lbl">挂钩标的</span>'
-            f'<div class="u-main">{head}</div>{body}{struct}{note}</div>')
+
+def _recommendation_block(oh) -> str:
+    """只呈现 OptionHelper 已确认的产品结构与理由，不由研究层补写。"""
+    if oh is None or not getattr(oh, "ok", False) or not getattr(oh, "product_name", ""):
+        return ""
+    product = _esc(str(oh.product_name))
+    product_id = _esc(str(oh.product_id)) if getattr(oh, "product_id", "") else ""
+    reason = _esc(str(getattr(oh, "reason", "") or ""))
+    name = product + (f"（{product_id}）" if product_id else "")
+    detail = f'<span class="r-reason">　{reason}</span>' if reason else ""
+    partial = (getattr(oh, "coverage_status", "") == "partial")
+    warning = "　⚠ 部分计算模块未完成，本页仅供参考。" if partial else ""
+    return ('<section class="recommendation"><span class="r-label">推荐结构</span>'
+            f'<span class="r-name">{name}</span>{detail}{warning}</section>')
 
 
 def _quote_block(oh) -> str:

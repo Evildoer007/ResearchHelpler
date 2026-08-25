@@ -11,10 +11,9 @@
       python main.py -b "需求…" --pdf
   默认只出 HTML；--pdf 会额外渲染一份 PDF 并报出**真实页数**。
 
-加 --optionhelper quote 接入最新版 OptionHelper Skill 的正式参考报价：
-      python main.py -b "需求…" --optionhelper quote
-  Skill 根目录、明确选择的独立解释器、项目 memory 与 Agent 已验证 selection
-  均就绪后，页面最下方展示本次冻结的报价表。失败不阻断主报告。
+加 --optionhelper recommend 先运行最新版 OptionHelper Recommender；确认候选后以
+--optionhelper quote 生成正式参考报价。两者均要求 Skill 根目录、明确选择的解释器与项目
+memory 就绪；报价成功时页面最下方展示本次冻结的报价表。失败不阻断主报告。
 
 客户条件可在首次运行时明确输入（未填项使用项目默认档案）：
       --horizon 6个月 --max-loss 20% --principal-fluctuation yes
@@ -57,10 +56,11 @@ except ImportError:
     pass
 
 _WANT_PDF = False        # 由 --pdf 打开，见 main()
-_OH_OUTPUT = ""          # 由 --optionhelper quote 打开，见 main()
+_OH_OUTPUT = ""          # 由 --optionhelper quote|recommend 打开，见 main()
 _CLIENT_CONSTRAINTS = None  # 在 main() 解析为 ClientConstraints
 
-from core import brief, market_confirmation, overrides as ov, pipeline, thesis, topics, validator, writer
+from core import (brief, event_evidence, market_confirmation, overrides as ov, pipeline,
+                  thesis, topics, validator, writer)
 from core.client_constraints import ClientConstraints, parse_cli as parse_client_constraints
 from core.provider import get_provider
 from core.run_tracker import RunTracker
@@ -136,7 +136,26 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
     # 正式报价是慢速外部环节，不能让已完成的研究报告被它卡住。先写一份不含报价表的
     # 可用 HTML；报价完成/失败后再覆写同一路径并补上最终内部底稿。
     out = _report_path(title)
-    if _OH_OUTPUT and not research_only:
+    # 研究完成后固化一份只含已验证市场事实的 OptionHelper 交接快照。桌面端后续推荐/报价
+    # 直接消费它，绝不为产品环节重新解析需求、取数或调用研究 LLM。
+    if tracker:
+        try:
+            from core import optionhelper_bridge as snapshot_ohb, viewpoint as snapshot_vpmod
+
+            snapshot_vp = snapshot_vpmod.build(ma, rc)
+            if snapshot_vp.ok:
+                snapshot_path = tracker.directory / f"{tracker.run_id}.optionhelper-handoff.json"
+                snapshot_path.write_text(json.dumps({
+                    "run_id": tracker.run_id,
+                    "underlying": snapshot_vp.标的代码,
+                    "market_view": snapshot_vp.市场展望.方向 or snapshot_vp.整体方向,
+                    "client_product_intent": client_product_intent,
+                    "market_prompt": snapshot_ohb.build_prompt(snapshot_vp),
+                }, ensure_ascii=False, indent=2), encoding="utf-8")
+                tracker.add_artifact("OptionHelper 观点包", snapshot_path)
+        except Exception as error:
+            print(f"  ⚠ 未能保存 OptionHelper 观点包快照：{type(error).__name__}: {error}")
+    if _OH_OUTPUT == "quote" and not research_only:
         if tracker:
             with tracker.stage("research_report", "先交付研究报告"):
                 _write_research_html(ma, rc, out, oh_result=None)
@@ -145,7 +164,7 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
             _write_research_html(ma, rc, out, oh_result=None)
         print(f"  ✓ 研究报告已先输出：{out}（正式报价将独立更新）")
 
-    # OptionHelper 最新 Skill 的正式 Quote 交付。默认关闭；开了但失败也不阻断。
+    # OptionHelper Recommender 先形成受控候选；它不写 pending selection、更不报价。
     oh_result = None
     if _OH_OUTPUT and not research_only:
         from core import optionhelper_bridge as ohb, viewpoint as vpmod
@@ -156,32 +175,65 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
             if tracker:
                 tracker.add_recovery("修复观点包缺口后，可仅重新发起正式报价。")
         else:
-            print("  · 正在调用 OptionHelper 正式参考报价链路；研究报告会继续交付…")
-            if tracker:
-                with tracker.stage("optionhelper_quote", "生成 OptionHelper 正式参考报价") as stage:
+            if _OH_OUTPUT == "recommend":
+                print("  · 正在调用 OptionHelper 结构推荐链路；不会发起正式报价…")
+                if tracker:
+                    with tracker.stage("optionhelper_recommender", "生成 OptionHelper 结构推荐") as stage:
+                        recommendation = ohb.recommend(
+                            vp, client_constraints=_CLIENT_CONSTRAINTS,
+                            client_product_intent=client_product_intent,
+                        )
+                        if not recommendation.ok:
+                            tracker.fail_stage(stage, recommendation.error)
+                            tracker.add_recovery("补齐客户约束或检查 OptionHelper Recommender 后重新推荐。")
+                        else:
+                            path = tracker.directory / f"{tracker.run_id}.optionhelper-recommendation.json"
+                            path.write_text(json.dumps({
+                                "run_id": tracker.run_id,
+                                "constraints": recommendation.constraints,
+                                "candidates": recommendation.candidates,
+                            }, ensure_ascii=False, indent=2), encoding="utf-8")
+                            tracker.add_artifact("OptionHelper 推荐候选", path)
+                            print(f"  ✓ OptionHelper 已形成 {len(recommendation.candidates)} 个结构候选")
+                else:
+                    recommendation = ohb.recommend(
+                        vp, client_constraints=_CLIENT_CONSTRAINTS,
+                        client_product_intent=client_product_intent,
+                    )
+                    if not recommendation.ok:
+                        print(f"  ⚠ OptionHelper Recommender 未完成：{recommendation.error}")
+            else:
+                print("  · 正在调用 OptionHelper 正式参考报价链路；研究报告会继续交付…")
+                if tracker:
+                    with tracker.stage("optionhelper_quote", "生成 OptionHelper 正式参考报价") as stage:
+                        oh_result = ohb.run_full(vp, output_type=_OH_OUTPUT,
+                                                  client_constraints=_CLIENT_CONSTRAINTS,
+                                                  client_product_intent=client_product_intent,
+                                                  run_id=tracker.run_id)
+                        if not oh_result.ok:
+                            tracker.fail_stage(stage, oh_result.error, detail=oh_result.stage)
+                            tracker.add_recovery(oh_result.recovery_action)
+                else:
                     oh_result = ohb.run_full(vp, output_type=_OH_OUTPUT,
                                               client_constraints=_CLIENT_CONSTRAINTS,
                                               client_product_intent=client_product_intent)
-                    if not oh_result.ok:
-                        tracker.fail_stage(stage, oh_result.error, detail=oh_result.stage)
-                        tracker.add_recovery(oh_result.recovery_action)
-            else:
-                oh_result = ohb.run_full(vp, output_type=_OH_OUTPUT,
-                                          client_constraints=_CLIENT_CONSTRAINTS,
-                                          client_product_intent=client_product_intent)
-            if oh_result.ok:
-                row_count = sum(len(group.rows) for group in oh_result.quote_groups)
-                print(f"  ✓ OptionHelper：{oh_result.product_name}（{oh_result.product_id}）"
-                      f" · 参考报价 {row_count} 行")
-                if oh_result.report_path:
-                    print(f"      报告：{oh_result.report_path}")
-            else:
-                print(f"  ⚠ OptionHelper 未完成（{oh_result.stage}）：{oh_result.error}")
-                if oh_result.recovery_action:
-                    print(f"      下一步：{oh_result.recovery_action}")
-                if oh_result.missing:
-                    for m in oh_result.missing:
-                        print(f"      · 缺：{m}")
+                if oh_result.ok:
+                    row_count = sum(len(group.rows) for group in oh_result.quote_groups)
+                    print(f"  ✓ OptionHelper：{oh_result.product_name}（{oh_result.product_id}）"
+                          f" · 参考报价 {row_count} 行")
+                    if oh_result.report_path:
+                        print(f"      报告：{oh_result.report_path}")
+                else:
+                    print(f"  ⚠ OptionHelper 未完成（{oh_result.stage}）：{oh_result.error}")
+                    if oh_result.recovery_action:
+                        print(f"      下一步：{oh_result.recovery_action}")
+                    if oh_result.missing:
+                        for m in oh_result.missing:
+                            print(f"      · 缺：{m}")
+                if oh_result.selection_archive_path:
+                    print(f"      本次 selection 已归档并失效：{oh_result.selection_archive_path}")
+                    if tracker:
+                        tracker.add_artifact("OptionHelper selection归档", oh_result.selection_archive_path)
 
     if tracker:
         with tracker.stage("report", "更新报告并生成内部底稿"):
@@ -194,27 +246,58 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
         tracker.add_artifact("研究报告", out)
         tracker.add_artifact("内部底稿", gap_path)
 
-    # PDF 导出（A2）。默认关闭：启动 Chromium 约 3~5 秒，批量生成时不该每份都付这个代价。
-    # 打开时顺便报**真实页数**——这是"一页通到底是不是一页"的唯一权威答案，
-    # 底稿里的版面预算只是不启动 Qt 时的粗估（见 gaps._page_budget）。
+    # PDF 页数是“一页通”正式交付的硬门：HTML 可无限滚动，不能替代真实打印结果。
+    # 不导出 PDF 的运行仍保留研究 HTML，但只能算内部草稿；绝不能把“没有测过”写成“一页”。
     if _WANT_PDF:
         try:
             from render import pdf_out
+            layout_audit: dict = {}
             if tracker:
-                with tracker.stage("pdf", "导出 PDF"):
-                    pdf = pdf_out.html_to_pdf(out)
+                with tracker.stage("pdf", "导出 PDF 并校验一页") as stage:
+                    pdf = pdf_out.html_to_pdf(out, layout_audit=layout_audit)
                     n = pdf_out.page_count(pdf)
+                    if n != 1:
+                        tracker.fail_stage(stage, f"PDF 实测 {n} 页，不满足一页通正式交付条件")
             else:
-                pdf = pdf_out.html_to_pdf(out)
+                pdf = pdf_out.html_to_pdf(out, layout_audit=layout_audit)
                 n = pdf_out.page_count(pdf)
-            flag = "" if n == 1 else f"　⚠ 一页通应为 1 页，请看底稿「版面预算」"
-            print(f"  ✓ PDF：{pdf}（{n} 页）{flag}")
+            passed = n == 1
+            if passed:
+                print(f"  ✓ PDF：{pdf}（实测 1 页，已通过一页通交付校验）")
+            else:
+                print(f"  ⚠ PDF：{pdf}（实测 {n} 页，**不得作为正式一页通交付**；"
+                      "压缩建议已写入内部底稿）")
+            gaps.append_delivery_check(gap_path, ma, rc, oh_result, pdf_pages=n,
+                                       layout_audit=layout_audit)
             if tracker:
-                tracker.add_artifact("PDF", pdf)
+                tracker.add_artifact("PDF（正式交付）" if passed else "PDF（超页，仅供内部复核）", pdf)
+                tracker.add_metadata("一页通交付校验", "通过：PDF 实测 1 页" if passed
+                                     else f"不通过：PDF 实测 {n} 页，禁止正式交付")
+                if not passed:
+                    overflow = (layout_audit.get("overflow") or [])
+                    labels = []
+                    for item in overflow:
+                        if isinstance(item, dict) and str(item.get("label") or "").strip():
+                            label = str(item["label"]).strip()
+                            if label not in labels:
+                                labels.append(label)
+                    if labels:
+                        tracker.add_metadata("超页区块（渲染定位）", "、".join(labels[:5]))
+                    tracker.add_recovery("压缩底稿“正式交付校验”列出的图表/正文后重新导出 PDF；"
+                                         "实测 1 页前不得对外发送。")
         except Exception as e:
             print(f"  ⚠ PDF 导出失败（不影响 HTML 与底稿）：{type(e).__name__}: {e}")
+            gaps.append_delivery_check(gap_path, ma, rc, oh_result,
+                                       pdf_error=f"{type(e).__name__}: {e}")
             if tracker:
+                tracker.add_metadata("一页通交付校验", "未通过：PDF 未成功导出，不能确认单页")
                 tracker.add_recovery("PDF 导出失败不影响 HTML；检查 Chromium/QtWebEngine 后可单独重试导出。")
+    else:
+        print("  ⓘ 未导出 PDF：研究 HTML 已生成，但一页通正式交付状态为“未校验”。")
+        gaps.append_delivery_check(gap_path, ma, rc, oh_result)
+        if tracker:
+            tracker.add_metadata("一页通交付校验", "未校验：未导出 PDF，仅可作内部草稿")
+            tracker.add_recovery("正式交付前请用 --pdf 重跑并确认 PDF 实测为 1 页。")
     return out
 
 
@@ -249,6 +332,27 @@ def _ask_picks(prepared) -> list[str] | None:
     print(pipeline.render_candidates(cands))
     if not cands:
         return None
+
+    # GUI 与命令行共用这一段交互。终端仍显示可读清单并等待编号；GUI 则消费
+    # 这条结构化标记，弹出勾选卡后把同样的编号写回 stdin。候选的原文和出处
+    # 只在分析师勾选后才进入正文，不能由模型静默挑选研报结论。
+    picker_payload = {
+        "candidates": [
+            {
+                "index": index,
+                "id": candidate.id,
+                "kind": candidate.kind,
+                "name": candidate.名称,
+                "category": candidate.类别,
+                "direction": candidate.方向,
+                "basis": candidate.依据,
+                "source": candidate.出处,
+            }
+            for index, candidate in enumerate(cands, 1)
+        ],
+        "suggested": pipeline.recommend(cands),
+    }
+    print("LOGIC_PICK_REQUIRED=" + json.dumps(picker_payload, ensure_ascii=False), flush=True)
 
     n_doc = sum(1 for c in cands if c.kind == "doc")
     tip = "；研报观点必须核对原文后再选" if n_doc else ""
@@ -379,6 +483,32 @@ def generate_from_brief(text: str, *, pick: bool = False,
                   f"{'仅研究' if value.research_only else value.underlying_code}")
             break
 
+    # 事件本体的真实情况、它与本次行业/ETF的传导关系，不能由模型从“海力士发业绩”
+    # 这句话里补全。证据不足时在任何行情/LLM调用之前终止，明确告诉分析师不会生成报告。
+    evidence = getattr(o, "事件证据", None) or event_evidence.parse(None)
+    gate = event_evidence.assess(b, evidence)
+    if gate.required and not gate.ready:
+        entity = getattr(getattr(b, "触发实体", None), "名称", "该事件主体")
+        message = gate.message(entity)
+        payload = {
+            "message": message,
+            "entity": entity,
+            "missing": list(gate.missing),
+            "template": event_evidence.template(),
+        }
+        if tracker:
+            with tracker.stage("event_evidence", "校验事件事实与产业链传导证据") as stage:
+                tracker.fail_stage(stage, message)
+            tracker.add_recovery("补充事件事实与传导证据后重跑；未补齐前不会生成报告或正式报价。")
+        print("EVENT_EVIDENCE_REQUIRED=" + json.dumps(payload, ensure_ascii=False), flush=True)
+        print(f"  ✗ {message}")
+        print("    本次不会生成一页通或 OptionHelper 正式报价。")
+        print("    请在 GUI 的「管理事件证据」中从已上传材料导入，或手工补录：")
+        for item in gate.missing:
+            print(f"      · {item}")
+        print("    可用来源：公司 IR/交易所披露、已上传研报（写明页码）、或其他可核验材料。")
+        return None
+
     t = b.代表标的
     if t is None or not t.可用:
         print("  ⚠ 未能确定可用的代表标的，请人工指定证券代码后重试。")
@@ -419,7 +549,11 @@ def _run_tracked(tracker: RunTracker, work) -> object:
         with tracker.activate():
             result = work()
         status = "completed" if result else "failed"
-        if status == "completed" and tracker.recovery_actions:
+        delivery = str(tracker.metadata.get("一页通交付校验") or "")
+        if status == "completed" and delivery and not delivery.startswith("通过"):
+            # 研究已生成，但不是可发给客户的正式一页通；不能用笼统的 completed 掩盖它。
+            status = "completed_not_deliverable"
+        elif status == "completed" and tracker.recovery_actions:
             status = "completed_with_warnings"
         tracker.finish(status=status)
         return result
@@ -439,19 +573,18 @@ def main() -> None:
     confirm_market = "--confirm-market" in args
     args = [a for a in args if a != "--confirm-market"]
 
-    # --pdf：导出 PDF（A2）。默认不开——启动 Chromium 约 3~5 秒，
-    # 批量生成时不该每份都付这个代价；要发给客户时再加这个开关。
+    # --pdf：导出并实测一页。未加开关仍会出研究 HTML，但会明确标为“未校验草稿”。
     global _WANT_PDF
     if "--pdf" in args:
         _WANT_PDF = True
         args = [a for a in args if a != "--pdf"]
 
-    # --optionhelper quote：接入新版 Skill 的正式参考报价；不加则完全不调用。
+    # --optionhelper recommend|quote：先生成推荐候选，或使用已确认候选发起正式报价。
     global _OH_OUTPUT
     if "--optionhelper" in args:
         i = args.index("--optionhelper")
-        if i + 1 >= len(args) or args[i + 1] != "quote":
-            print("用法：--optionhelper quote")
+        if i + 1 >= len(args) or args[i + 1] not in {"recommend", "quote"}:
+            print("用法：--optionhelper recommend|quote")
             return
         _OH_OUTPUT = args[i + 1]
         args = args[:i] + args[i + 2:]

@@ -5,6 +5,10 @@
 输入一句话需求，输出一份单页图文成品。全程使用真实数据，成文中每个数字均可回溯至来源；
 需要交付时可同时导出 PDF，需要产品落点时可选调用 OptionHelper 完成推荐、定价与回测。
 
+若需求中明确写出证券代码（如 `512000.SH`），系统会从原文直接提取并按受控工具目录/数据源
+校验；该代码优先于 LLM 候选和板块默认映射。ETF 交易简称与基金官方全称会按同一工具别名核对，
+代码无法验证时会明确停止，不会静默换成另一只 ETF。
+
 > 一页通指单页图文密排的研究成品，非多页 Word 长报告。版式对标 0720 三份模板
 > （券商板块 / AI 产业趋势 / 长鑫科技 IPO）。
 
@@ -140,9 +144,38 @@ python main.py -b "券商板块最近怎么样，有没有配置价值？" --pic
 python main.py -b "SK海力士业绩对芯片板块有什么影响？" --overrides overrides.json
 ```
 
-覆盖文件支持两类内容：schema 中允许人工补充的字段，以及需求解析出的外部事实。
-每个字段都必须填写来源，成品与底稿会标记为“人工填写”。系统会拒绝覆盖判定引擎依赖的字段——
-人工数据可以帮助 writer 补充论据，但不能伪装成机械取数结果去触发一条论点。
+覆盖文件支持三类内容：schema 中允许人工补充的字段、需求解析出的外部事实，以及事件驱动
+报告的“事件事实 + 传导关系”证据。它不是“上传一份研报”的替代品：它适合录入一项明确的、
+自动数据源未覆盖的**展示/解释性事实**（例如带来源的行业经营指标、公司公开指引），供报告正文和
+内部底稿引用。每个字段都必须填写来源，成品与底稿会标记为“人工填写”。系统会拒绝覆盖判定引擎
+依赖的字段——人工数据不能伪装成机械取数结果去触发或改变一条论点。
+
+研究逻辑的选择与“人工数据补充”无关。每次 GUI 研究都会先用自动行情触发论点库，再从 `sources/`
+材料提炼带原文出处的候选；两类候选在同一张“选择本次报告逻辑”卡中展示，均须由分析师勾选后才
+进入正文。选择“采用系统建议”只按证据质量和结构给出建议组合，不替代分析师判断；也可明确交回
+系统自动挑选。
+
+对于“某公司业绩/公告如何影响某个板块或 ETF”这类需求，后两项是**报告生成门槛**：缺少
+至少一条带来源的事件事实，或缺少至少一条带来源的产业链传导关系，系统会明确显示“未生成
+报告”，并停止在取数前；不会用板块行情代替事件分析，也不会调用 OptionHelper。该栏平时可留空；
+只有实际识别为事件型需求时才会触发此门槛。GUI 会弹出“缺少事件传导证据”的提示，可直接打开
+“管理事件证据”从已上传材料导入，或在 JSON 中使用：
+
+```json
+{
+  "事件证据": {
+    "事件事实": [{"内容": "已披露的业绩实际值或指引", "来源": "公司 IR 公告 p4"}],
+    "传导关系": [{"关系": "供应链", "内容": "该事实如何影响本次 A 股行业或 ETF", "来源": "产业链研报 p8"}]
+  }
+}
+```
+
+官方 IR/交易所披露、带页码的已上传研报、或其他可核验材料都可作为来源；研报不再是唯一入口。
+桌面端先把“上传补充材料”复制到项目 `sources/`；“管理事件证据 → 从已上传材料导入原文”可直接
+选择这些 PDF，也支持选择本地 PDF/TXT/MD/DOCX，或由分析师手动输入 HTTPS 的**原始文件直链**。
+系统只抽取并保留带文件名/页码的逐字片段，绝不调用 LLM
+概括材料、自动认定事实或推断传导关系；分析师必须选中片段并明确导入为“事件事实”或指定关系
+类型的“传导证据”。直链不抓取普通网页，下载件仅保存在被 Git 忽略的 `output/materials/` 供复核。
 
 ### 导出 PDF：`--pdf`
 
@@ -150,8 +183,10 @@ python main.py -b "SK海力士业绩对芯片板块有什么影响？" --overrid
 python main.py -b "券商板块最近怎么样？" --pdf
 ```
 
-默认只生成 HTML；`--pdf` 使用 QtWebEngine 额外导出同名 PDF，并报告真实页数。
-内部底稿还会给出版面预算预警，但它只是估算，PDF 的实际页数才是“一页通”是否真的一页的最终依据。
+默认只生成 HTML；`--pdf` 使用 QtWebEngine 导出同名 PDF，并以真实页数执行正式交付校验。
+PDF 实测为 1 页才可作为正式一页通交付；超过 1 页会在运行状态、桌面端和内部底稿明确标为
+“不通过、禁止正式交付”，并定位首张 A4 后溢出的区块、列出优先压缩的图表/正文方向。未使用 `--pdf` 的 HTML 明确标为
+“未校验的内部草稿”。内部底稿的版面预算仍只是预警，真实 PDF 页数才是最终依据。
 
 ### 调用 OptionHelper：`--optionhelper`
 
@@ -161,9 +196,10 @@ python main.py -b "酒ETF估值如何，有没有配置价值？" --optionhelper
 python main.py -b "酒ETF估值如何，有没有配置价值？" --horizon 6个月 --max-loss 20% --principal-fluctuation yes --return-preference "更偏上涨参与" --optionhelper quote
 ```
 
-一页通只接入最新版 Skill 的 `quote` 正式交付。Research Helper 先把本次已验证的市场事实与
-市场展望交接给 OptionHelper；当前对话 Agent 再按 Recommender 指南完成 Intent / Research /
-Critic，并把已核验的产品选择写入项目级 `.optionhelper/selection.json`。Research Helper 不在
+一页通只接入最新版 Skill 的 `recommend` 与 `quote` 受控链路。Research Helper 先把本次已验证的市场事实与
+市场展望交接给 OptionHelper；OptionHelper Recommender 按指南完成 Intent / Research /
+Critic，形成候选。分析师只确认主候选、改选备选或退回修改客户约束，**不填写产品编号或推荐理由**；
+确认后的**本次**产品选择才写入一次性 `.optionhelper/selection.pending.json`。Research Helper 不在
 观点包中建议产品或结构；OptionHelper 负责合同冻结、取数、收益结构、定价、Reporter 与
 Designer。调用成功时，研报助手只读取同一次 ReportRun 的 `designer-input.json`，在一页通
 最下方生成随本次结果变化的“推荐结构 · 参考报价”表；不会解析 HTML，也不会自行补价格。
@@ -171,10 +207,10 @@ Designer。调用成功时，研报助手只读取同一次 ReportRun 的 `desig
 
 观点包的固定边界是：`标的与选择原因`、`整体方向与历史波动率`、带来源和截止日的已验证
 市场事实，以及`市场展望`（预期方向、观察窗口、支持因素、制约因素、待验证风险）。它不包含
-产品名、结构、执行价、障碍或收益承诺。成品中的“挂钩标的”卡片也只简要罗列市场情况，并用
-一句话说明为何选取该标的。
+产品名、结构、执行价、障碍或收益承诺。成品中的“挂钩标的”卡片只保留标的核心状态与一句话
+选取原因，不重复正文的市场情况。
 
-`selection.json` 使用最新版公开选择字段，例如：
+`selection.pending.json` 使用最新版公开选择字段，例如：
 
 ```json
 {
@@ -197,11 +233,15 @@ Designer。调用成功时，研报助手只读取同一次 ReportRun 的 `desig
 执行价等已确认合同覆盖可与 `selection` 并列写入 `term_overrides`；例如
 `{"term_overrides": {"T": 0.5}}` 代表 6 个月。桥接层不自行估计价格或障碍。
 
-`selection.json` 是项目级、可跨运行保留的“已核验产品选择”，不是本次研究自动生成的默认值。
-因此它可以保留产品、理由及客户条件，但不得携带上一份报告的研究结果：桥接层先硬校验
-`selection.underlyings` 与本页挂钩标的一致；随后只保留期限、最大损失、本金波动和收益偏好等
-客户条件，并强制以**本次观点包**写入 `underlying`、`market_view`、`output_type=quote` 与
-`format=html`。不一致会拒绝报价，不会拿上一轮的 ETF 或方向生成新报告的价格。
+`selection.pending.json` 是**一次性待报价件**，不是可跨运行复用的项目设置。Quote 开始时，桥接层
+以当前 `run_id` 原子地把它移到 `.optionhelper/selections/active/<run_id>.json`，先硬校验
+`selection.underlyings` 与本页挂钩标的一致；报价无论成功、业务拒绝还是配置失败，都会归档到
+`.optionhelper/selections/archive/<run_id>.json` 并写入 `lifecycle.state=consumed`。归档只供审计，
+绝不再作为任何运行的输入；旧 `.optionhelper/selection.json` 也不再读取。下一次报价必须重新写入
+一份 pending selection，因而不会拿上一轮的 ETF、市场方向或产品选择生成新报告的价格。
+
+桥接层只从 pending selection 保留产品选择、理由及客户条件；`underlying`、`market_view`、
+`output_type=quote` 与 `format=html` 始终由**本次观点包/调用**强制写入，不能由旧文件覆盖。
 命令行也可直接输入本次客户条件：`--horizon`、`--max-loss`、`--principal-fluctuation yes|no`
 与可选的 `--return-preference`。前三项以受控字段传给正式报价；收益偏好作为客户原话单独
 传达给 OptionHelper，不由 Research Helper 翻译成产品建议。
@@ -234,10 +274,37 @@ OptionHelper 修复后重试，绝不自行换结构。
 
 ### 桌面界面
 
-运行 `python -m gui.app` 启动 PySide6 桌面界面。界面与命令行复用同一条流程和运行日志，提供：
-客户需求及期限/最大损失/本金波动/收益偏好输入、实时阶段输出、正式报价和 PDF 开关、历史运行
-记录、交付文件双击打开，以及选择或编辑人工补数 JSON 的入口。界面不直接修改 OptionHelper，
-也不会自动替换 Agent 已核验的产品选择。
+桌面界面是独立的 PySide6 窗口，不会嵌在 VS Code 中。**推荐从项目根目录运行**：
+
+```powershell
+python gui/start.py
+```
+
+启动器会优先使用当前解释器；若其中没有 PySide6，则查找本机已配置的 Anaconda Python。其它
+环境可设置 `RESEARCH_HELPER_GUI_PYTHON` 指向安装了 PySide6 的 `python.exe`。也可在已选中
+正确环境后直接运行 `python -m gui.app`。
+
+若看到 `ModuleNotFoundError: No module named 'PySide6'`，说明 VS Code/终端选中的 Python 没有
+桌面依赖，而不是研究流程失败。请切换到已安装 PySide6 的解释器，或在目标环境安装：
+
+```powershell
+python -m pip install PySide6
+```
+
+VS Code 用户可重载窗口后按 `F5`，选择 `Research Helper：启动桌面端`；项目的 `.vscode` 配置已
+提供该入口。界面与命令行复用同一条流程和运行日志，提供：客户需求及期限/最大损失/本金波动/
+收益偏好输入、市场确认、补充材料上传、候选逻辑勾选、事件事实与传导证据表单（含受控材料原文导入）、
+实时阶段输出、PDF 开关、历史运行记录与交付文件双击打开，并在结果页内直接预览最终一页通及其页底的
+正式报价表。“研究完成后准备正式报价审核”默认勾选；人工数据补充 JSON 仅在自动数据源有展示/解释性
+缺口时使用。输入区的“准备正式报价审核”会先运行
+OptionHelper Recommender，并展示主候选与备选的理由、适用/不适用情形和风险。研究完成且已有已确认挂钩标的时，
+分析师只需确认采用候选，或返回修改客户约束后重新推荐；确认后任务进入**本次桌面会话内的串行后台队列**。
+候选只存在于本次任务内存并随该次 Quote 直接提交，绝不回读或复用上一轮 selection；失败后须重新推荐。
+关闭桌面端或取消尚未启动的任务不会留下 pending selection。
+
+研究完成时，系统会同时保存该运行的只读“OptionHelper 观点包”快照。桌面端的结构推荐和正式报价均直接
+消费这份快照：不会重新解析需求、重拉市场数据或重新调用研究 LLM；报价完成后只更新同一份一页通底部的冻结报价表。
+旧运行若生成于该机制启用前而没有观点包快照，需要重新生成一次研究报告后才能走连续报价流程。
 
 港股、跨市场、产业链和多行业主题会在需求解析后暂停，弹出“市场/研究口径/挂钩工具”确认页。
 分析师可选择：仅研究、明确映射到 A 股研究口径，或保留原市场并指定 ETF/指数；映射理由选填。
@@ -262,7 +329,8 @@ python main.py -b "需求…" --pick --overrides overrides.json --optionhelper q
 
 ## 研报文档通道
 
-论点库中渗透率、国产化率、海外龙头业绩这类数据，行情接口结构性地不提供，只能取自研报。
+论点库中渗透率、国产化率、海外龙头业绩这类数据，行情接口结构性地不提供；可取自研报、官方
+IR/交易所披露或分析师提供的其他可核验材料。
 将当次需要的研报 PDF 放入 `sources/`，系统从中提炼观点候选：
 
 ```bash
@@ -444,25 +512,25 @@ SK海力士）与代表标的、挂钩标的是三个不同角色：触发实体
 - 研报文档通道：PDF → 观点候选，逐字原文 + 机械校验
 - 人工勾选正文主轴论点（`--pick`）
 - 人工补数文件（`--overrides`），带来源留痕且禁止覆盖机械判定字段
-- PDF 导出与真实页数检查（`--pdf`）
+- PDF 导出与一页通正式交付硬校验（`--pdf`；超页不得正式交付）
 - 挂钩标的择优已接入；板块没有确定映射时才运行多维候选比较
 - 候选择优会同时比较候选自身的年化实现波动率与历史分位；ETF 的波动率不以代表个股替代
 - 最新版 OptionHelper Skill Quote 桥接（`--optionhelper quote`）：消费正式冻结事实并在页底生成参考报价表
 - 情景收益带：按固定的“近20日收益分位 × 近20日实现波动率分位”筛选历史相似状态，
   展示其后约1个月/3个月收益的 P25/中位/P75；仅作历史条件分布，非预测、非产品建议
-- PySide6 最小桌面界面（`python -m gui.app`）：输入、进度、结果、运行记录与人工补数 JSON 入口
+- PySide6 桌面界面（`python gui/start.py`）：输入、事件证据表单、进度、结果、运行记录与高级补数入口
 - 高风险市场/行业确认闸门：港股、跨市场、产业链和多行业主题必须由分析师确认；白名单外
   ETF/指数经真实性、暴露与流动性校验后仅作本次临时标的
 
 **尚未完成**
 
 - Word 导出
-- GUI 的后台报价队列、一键重试和表单式逐字段补数仍待做；当前界面提供 JSON 编辑/选择入口
+- GUI 的报价队列仅驻留本次桌面会话，不支持跨会话恢复；这是为了不持久化尚未执行的产品选择
 - exe 打包
 - OptionHelper 仍是外部依赖：需要明确选择独立 Python、通过统一就绪检查、在项目 memory
-  保存 iFinD Refresh Token，并由当前对话 Agent 提供已验证 selection；失败不会阻断主流程
-- GUI 已直接订阅 run_id 对应的结构化日志；报价后台队列与一键重试尚未实现
-- “一页”尚不是硬保证：底稿会预估版面、PDF 会报告真实页数，但超页时目前仍需人工压缩内容或图表
+  保存 iFinD Refresh Token；Recommender 通过本项目当前配置的 LLM 充当其 AgentPort，失败不会阻断主流程
+- GUI 已直接订阅 run_id 对应的结构化日志，支持串行正式报价队列、取消未启动任务及强制重新审核后的安全重试
+- 超页后不会自动删改正文、图表或冻结报价；系统会阻止正式交付并给出压缩方向，分析师复核修改后需重新导出实测
 
 **已知短板**
 
@@ -563,7 +631,8 @@ llm/                    DeepSeek 封装
 - iFinD Refresh Token 不再放入 `config.local.json` 或环境变量。按 Skill 流程明确确认后，
   使用 `environment_check.py --save-ifind-refresh-token --project-root <本项目目录>` 交互保存到
   `.optionhelper/memory.md`；该目录已被 `.gitignore` 排除。
-- 默认从 `.optionhelper/selection.json` 读取 Agent 交接；如需更换位置，可配置
+- 默认从一次性 `.optionhelper/selection.pending.json` 读取 Agent 交接；报价后会进入
+  `.optionhelper/selections/archive/<run_id>.json`。如需更换 pending 文件位置，可配置
   `OPTIONHELPER_SELECTION_PATH`。受控 Host 部署则配置 `OPTIONHELPER_HOST_URL`。
 
 LLM 使用 DeepSeek，默认模型 `deepseek-v4-flash`，可在 GUI 的“LLM 设置”中切换模型和 API Key，
@@ -571,8 +640,25 @@ LLM 使用 DeepSeek，默认模型 `deepseek-v4-flash`，可在 GUI 的“LLM �
 新版 OptionHelper 不复用该模型网关，也不会由桥接层启动第二个模型服务。环境变量优先于
 `config.local.json`。
 
+> **当前网络限制：** 主研究链路的 DeepSeek 请求会通过 `core.config.no_proxy()` 强制直连
+> `https://api.deepseek.com`，不会使用系统/VPN/Clash 代理。若本机无法直连该 API 的 443 端口，
+> 运行会在“解析需求”阶段失败，iFinD 尚未被调用；网页版 DeepSeek 可对话并不能证明 API 可达。
+> “直连 / 系统代理 / 自定义兼容 API 地址”的可配置网络模式尚未实现，需先使用可直连该 API 的网络。
+
 密钥不打包进 exe——可被反编译提取。分发时各人填写自己的密钥；
 若需大范围推广，走公司内网后端代理，统一充值、限流与审计。
+
+### 更换 iFinD 账号
+
+完整更换 iFinD 账号时，需要分别更新两条凭证通道：
+
+- `IFIND_ACCOUNT` 和 `IFIND_PASSWORD`：Research Helper 研究取数所用的 iFinD SDK 登录；
+- `IFIND_REFRESH_TOKEN`：仅供 OptionHelper 在正式报价时换取短期访问令牌，不能替代前者。
+
+桌面端可在“数据与报价凭证 → iFinD 凭证…”中一次输入。既有密码和 Token 不会回显，
+留空表示保持原值；账号密码保存至被 Git 忽略的 `config.local.json`，Refresh Token 仍由
+OptionHelper 原子保存至被忽略的 `.optionhelper/memory.md`。若 Windows 环境变量中已设置
+`IFIND_ACCOUNT` 或 `IFIND_PASSWORD`，环境变量优先，应同时更新或移除旧值。
 
 ---
 

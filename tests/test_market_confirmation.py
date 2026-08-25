@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -40,6 +43,7 @@ class MarketConfirmationTests(unittest.TestCase):
     def setUp(self) -> None:
         instruments.clear_temporary()
         self.provider = FakeProvider({
+            "512000.SH": "华宝中证全指证券公司ETF",
             "513050.SH": "中概互联ETF",
             "159992.SZ": "创新药ETF",
             "515980.SH": "人工智能ETF",
@@ -69,6 +73,39 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertEqual(b.市场范围, "港股")
         self.assertEqual(b.涉及板块, ["化学制药"])  # 非 A 股确认不会覆写为另一个伪口径
 
+    def test_explicit_etf_alias_accepts_verified_fund_full_name(self) -> None:
+        from core import brief as brief_module, pipeline, topics
+
+        check = topics._verify_code("512000.SH", "券商ETF", self.provider)
+        self.assertTrue(check.startswith("ok:"), check)
+        self.assertIn("别名已核验", check)
+        b = brief("根据目前券商ETF 512000.SH推荐产品", "A股", ["证券"])
+        # 即使 LLM 完全遗漏候选标的，用户原文中的代码也必须从受控目录直接进入候选池。
+        b.候选标的 = []
+        brief_module._inject_explicit_codes(b, b.原始需求, self.provider)
+        self.assertEqual(b.候选标的[0].代码, "512000.SH")
+        self.assertEqual(b.候选标的[0].名称, "券商ETF")
+        b.候选标的[0].校验 = check
+        self.assertEqual(pipeline._explicit_etf_from_brief(b), "512000.SH")
+
+    def test_explicit_etf_is_forwarded_to_sector_derived_fetches(self) -> None:
+        """用户点名 ETF 时，行情字段不得回退到板块的默认 ETF。"""
+        from core import fetcher
+
+        provider = object()
+        values = []
+        def record(*args):
+            values.append(args)
+            return fetcher.FieldValue(field=str(args[0]), ok=True)
+
+        with patch("core.fetcher._fetch_one", side_effect=record), \
+             patch("core.instruments.resolve_analysis_etf") as resolve:
+            fetcher.fetch_fields(
+                ["年化波动率"], "600030.SH", provider, "证券", analysis_etf="512000.SH",
+            )
+        resolve.assert_not_called()
+        self.assertEqual(values[0][-1], "512000.SH")
+
     def test_global_korean_company_request_requires_cross_market_confirmation(self) -> None:
         from unittest.mock import MagicMock
 
@@ -77,6 +114,47 @@ class MarketConfirmationTests(unittest.TestCase):
         parsed = __import__("core.brief", fromlist=["parse"]).parse(
             "SK海力士发了业绩，全球市场芯片科技板块异动明显", client=client)
         self.assertEqual(parsed.市场范围, "跨市场")
+
+    def test_event_report_is_blocked_without_entity_fact_and_transmission_evidence(self) -> None:
+        from core import pipeline
+        from core.genres import TYPE_EVENT
+
+        b = Brief(
+            原始需求="SK海力士业绩对 A 股芯片板块的影响",
+            市场范围="A股",
+            市场确认={"market": "A股", "research_scope": "半导体", "research_only": True},
+            主导类型=TYPE_EVENT,
+            触发实体=TargetRef("SK海力士", "000660.KS", "ok:SK海力士"),
+            ok=True,
+        )
+        result = pipeline.run_from_brief(b)
+        self.assertFalse(result.ok)
+        self.assertIn("无法生成事件影响报告", result.error)
+
+    def test_event_evidence_is_source_required_and_attached_as_separate_fields(self) -> None:
+        from core import event_evidence, pipeline
+        from core.genres import TYPE_EVENT
+
+        b = Brief(
+            原始需求="SK海力士业绩对 A 股芯片板块的影响",
+            主导类型=TYPE_EVENT,
+            触发实体=TargetRef("SK海力士", "000660.KS", "ok:SK海力士"),
+            ok=True,
+        )
+        incomplete = event_evidence.parse({"事件事实": [{"内容": "营收增长"}], "传导关系": []})
+        self.assertFalse(event_evidence.assess(b, incomplete).ready)
+
+        evidence = event_evidence.parse({
+            "事件事实": [{"内容": "公司披露本季 HBM 出货增长", "来源": "SK hynix 季报 p4"}],
+            "传导关系": [{"关系": "供应链", "内容": "该变化影响 A 股存储产业链预期",
+                       "来源": "产业链研报 p8"}],
+        })
+        self.assertTrue(event_evidence.assess(b, evidence).ready)
+        ma = pipeline.MarketAnalysis(plan=None, rep_code="159995.SZ", ok=True)
+        event_evidence.attach_to_analysis(ma, b, evidence)
+        self.assertIn("触发标的_事件事实1", ma.field_values)
+        self.assertIn("事件传导证据1", ma.field_values)
+        self.assertEqual(ma.事件证据["事件主体"], "SK海力士 000660.KS")
 
     def test_hk_internet_accepts_only_explicit_cross_border_tool(self) -> None:
         b = brief("基于港股互联网板块的投资机会", "港股", ["传媒"])
@@ -173,6 +251,23 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertEqual(result.data, {"ok": True})
         self.assertFalse(mocked.call_args_list[-1].kwargs["json_mode"])
 
+    def test_llm_requests_disable_thinking_for_machine_readable_output(self) -> None:
+        from unittest.mock import Mock
+
+        from llm.client import DeepSeekClient
+
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}],
+            "usage": {"total_tokens": 5},
+        }
+        client = DeepSeekClient()
+        with patch("llm.client.requests.post", return_value=response) as post:
+            result = client.chat_json("只输出 JSON。", "返回 JSON。", retries=0)
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(post.call_args.kwargs["json"]["thinking"], {"type": "disabled"})
+
     def test_optionhelper_constraints_drop_stale_underlying_and_view(self) -> None:
         from core.optionhelper_bridge import _effective_constraints
 
@@ -198,6 +293,65 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertEqual(result["max_loss"], "20%")
         self.assertEqual(result["output_type"], "quote")
         self.assertEqual(result["format"], "html")
+
+    def test_optionhelper_selection_is_claimed_once_then_archived(self) -> None:
+        from core.optionhelper_bridge import OptionHelperResult, _archive_selection, _claim_selection
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending = root / ".optionhelper" / "selection.pending.json"
+            legacy = root / ".optionhelper" / "selection.json"
+            pending.parent.mkdir(parents=True)
+            legacy.write_text('{"selection": {"product_id": "4.1"}}', encoding="utf-8")
+            pending.write_text('{"selection": {"product_id": "3.1", "underlyings": ["159995.SZ"]}}',
+                               encoding="utf-8")
+            with patch("core.optionhelper_bridge.config.OPTIONHELPER_SELECTION_PATH", str(pending)), \
+                    patch("core.optionhelper_bridge.config.OPTIONHELPER_HOST_URL", ""):
+                lease, error = _claim_selection(root, "run-test-one")
+                self.assertFalse(error)
+                self.assertIsNotNone(lease)
+                self.assertFalse(pending.exists())
+                self.assertTrue(lease.active_path.exists())
+                archived = _archive_selection(
+                    lease,
+                    OptionHelperResult(ok=False, stage="configuration", error="凭据未就绪"),
+                )
+                self.assertTrue(Path(archived).is_file())
+                self.assertFalse(lease.active_path.exists())
+                payload = json.loads(Path(archived).read_text(encoding="utf-8"))
+                self.assertEqual(payload["lifecycle"]["state"], "consumed")
+                self.assertEqual(payload["lifecycle"]["run_id"], "run-test-one")
+                next_lease, next_error = _claim_selection(root, "run-test-two")
+                self.assertIsNone(next_lease)
+                self.assertIn("没有一次性 selection", next_error)
+                self.assertTrue(legacy.is_file())  # 旧静态文件不会被偷偷复用。
+
+    def test_optionhelper_failed_attempt_consumes_its_pending_selection(self) -> None:
+        from core.optionhelper_bridge import run_full
+        from core.viewpoint import ViewPackage
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending = root / ".optionhelper" / "selection.pending.json"
+            pending.parent.mkdir(parents=True)
+            pending.write_text(
+                '{"selection": {"product_id": "3.1", "underlyings": ["159995.SZ"]}}',
+                encoding="utf-8",
+            )
+            with patch("core.optionhelper_bridge.config.OPTIONHELPER_SELECTION_PATH", str(pending)), \
+                    patch("core.optionhelper_bridge.config.OPTIONHELPER_HOST_URL", ""), \
+                    patch("core.optionhelper_bridge.missing_setup", return_value=["缺少解释器"]):
+                result = run_full(
+                    ViewPackage(标的代码="159995.SZ", ok=True),
+                    project_root=root,
+                    run_id="run-failed-quote",
+                )
+            self.assertEqual(result.stage, "configuration")
+            self.assertFalse(pending.exists())
+            archive = root / ".optionhelper" / "selections" / "archive" / "run-failed-quote.json"
+            self.assertTrue(archive.is_file())
+            payload = json.loads(archive.read_text(encoding="utf-8"))
+            self.assertEqual(payload["lifecycle"]["quote_status"], "failed")
 
 
 if __name__ == "__main__":

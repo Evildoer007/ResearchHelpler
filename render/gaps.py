@@ -244,18 +244,18 @@ _PX_PER_CHAR_CONCL = 0.405      # 核心结论（字号更大、有内边距，�
 # 实测单图高中位 198px，加上下间距约 210px；两张共行时各缩到约 77% 宽，行高约 165px。
 _PX_CHART_ROW_1 = 230      # 独占一行：图更宽故更高
 _PX_CHART_ROW_2 = 197      # 并排一行（实测 189/203/197）
-_PX_FIXED = 264                 # 标题+副标题+页脚+页面内边距+外边距+各块间距（实测）
-_PX_PER_LOGIC = 20              # 每条逻辑的标题行与上下间距
+_PX_FIXED = 232                 # 紧凑版标题+副标题+页脚+页面内边距+外边距+各块间距
+_PX_PER_LOGIC = 15              # 每条逻辑的标题行与上下间距（紧凑版）
 _PAGE_LIMIT = 1123              # A4 在 96dpi 下的高度（原写 1160 是按 820px 宽估的）                       # 820px 宽按 A4 比例对应的可用高度
 # 「挂钩标的」卡片（render.layout._underlying_block）：估算值，未像上面几个
 # 常量那样做过真实渲染校准（#83 那轮只测了逻辑正文和图表行）。这节 #84 才
 # 从"预留不渲染"改成常驻渲染，先按 CSS 行高粗算，等有真实成品再回来校。
-_PX_UNDERLYING_BASE = 95        # 标的行 + 报价说明，无挂钩理由/推荐结构时
-_PX_UNDERLYING_WHY = 25         # 加一行挂钩理由（择优映射类需求才有）
-_PX_UNDERLYING_STRUCT = 30      # 加一行 OptionHelper 推荐结构
-_PX_QUOTE_BASE = 42             # 报价节标题、组间距与表后提示
-_PX_QUOTE_GROUP = 22            # 每个挂钩标的分组标题
-_PX_QUOTE_ROW = 24              # 表头或一行报价
+_PX_UNDERLYING_BASE = 70        # 标题与标的同行；无挂钩理由/推荐结构时
+_PX_UNDERLYING_WHY = 20         # 加一行挂钩理由（择优映射类需求才有）
+_PX_UNDERLYING_STRUCT = 24      # 加一行 OptionHelper 推荐结构
+_PX_QUOTE_BASE = 34             # 紧凑报价节标题、组间距与表后提示
+_PX_QUOTE_GROUP = 18            # 每个挂钩标的分组标题
+_PX_QUOTE_ROW = 21              # 紧凑表头或一行报价
 
 
 def _chart_px(n: int) -> float:
@@ -508,6 +508,76 @@ def _selection_section(ma) -> list[str]:
     out += ["> 挂钩标的与分析对象**不是同一个**时（产业趋势/事件驱动类，其分析对象"
             "本身不可交易），请复核理由是否由实测指标支撑，以及候选池里是否有更合适的标的。", ""]
     return out
+
+
+def delivery_check_markdown(ma, rc, oh_result=None, *, pdf_pages: int | None = None,
+                            pdf_error: str = "", layout_audit: dict | None = None) -> str:
+    """真实 PDF 页数后的交付判定，供运行结束时追加到内部底稿。
+
+    估算版面只用于预警；只有 PDF 实测页数能决定一页通是否允许作为正式客户交付。
+    此处不尝试偷偷删除正文、图表或冻结报价表——压缩哪些内容必须由分析师复核决定。
+    """
+    lines = ["---", "", "## 八、一页通正式交付校验", ""]
+    if pdf_error:
+        lines += ["- **状态：未通过（未取得可校验 PDF）**",
+                  f"- 导出错误：{pdf_error}",
+                  "- 处理：检查 QtWebEngine/Chromium 后以同一份 HTML 重新导出 PDF；"
+                  "在实测为 1 页前，不得作为正式一页通发出。", ""]
+        return "\n".join(lines)
+    if pdf_pages is None:
+        lines += ["- **状态：未校验**",
+                  "- 本次没有导出 PDF，HTML 预览不能证明其为单页。",
+                  "- 处理：用 `--pdf` 或桌面端“导出 PDF 并校验一页”重跑；"
+                  "在实测为 1 页前，仅可作内部草稿。", ""]
+        return "\n".join(lines)
+    if pdf_pages == 1:
+        lines += ["- **状态：通过**",
+                  "- 真实 PDF 页数：**1 页**。可作为正式一页通交付（仍需按常规流程复核内容与报价）。", ""]
+        return "\n".join(lines)
+
+    logics = _rendered_logics(ma, rc)
+    chart_counts = sorted(((len(item.图表规格列表 or []), item.逻辑id) for item in logics), reverse=True)
+    body_counts = sorted(((len(item.论述 or ""), item.逻辑id) for item in logics), reverse=True)
+    lines += [f"- **状态：不通过（禁止正式交付）**",
+              f"- 真实 PDF 页数：**{pdf_pages} 页**；一页通的硬约束为 1 页。",
+              "- 处理建议（改完后必须重新导出并实测）："]
+    overflow = (layout_audit or {}).get("overflow") or []
+    labels = []
+    for item in overflow:
+        if isinstance(item, dict) and str(item.get("label") or "").strip():
+            label = str(item["label"]).strip()
+            if label not in labels:
+                labels.append(label)
+    if labels:
+        lines.append("  - 渲染定位（仅辅助定位，以 PDF 页数为准）：第 1 页后溢出的区块为 "
+                     + "、".join(f"`{label}`" for label in labels[:5]) + "。")
+    if chart_counts and chart_counts[0][0]:
+        count, logic_id = chart_counts[0]
+        lines.append(f"  1. 优先复核 `{logic_id}` 的 {count} 张图；删减一张独占行图通常最有效。")
+    if body_counts and body_counts[0][0]:
+        count, logic_id = body_counts[0]
+        lines.append(f"  2. 压缩最长正文 `{logic_id}`（当前 {count} 字），保留可证伪依据与结论。")
+    if len(rc.核心结论 or ""):
+        lines.append(f"  3. 压缩核心结论（当前 {len(rc.核心结论)} 字），避免重复正文。")
+    if oh_result is not None and getattr(oh_result, "ok", False):
+        lines.append("  4. 正式报价表是已冻结交付事实，优先压缩研究正文/图表，不得在此处擅自删改报价行。")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def append_delivery_check(gap_path: str | Path, ma, rc, oh_result=None, *,
+                          pdf_pages: int | None = None, pdf_error: str = "",
+                          layout_audit: dict | None = None) -> None:
+    """把最终交付判定写入已生成的内部底稿；失败时不影响已有研究报告。"""
+    path = Path(gap_path)
+    try:
+        original = path.read_text(encoding="utf-8")
+        path.write_text(original.rstrip() + "\n\n" + delivery_check_markdown(
+            ma, rc, oh_result, pdf_pages=pdf_pages, pdf_error=pdf_error,
+            layout_audit=layout_audit) + "\n", encoding="utf-8")
+    except OSError:
+        # 底稿落盘失败不能反向吞掉已有 PDF/HTML；tracker 会保留同一交付结论。
+        return
 
 
 def _source_table(ma) -> list[str]:
@@ -772,6 +842,22 @@ def _optionhelper_section(oh) -> list[str]:
     return out
 
 
+def _event_evidence_section(ma) -> list[str]:
+    """记录事件事实与传导的来源，便于复核“为什么这件事会影响该 ETF”。"""
+    evidence = dict(getattr(ma, "事件证据", {}) or {})
+    if not evidence:
+        return []
+    lines = ["### 事件证据链（分析师提供，已进入正文可引用范围）", ""]
+    entity = str(evidence.get("事件主体") or "事件主体")
+    lines.append(f"- **事件主体**：{entity}")
+    for item in evidence.get("事件事实") or []:
+        lines.append(f"- **事件事实**：{item}")
+    for item in evidence.get("传导关系") or []:
+        lines.append(f"- **传导关系**：{item}")
+    lines += ["", "> 事件事实、传导依据与 A 股行情数据分别记录；不得把三者互相替代或补写。", ""]
+    return lines
+
+
 def build_markdown(ma, rc, vr, *, title: str, html_path: str, oh_result=None) -> str:
     """把本次生成的缺口与复核项排成一份可留存的 Markdown。"""
     from core.planner import DOC_FIELD_PREFIX, SRC_SPINE
@@ -791,6 +877,7 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str, oh_result=None) ->
         "",
     ]
     lines += _scope_section(ma, sector)
+    lines += _event_evidence_section(ma)
     lines += _source_table(ma)
     lines += ["---", "", "## 二、给 OptionHelper 的观点包", ""]
     lines += _viewpoint_section(ma, rc)

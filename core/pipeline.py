@@ -52,6 +52,8 @@ class MarketAnalysis:
     # 分析师经覆盖文件填好的外部事实（待补事项 → 内容）。与上一项互斥：
     # 填了就从"待补"移到这里，否则 writer 仍被告知"不得编造"而回避它，等于白填。
     外部事实已填: dict = dfield(default_factory=dict)
+    # 事件驱动报告的可溯源事实与传导证据；仅在通过证据门后存在。
+    事件证据: dict = dfield(default_factory=dict)
     # 挂钩标的择优结果（`selection.Proposal`）。**只在板块→ETF 映射给不出答案时**
     # 才有值——产业趋势与事件驱动这两类的分析对象本身不可交易（"AI产业景气"、
     # "IPO的流动性冲击"都挂不了），必须映射到一只有该暴露的可交易标的上（§9.2②）。
@@ -153,7 +155,9 @@ def fetch_profile(
 
     fields = _all_fields()
     with universe.analysis_basket(sector or "", basket):
-        results, _gaps, _prov = fetcher.fetch_fields(fields, rep_code, provider, sector)
+        results, _gaps, _prov = fetcher.fetch_fields(
+            fields, rep_code, provider, sector, analysis_etf=etf_code,
+        )
         profile = {fv.field: fv for fv in results}
         if sector:
             for fv in (_components_detail(sector, provider),
@@ -791,7 +795,9 @@ def run(
     if missing:
         # 用 profile 里已解析的行业名，别用入参的原始主题名——否则补充取数会绕开解析
         extra, _gaps, _prov = fetcher.fetch_fields(
-            missing, rep_code, provider, profile.get("__sector__") or sector)
+            missing, rep_code, provider, profile.get("__sector__") or sector,
+            analysis_etf=str(profile.get("__etf__") or ""),
+        )
     fv_map = {**profile, **{fv.field: fv for fv in extra}}
 
     # ③a 触发实测数据：把判定时算出的证据包装成 FieldValue 交给下游。
@@ -970,6 +976,16 @@ def run_from_brief(
     if confirmation is None and market_confirmation.needs_confirmation(b):
         return MarketAnalysis(plan=None, rep_code="", ok=False,
             error="该需求属于高风险口径，必须先完成分析师确认，不能直接进入研究链。")
+
+    # 事件影响报告不能只拿“事件名称 + A 股板块行情”拼接。此处再做一次后端硬校验，
+    # 即使未来 GUI/脚本绕过 main.py，也无法生成一份没有事件本体与传导依据的成品。
+    from . import event_evidence
+    evidence = getattr(overrides, "事件证据", None) or event_evidence.parse(None)
+    gate = event_evidence.assess(b, evidence)
+    if gate.required and not gate.ready:
+        entity = getattr(getattr(b, "触发实体", None), "名称", "该事件主体")
+        return MarketAnalysis(plan=None, rep_code="", ok=False,
+            error=gate.message(entity))
     target = b.代表标的
     if target is None or not target.可用:
         ma = MarketAnalysis(plan=None, rep_code="", ok=False,
@@ -1001,6 +1017,7 @@ def run_from_brief(
              prepared=prepared, chosen=chosen, overrides=overrides)
     ma.外部事实待补 = 仍缺
     ma.外部事实已填 = 填好的
+    event_evidence.attach_to_analysis(ma, b, evidence)
     ma.rep_name = target.名称          # 正文首次提及要写名称，只有代码读者认不出
     ma.板块理由 = getattr(b, "板块理由", "")
     ma.客户产品诉求 = getattr(b, "客户产品诉求", "")

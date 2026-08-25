@@ -408,7 +408,7 @@ def _fetch_one(field: str, code: str, provider: DataProvider,
 
 def fetch_fields(
     fields: list[str], code: str, provider: DataProvider | None = None,
-    sector: str | None = None,
+    sector: str | None = None, *, analysis_etf: str | None = None,
 ) -> tuple[list[FieldValue], list[str], DataProvider]:
     """取一批字段：个股字段用代表标的 code（iFinD），板块级字段用 sector（signals）。
 
@@ -418,8 +418,11 @@ def fetch_fields(
 
     # 分析ETF只解析一次（内含一次流动性查询），不要让 6 个 _SECTOR_DERIVED
     # 字段各自重复查一遍——那是同一个问题问 6 次。
-    etf_code = None
-    if sector and any(f in _SECTOR_DERIVED for f in fields):
+    # 用户已点名 ETF 时，它就是本次行情字段的唯一分析对象。此前这里忽略了
+    # pipeline 传入的显式 ETF，又按 sector 反查默认映射，导致 512000.SH 的报告
+    # 悄悄读取了“证券”默认 ETF 512880.SH 的自身波动率/成交额等行情字段。
+    etf_code = (analysis_etf or "").strip() or None
+    if not etf_code and sector and any(f in _SECTOR_DERIVED for f in fields):
         from . import instruments as inst
         i, _note = inst.resolve_analysis_etf(sector, provider=provider)
         etf_code = i.代码 if i else None

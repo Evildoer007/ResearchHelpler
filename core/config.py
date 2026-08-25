@@ -110,9 +110,10 @@ except (OSError, UnicodeError):
     _SELECTED_OPTIONHELPER_PYTHON = ""
 OPTIONHELPER_PYTHON = _cred("OPTIONHELPER_PYTHON", _SELECTED_OPTIONHELPER_PYTHON)
 
-# 对话 Agent 完成 Recommender Intent/Research/Critic 后写出的公开选择交接文件。
+# 对话 Agent 完成 Recommender Intent/Research/Critic 后写出的**一次性**公开选择交接件。
+# Quote 桥接会把它原子移动到以 run_id 命名的归档；绝不从旧运行回读。
 OPTIONHELPER_SELECTION_PATH = _cred(
-    "OPTIONHELPER_SELECTION_PATH", str(_PROJECT_ROOT / ".optionhelper" / "selection.json"),
+    "OPTIONHELPER_SELECTION_PATH", str(_PROJECT_ROOT / ".optionhelper" / "selection.pending.json"),
 )
 OPTIONHELPER_HOST_URL = _cred("OPTIONHELPER_HOST_URL")
 

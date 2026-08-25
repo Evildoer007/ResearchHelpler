@@ -1409,7 +1409,7 @@ def _etf(p):
         return None
     from . import flows as fl
     try:
-        t = fl.etf_share_trend(sector)
+        t = fl.etf_share_trend(sector, analysis_etf=str(p.get("__etf__") or ""))
     except Exception:
         return None
     return t if t.ok else None
