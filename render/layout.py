@@ -68,6 +68,25 @@ def _units(pts: list) -> set[str]:
     return out
 
 
+def _ordered_time_labels(labels: list[str]) -> bool:
+    """折线图只接受显式、单调的时间轴，杜绝把指标清单画成“趋势”。"""
+    if len(labels) < 2:
+        return False
+    keys: list[tuple[int, int]] = []
+    for raw in labels:
+        text = str(raw).strip()
+        # 2026-08 / 2026Q3 / 2026年 / FY2026 / 26H1 等常见报告时间标签。
+        match = re.fullmatch(r"(?:FY)?(\d{2,4})(?:[-/.年](\d{1,2})月?|Q([1-4])|H([12]))?", text, re.I)
+        if not match:
+            return False
+        year = int(match.group(1))
+        if year < 100:
+            year += 2000
+        period = int(match.group(2) or match.group(3) or (6 if match.group(4) == "1" else 12 if match.group(4) else 0))
+        keys.append((year, period))
+    return keys == sorted(keys) and len(set(keys)) == len(keys)
+
+
 def _num(v) -> float | None:
     """把格式化串还原成数值。解析不出返回 **None**（不是 0）。
 
@@ -340,6 +359,14 @@ def _chart_for(lc) -> str | None:
             vals = [r[1] for r in rows]
 
             if typ == "line":
+                # LLM 常把“PB 分位、利润增速、区间涨跌幅”这种横截面指标并排后
+                # 画成折线；没有连续时间轴就没有“走势”含义，强制退回柱状图。
+                if not _ordered_time_labels(labels) or len(_units([p for p in pts if _num(p.get("值")) is not None])) != 1:
+                    CHART_FALLBACKS.append(f"{getattr(lc, '逻辑id', '?')}：line → number_cards（非同量纲时间序列）")
+                    cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
+                              "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
+                             for p in pts]
+                    return _img_html(C.number_cards(cards, title=spec.get("标题")))
                 return _img_html(C.line(labels, vals, title=spec.get("标题")))
             if typ == "bar_line" and all(r[2] is not None for r in rows):
                 return _img_html(C.bar_line(

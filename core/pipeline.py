@@ -68,6 +68,8 @@ class MarketAnalysis:
     # 实测一份成品的研报逻辑因此配了张挤成一团的数字卡。类别本来就在 DocClaim 上，
     # 只是传到 writer 时丢了。
     doc_cats: dict = dfield(default_factory=dict)
+    # 被人工选入正文的研报观点及其证据边界。writer 需要它阻止公司级证据外推。
+    doc_claims: list = dfield(default_factory=list)
     # 系统按字段自动配的**历史序列图**：{字段名: 图表规格}。
     # 分位/波动率类字段传给 writer 的只有一个标量（"9.4%分位"），
     # 它手上没有序列，能画的就只有数字卡——这是数据可得性问题，不是提示词问题，
@@ -128,6 +130,8 @@ def fetch_profile(
     from . import universe
 
     provider = provider or get_provider()
+    confirmed_type = str(getattr(_inst.get(analysis_etf), "类型", "") or "") if analysis_etf else ""
+    commodity_etf = confirmed_type == "商品ETF"
 
     # 用户点名了某只 ETF：先把板块名对齐到这只 ETF 规范代表的那一级（#85）。
     # 否则 PB/波动率用对了 ETF 真实成分篮子，但板块级信号字段（资金净流入等，
@@ -136,7 +140,7 @@ def fetch_profile(
         aligned = _inst.sector_of_etf(analysis_etf)
         if aligned:
             sector = aligned
-    if sector:
+    if sector and not commodity_etf:
         sector = universe.resolve_sector(sector, rep_code=rep_code, provider=provider)
 
     # 分析 ETF：显式指定优先；否则按板块名反推（#85）。它一旦确定，本次所有板块级
@@ -151,15 +155,20 @@ def fetch_profile(
         _i, _note = _inst.resolve_analysis_etf(sector, provider=provider)
         etf_code = _i.代码 if _i else ""
         etf_note = _note
-    basket = universe.etf_constituents(etf_code, provider=provider) if etf_code else []
+    basket = universe.etf_constituents(etf_code, provider=provider) if etf_code and not commodity_etf else []
 
     fields = _all_fields()
-    with universe.analysis_basket(sector or "", basket):
+    # 已确认 ETF 却暂取不到真实成分时，宁可把股票整体法字段标为缺口，
+    # 也不能退回“通信/电子”等宽行业篮子冒充这只 ETF 的分析。商品 ETF 同理。
+    # ETF 自身的价格、波动率、成交额等字段仍会通过 analysis_etf 正常取数。
+    fetch_sector = None if (commodity_etf or (etf_code and not basket)) else sector
+    with universe.analysis_basket(fetch_sector or "", basket):
         results, _gaps, _prov = fetcher.fetch_fields(
-            fields, rep_code, provider, sector, analysis_etf=etf_code,
+            fields, rep_code, provider, fetch_sector, analysis_etf=etf_code,
+            asset_type=confirmed_type,
         )
         profile = {fv.field: fv for fv in results}
-        if sector:
+        if sector and not commodity_etf:
             for fv in (_components_detail(sector, provider),
                        _subsector_detail(sector, provider)):
                 if fv is not None:
@@ -186,6 +195,11 @@ def fetch_profile(
     profile["__etf__"] = etf_code
     profile["__etf_note__"] = etf_note
     profile["__etf_成分数__"] = len(basket)
+    profile["__etf_basket_status__"] = (
+        "真实跟踪指数成分" if basket else ("商品 ETF（无股票成分）" if commodity_etf else
+                                           "未取得真实成分；不使用行业近似替代")
+    )
+    profile["__asset_type__"] = confirmed_type
 
     # 人工覆盖放在**最后**：先让机器尽力取，取不到的才由人补，
     # 人工值不会挡住本来能自动取到的数据。判定字段不可覆盖（见 core/overrides.py），
@@ -517,6 +531,8 @@ class Candidate:
     方向: str = ""
     依据: str = ""           # 触发说明 或 研报原文
     出处: str = ""           # 仅 doc：机构《标题》日期 pN · 时效
+    证据范围: str = ""       # 仅 doc：公司级 / 行业级 / 市场级
+    证据主体: str = ""
     trigger: object = None
     claim: object = None
 
@@ -607,7 +623,8 @@ def candidates(prepared: Prepared) -> list[Candidate]:
         for c in items:
             out.append(Candidate(
                 kind="doc", id=c.id, 名称=c.观点, 类别=c.类别, 方向=c.方向,
-                依据=c.原文, 出处=f"{c.来源} p{c.页码} · {c.时效}", claim=c,
+                依据=c.原文, 出处=f"{c.来源} p{c.页码} · {c.时效}",
+                证据范围=c.证据范围, 证据主体=c.证据主体, claim=c,
             ))
     return out
 
@@ -634,6 +651,10 @@ def recommend(cands: list[Candidate], n: int = 3) -> list[int]:
     """
     scored = []
     for i, c in enumerate(cands, 1):
+        # 公司级材料可供分析师作为案例手动选择，但不能被“证据厚度”算法误推为
+        # 行业报告的主轴。缺少行业/市场级证据时，系统宁可只建议数据触发项。
+        if c.kind == "doc" and c.证据范围 == "公司级":
+            continue
         q = _quality(c)
         s = min(q["nums"], 6) * 2                   # 可引用数字越多，正文越写得实
         s += 4 if c.kind == "thesis" else 0          # 自有数据可机械溯源，权重更高
@@ -707,6 +728,9 @@ def render_candidates(cands: list[Candidate], *, with_hint: bool = True) -> str:
             lines.append(f"  {i:>2}. {head}{tag}{mk}")
             if c.出处:
                 lines.append(f"      {c.出处}")
+            if kind == "doc" and c.证据范围:
+                note = "仅可作公司案例，不可外推为板块结论" if c.证据范围 == "公司级" else "可作行业/市场层证据"
+                lines.append(f"      证据边界：{c.证据范围}（{c.证据主体 or '主体待核'}）｜{note}")
             if c.依据:
                 lines.append(f"      {'原文' if kind == 'doc' else '依据'}：{c.依据[:100]}")
         lines.append("")
@@ -881,6 +905,7 @@ def run(
         plan=plan, rep_code=rep_code, logics=logics, field_values=fv_map,
         doc_charts={c.id: c.图表 for c in doc_chosen if c.图表},
         doc_cats={c.id: c.类别 for c in doc_chosen if c.类别},
+        doc_claims=list(doc_chosen),
         auto_charts={
             **_auto_series_charts(profile.get("__sector__") or sector or "",
                                   fv_map, provider),
@@ -942,19 +967,26 @@ def _explicit_etf_from_brief(b) -> str:
 def prepare_from_brief(b, *, provider: DataProvider | None = None,
                        with_docs: bool = False, overrides=None) -> Prepared | None:
     """从需求解析结果做摸底+触发，供人工勾选。代表标的不可用时返回 None。"""
+    explicit_etf = _explicit_etf_from_brief(b)
     t = b.代表标的
+    # 分析师确认的 ETF 是本次研究对象与定价标的；不再暗中换回一只行业龙头作“数据锚点”。
+    if explicit_etf:
+        from .brief import TargetRef
+        from . import instruments as _inst
+        item = _inst.get(explicit_etf)
+        t = TargetRef(item.简称 if item else explicit_etf, explicit_etf, "ok:分析师确认ETF")
     if t is None or not t.可用:
         return None
     # 主题串给文档抽取做相关性过滤：主题 + 全部涉及板块，比只给一个板块名更全
     # （"半导体、芯片、存储芯片"三个都带上，避免研报里说"存储"就被判为不相关）
-    主题 = " ".join(x for x in [b.主题, *(b.涉及板块 or [])] if x)
+    主题 = " ".join(x for x in [getattr(b, "研究主题", ""), *(b.涉及板块 or [])] if x)
     trig = getattr(b, "触发实体", None)
     trigger_code = trig.代码 if trig is not None and trig.可用 else ""
     trigger_name = trig.名称 if trig is not None and trig.可用 else ""
     return prepare(t.代码, (b.涉及板块[0] if b.涉及板块 else None), provider,
                    with_docs=with_docs, topic=主题,
                    trigger_code=trigger_code, trigger_name=trigger_name,
-                   analysis_etf=_explicit_etf_from_brief(b),
+                   analysis_etf=explicit_etf,
                    overrides=overrides)
 
 
@@ -986,7 +1018,12 @@ def run_from_brief(
         entity = getattr(getattr(b, "触发实体", None), "名称", "该事件主体")
         return MarketAnalysis(plan=None, rep_code="", ok=False,
             error=gate.message(entity))
+    explicit_etf = _explicit_etf_from_brief(b)
     target = b.代表标的
+    if explicit_etf:
+        from .brief import TargetRef
+        item = __import__("core.instruments", fromlist=["get"]).get(explicit_etf)
+        target = TargetRef(item.简称 if item else explicit_etf, explicit_etf, "ok:分析师确认ETF")
     if target is None or not target.可用:
         ma = MarketAnalysis(plan=None, rep_code="", ok=False,
                             error="需求中没有可用的代表标的（代码待确认）")
@@ -999,7 +1036,9 @@ def run_from_brief(
 
     ctx = {
         # 禁止把原始口语整段送入研究链：其中可能包含客户点名的产品结构。
-        "研究需求": b.主题,
+        "研究需求": getattr(b, "研究主题", "") or b.主题,
+        "研究主题（细分对象）": getattr(b, "研究主题", "") or b.主题,
+        "研究篮子口径": getattr(b, "研究篮子口径", "") or "、".join(b.涉及板块 or []),
         "触发事件": b.触发事件,
         "用户关注点": b.关注点,
         "涉及板块": b.涉及板块,
@@ -1010,10 +1049,11 @@ def run_from_brief(
     }
     if 填好的:
         ctx["外部事实_分析师已人工填写_可直接引用"] = 填好的
-    ma = run(b.主题, b.主导类型, target.代码, client=client, provider=provider,
+    research_topic = getattr(b, "研究主题", "") or b.主题
+    ma = run(research_topic, b.主导类型, target.代码, client=client, provider=provider,
              genre=b.混合体裁, context=ctx,
              sector=(b.涉及板块[0] if b.涉及板块 else None),
-             analysis_etf=_explicit_etf_from_brief(b),
+             analysis_etf=explicit_etf,
              prepared=prepared, chosen=chosen, overrides=overrides)
     ma.外部事实待补 = 仍缺
     ma.外部事实已填 = 填好的

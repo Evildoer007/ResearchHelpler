@@ -347,6 +347,8 @@ def _ask_picks(prepared) -> list[str] | None:
                 "direction": candidate.方向,
                 "basis": candidate.依据,
                 "source": candidate.出处,
+                "evidence_scope": candidate.证据范围,
+                "evidence_subject": candidate.证据主体,
             }
             for index, candidate in enumerate(cands, 1)
         ],
@@ -446,7 +448,7 @@ def generate_from_brief(text: str, *, pick: bool = False,
             print("    命令行请加 --confirm-market，并在提示后输入一行确认 JSON。")
             return None
         provider = get_provider()
-        payload = market_confirmation.proposal(b)
+        payload = market_confirmation.proposal(b, provider=provider)
         while True:
             print("MARKET_CONFIRMATION_REQUIRED=" + json.dumps(payload, ensure_ascii=False), flush=True)
             line = sys.stdin.readline()
@@ -510,8 +512,17 @@ def generate_from_brief(text: str, *, pick: bool = False,
         return None
 
     t = b.代表标的
+    # 分析师确认的 ETF 就是研究对象与挂钩标的；不再展示或使用一只行业龙头
+    # 作为“代表标的”，避免中国移动之类的宽行业龙头污染光模块主题。
+    confirmed_code = str(getattr(b, "确认挂钩标的", "") or "").strip()
+    confirmed_type = str(getattr(b, "确认挂钩标的类型", "") or "")
+    if confirmed_code and "ETF" in confirmed_type.upper():
+        from core import instruments
+        item = instruments.get(confirmed_code)
+        t = brief.TargetRef(item.简称 if item else confirmed_code, confirmed_code,
+                            "ok:分析师确认ETF")
     if t is None or not t.可用:
-        print("  ⚠ 未能确定可用的代表标的，请人工指定证券代码后重试。")
+        print("  ⚠ 未能确定可用的研究对象，请确认 ETF/指数代码后重试。")
         return None
     print(f"\n▶ 生成：{b.主题}  代表标的 {t.名称} {t.代码}")
     if not o.为空:

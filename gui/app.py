@@ -490,13 +490,19 @@ class LogicPickDialog(QDialog):
             except (TypeError, ValueError):
                 continue
             source_kind = "数据触发" if raw.get("kind") == "thesis" else "材料原文（请核对）"
-            title = f"{index}. {raw.get('name') or '未命名'}｜{raw.get('category') or '—'}｜{raw.get('direction') or '—'}｜{source_kind}"
+            boundary = ""
+            if raw.get("kind") == "doc" and raw.get("evidence_scope"):
+                scope = str(raw.get("evidence_scope"))
+                boundary = f"｜{scope}" + ("（仅案例）" if scope == "公司级" else "")
+            title = f"{index}. {raw.get('name') or '未命名'}｜{raw.get('category') or '—'}｜{raw.get('direction') or '—'}｜{source_kind}{boundary}"
             check = QCheckBox(title)
             check.setChecked(index in suggested)
             check.setProperty("system_suggested", index in suggested)
             detail = "依据：" + str(raw.get("basis") or "—")
             if raw.get("source"):
                 detail += "\n出处：" + str(raw.get("source"))
+            if raw.get("kind") == "doc" and raw.get("evidence_scope") == "公司级":
+                detail += "\n提示：公司级材料只能写为该公司的案例，不能作为整个行业盈利或景气的结论。"
             box = QWidget()
             layout = QVBoxLayout(box); layout.setContentsMargins(8, 6, 8, 6)
             layout.addWidget(check)
@@ -725,44 +731,57 @@ class MarketConfirmationDialog(QDialog):
         self.mode.addItem("明确映射到 A 股研究口径并继续", "map_a")
         self.mode.addItem("仅研究原市场，不生成产品报价", "research_only")
         self.mode.addItem("保留原市场并指定 ETF/指数", "keep_market")
-        if self.original == "A股":
-            self.mode.setCurrentIndex(0)
+        # 即使解析器先识别到“全球/港股”等事件背景，也默认给出可执行的 A 股研究路径；
+        # 选择该项时 value() 会强制写入 A股，不依赖禁用下拉框的显示值。
+        self.mode.setCurrentIndex(0)
 
         self.market = QComboBox()
         self.market.addItems(["A股", "港股", "跨市场"])
+        self.theme = QLineEdit(str(payload.get("proposed_theme") or ""))
+        self.theme.setPlaceholderText("例如：光模块 / 黄金；说明本次真正研究的细分主题")
         self.scope = QLineEdit(str(payload.get("proposed_scope") or ""))
         self.scope.setPlaceholderText("多个 A 股一级行业用“、”分隔；不能只填数字")
         self.underlying = QComboBox()
         self.underlying.setEditable(True)
         self.underlying.addItem("", {"code": "", "name": ""})
         for item in payload.get("suggested_instruments") or []:
-            label = f"{item.get('code', '')}｜{item.get('name', '')}｜{item.get('note', '')}"
+            origin = str(item.get("origin") or "")
+            label = f"{item.get('code', '')}｜{item.get('name', '')}｜{origin}｜{item.get('note', '')}"
             self.underlying.addItem(label, item)
-        self.underlying.lineEdit().setPlaceholderText("可输入白名单外代码，例如 513050.SH")
+        self.underlying.lineEdit().setPlaceholderText("请选择建议标的；也可输入代码，例如 513050.SH")
+        self.underlying_hint = QLabel("请选择候选后查看其主题匹配与流动性说明；手工输入代码会在提交后重新核验。")
+        self.underlying_hint.setWordWrap(True)
+        self.underlying_hint.setStyleSheet("color:#666;")
         self.reason = QLineEdit(str(payload.get("reason") or ""))
         self.reason.setPlaceholderText("选填：说明为什么采用这个研究口径/标的")
 
         errors = payload.get("errors") or []
+        notice = str(payload.get("notice") or "")
+        discovery_notice = str(payload.get("discovery_notice") or "")
         self.message = QLabel(
             ("上次校验未通过：\n• " + "\n• ".join(errors)) if errors
-            else str(payload.get("notice") or ""))
+            else (notice + ("\n" + discovery_notice if discovery_notice else "")))
         self.message.setWordWrap(True)
         self.message.setStyleSheet("color:#a61b29;" if errors else "color:#666;")
         confirm, cancel = QPushButton("校验并继续"), QPushButton("取消本次运行")
-        confirm.clicked.connect(self.accept)
+        confirm.clicked.connect(self._submit)
         cancel.clicked.connect(self.reject)
         self.mode.currentIndexChanged.connect(self._sync_mode)
+        self.underlying.currentIndexChanged.connect(self._sync_underlying_hint)
 
         form = QFormLayout(self)
         form.addRow("解析主题", self.topic)
         form.addRow("处理方式", self.mode)
         form.addRow("确认市场", self.market)
+        form.addRow("研究主题（研究什么）", self.theme)
         form.addRow("研究口径", self.scope)
-        form.addRow("ETF / 指数", self.underlying)
+        form.addRow("ETF / 指数（产品路径必填）", self.underlying)
+        form.addRow("候选理由", self.underlying_hint)
         form.addRow("映射理由", self.reason)
         form.addRow("", self.message)
         form.addRow("", ResearchHelperWindow._row(confirm, cancel))
         self._sync_mode()
+        self._sync_underlying_hint()
 
     def _sync_mode(self) -> None:
         mode = self.mode.currentData()
@@ -779,20 +798,54 @@ class MarketConfirmationDialog(QDialog):
             self.market.setEnabled(True)
             self.underlying.setEnabled(True)
 
+    def _sync_underlying_hint(self, *_args) -> None:
+        data = self.underlying.currentData() if self.underlying.currentIndex() >= 0 else {}
+        data = data if isinstance(data, dict) else {}
+        note = str(data.get("note") or "").strip()
+        origin = str(data.get("origin") or "").strip()
+        if note:
+            self.underlying_hint.setText(f"{origin or '候选'}理由：{note}")
+        else:
+            self.underlying_hint.setText("手工输入代码将在提交后校验证券真实性、主题暴露与近20日流动性。")
+
     def value(self) -> dict:
+        mode = str(self.mode.currentData() or "")
         raw = self.underlying.currentText().strip()
         data = self.underlying.currentData() if self.underlying.currentIndex() >= 0 else {}
         data = data if isinstance(data, dict) else {}
         code = str(data.get("code") or raw.split("｜", 1)[0]).strip().upper()
         name = str(data.get("name") or "").strip()
+        # “映射到 A 股”与“仅研究原市场”下市场下拉框是禁用控件。不要依赖禁用
+        # 控件在不同 Qt/Windows 组合里是否保留 currentText，而是由处理方式确定值。
+        market = "A股" if mode == "map_a" else (self.original if mode == "research_only"
+                                                  else self.market.currentText().strip())
         return {
-            "market": self.market.currentText(),
+            "market": market,
+            "research_theme": self.theme.text().strip(),
             "research_scope": self.scope.text().strip(),
-            "underlying_code": "" if self.mode.currentData() == "research_only" else code,
-            "underlying_name": "" if self.mode.currentData() == "research_only" else name,
-            "research_only": self.mode.currentData() == "research_only",
+            "underlying_code": "" if mode == "research_only" else code,
+            "underlying_name": "" if mode == "research_only" else name,
+            "research_only": mode == "research_only",
             "reason": self.reason.text().strip(),
         }
+
+    def _submit(self) -> None:
+        """先在界面解释必填项，避免反复启动后端校验才知道漏选了 ETF。"""
+        value = self.value()
+        if not value["research_theme"]:
+            QMessageBox.information(self, "请确认研究主题", "请填写本次真正要研究的细分主题，例如“光模块”或“黄金”。")
+            return
+        if not value["research_scope"]:
+            QMessageBox.information(self, "请确认研究口径", "请填写研究篮子/行业口径。")
+            return
+        if not value["research_only"] and not value["underlying_code"]:
+            QMessageBox.information(
+                self, "请确认挂钩工具",
+                "“映射到 A 股并继续”或“保留原市场”会进入产品路径，必须从下拉建议中选择或输入 ETF/指数代码。\n\n"
+                "如果这次只需要行业研究、不做产品报价，请把“处理方式”改为“仅研究原市场，不生成产品报价”。",
+            )
+            return
+        self.accept()
 
 class ResearchHelperWindow(QMainWindow):
     def __init__(self) -> None:
@@ -813,6 +866,8 @@ class ResearchHelperWindow(QMainWindow):
         self._selection_written_for_quote = ""
         self.quote_jobs: list[QuoteJob] = []
         self.active_quote_job: QuoteJob | None = None
+        self._quote_pdf_exporting = False
+        self._run_cancelled = False
         self.quote_slow_timer = QTimer(self)
         self.quote_slow_timer.setSingleShot(True)
         self.quote_slow_timer.timeout.connect(self._quote_is_slow)
@@ -858,6 +913,9 @@ class ResearchHelperWindow(QMainWindow):
         ifind_settings.clicked.connect(self.edit_ifind_credentials)
         self.run_button = QPushButton("开始生成")
         self.run_button.clicked.connect(self.start_run)
+        self.stop_run_button = QPushButton("停止本次运行")
+        self.stop_run_button.setEnabled(False)
+        self.stop_run_button.clicked.connect(self.cancel_active_run)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -907,7 +965,7 @@ class ResearchHelperWindow(QMainWindow):
         # 页面主操作统一采用可点击尺寸；文字不以省略号替代，避免分析师无法理解功能。
         for button in (upload_sources, open_sources, choose_override, edit_override,
                        edit_evidence, clear_evidence, llm_settings, ifind_settings,
-                       self.run_button, self.quote_review_button, self.cancel_quote_job_button,
+                       self.run_button, self.stop_run_button, self.quote_review_button, self.cancel_quote_job_button,
                        self.retry_quote_job_button):
             button.setMinimumHeight(32)
         for button in (upload_sources, open_sources, choose_override, edit_override,
@@ -931,7 +989,7 @@ class ResearchHelperWindow(QMainWindow):
         form.addRow("分析模型", self._row(llm_settings))
         form.addRow("数据与报价凭证", self._row(ifind_settings))
         form.addRow(QLabel("<b>3. 运行与交付</b>"))
-        form.addRow("", self.run_button)
+        form.addRow("", self._row(self.run_button, self.stop_run_button))
 
         input_card = QFrame()
         input_card.setFrameShape(QFrame.Shape.StyledPanel)
@@ -1542,6 +1600,99 @@ class ResearchHelperWindow(QMainWindow):
         else:
             QTimer.singleShot(0, lambda: self._finish_direct_quote(job))
 
+    @staticmethod
+    def _gap_artifact(data: dict) -> str:
+        artifacts = data.get("artifacts") or {}
+        exact = str(artifacts.get("内部底稿") or "")
+        if exact:
+            return exact
+        return next((str(path) for name, path in artifacts.items() if "内部底稿" in str(name)), "")
+
+    def _persist_quote_delivery(self) -> None:
+        if not self.run_id:
+            return
+        try:
+            (RUNS / f"{self.run_id}.json").write_text(
+                json.dumps(self.last_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _complete_direct_quote(self, job: QuoteJob) -> None:
+        self._quote_pdf_exporting = False
+        self.active_quote_job = None
+        self._refresh_quote_queue()
+        self._refresh_previews(self.last_summary)
+        self._sync_delivery_status(self.last_summary)
+        self.status.setText(f"{job.job_id}：{job.message}")
+        QTimer.singleShot(0, self._pump_quote_queue)
+
+    def _rebuild_quote_delivery(self, job: QuoteJob, oh, report_file: Path) -> None:
+        """正式报价成功后同步最终 HTML、内部底稿与 PDF。
+
+        研究与报价是异步两阶段，但最终交付必须是同一时点的三份文件。PDF 在 GUI
+        的既有事件循环中导出，避免 ``html_to_pdf`` 另建 QApplication 导致卡死。
+        """
+        from render import gaps
+        from render.pdf_out import page_count, print_page_async
+
+        gap_file = Path(self._gap_artifact(self.last_summary))
+        artifacts = self.last_summary.setdefault("artifacts", {})
+        metadata = self.last_summary.setdefault("metadata", {})
+
+        def finish(pdf: str = "", export_error: str = "") -> None:
+            pages = None
+            if pdf:
+                try:
+                    pages = page_count(pdf)
+                except (OSError, ValueError):
+                    export_error = "PDF 已导出但页数校验失败"
+            gaps.refresh_optionhelper_result(
+                gap_file, oh, html_path=str(report_file), pdf_path=pdf,
+                pdf_pages=pages, pdf_error=export_error,
+            )
+            for name in [key for key in artifacts if "PDF" in str(key)]:
+                artifacts.pop(name, None)
+            if pages is not None:
+                if pages == 1:
+                    artifacts["PDF（正式交付）"] = pdf
+                    metadata["一页通交付校验"] = "通过：PDF 实测 1 页"
+                    job.message = "正式报价完成；HTML、内部底稿和 PDF 已同步更新并通过一页校验"
+                else:
+                    artifacts["PDF（超页，仅供内部复核）"] = pdf
+                    metadata["一页通交付校验"] = f"不通过：PDF 实测 {pages} 页，禁止正式交付"
+                    job.message = f"正式报价完成；HTML、内部底稿已更新，但 PDF 实测 {pages} 页"
+            else:
+                metadata["一页通交付校验"] = "未通过：正式报价后的 PDF 未成功导出，不能确认单页"
+                job.message = "正式报价完成；HTML、内部底稿已更新，但最终 PDF 导出失败"
+            job.status = "completed"
+            self._persist_quote_delivery()
+            self._complete_direct_quote(job)
+
+        # QtWebEngine 缺失时仍交付 HTML/底稿，明确标出 PDF 未校验，不让旧 PDF 冒充最终版。
+        if QWebEngineView is None or not isinstance(self.report_preview, QWebEngineView):
+            finish(export_error="当前 PySide6 未安装 QtWebEngine，无法在界面内重导 PDF")
+            return
+
+        self._quote_pdf_exporting = True
+        self.status.setText(f"{job.job_id}：正式报价完成，正在重建最终 PDF 并校验页数…")
+        pdf_path = str(report_file.with_suffix(".pdf"))
+
+        def after_load(ok: bool) -> None:
+            try:
+                self.report_preview.loadFinished.disconnect(after_load)
+            except (RuntimeError, TypeError):
+                pass
+            if not ok:
+                finish(export_error="最终 HTML 加载失败")
+                return
+            print_page_async(
+                self.report_preview.page(), pdf_path,
+                on_done=lambda path: finish(path or "", "printToPdf 返回空数据" if not path else ""),
+            )
+
+        self.report_preview.loadFinished.connect(after_load)
+        self.report_preview.load(QUrl.fromLocalFile(str(report_file.resolve())))
+
     def _finish_direct_quote(self, job: QuoteJob) -> None:
         self._read_option_output()
         self._read_option_error()
@@ -1598,28 +1749,13 @@ class ResearchHelperWindow(QMainWindow):
                     else:
                         html = html.replace("</div></body>", append + "</div></body>")
                     report_file.write_text(html, encoding="utf-8")
-                    job.status, job.message = "completed", "正式报价完成；已更新本次一页通页底报价表"
-                    # 报价表改变版面，原 PDF 不能继续宣称已通过一页校验；必须以更新后的 HTML 重导。
-                    artifacts = self.last_summary.get("artifacts") or {}
-                    for name in [key for key in artifacts if "PDF" in str(key)]:
-                        artifacts.pop(name, None)
-                    self.last_summary["artifacts"] = artifacts
-                    metadata = self.last_summary.setdefault("metadata", {})
-                    metadata["一页通交付校验"] = "未校验：正式报价已追加，须重新导出 PDF 并实测为 1 页"
-                    if self.run_id:
-                        try:
-                            (RUNS / f"{self.run_id}.json").write_text(
-                                json.dumps(self.last_summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                        except OSError:
-                            pass
-                    self._refresh_previews(self.last_summary)
-                    self._sync_delivery_status(self.last_summary)
+                    # 报价改变版面，必须重建内部底稿与 PDF；不能只用正则改 HTML 后
+                    # 留下“本次未调用”的底稿和报价前 PDF。
+                    self._rebuild_quote_delivery(job, oh, report_file)
+                    return
                 except OSError as error:
                     job.status, job.message = "failed", f"报价完成但无法更新研究报告：{error}"[:180]
-        self.active_quote_job = None
-        self._refresh_quote_queue()
-        self.status.setText(f"{job.job_id}：{job.message}")
-        QTimer.singleShot(0, self._pump_quote_queue)
+        self._complete_direct_quote(job)
 
     def edit_llm_settings(self) -> None:
         dialog = LlmSettingsDialog(self)
@@ -1633,6 +1769,25 @@ class ResearchHelperWindow(QMainWindow):
                 self, "iFinD 凭证已保存",
                 "研究数据账号/密码和 Refresh Token 会在下一次分析或正式报价任务中分别生效。",
             )
+
+    def cancel_active_run(self) -> None:
+        """允许分析师中断研究主进程；不把半份结果伪装成完成。"""
+        if self.process is None or self.process.state() == QProcess.ProcessState.NotRunning:
+            return
+        self._run_cancelled = True
+        self.stop_run_button.setEnabled(False)
+        self.status.setText("正在停止本次研究；已生成的文件仅供内部查看，不能作为正式交付…")
+        if self.run_id:
+            path = RUNS / f"{self.run_id}.json"
+            data = _load_json(path)
+            if data:
+                data["status"] = "cancelled"
+                data["error"] = "分析师主动停止运行"
+                try:
+                    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                except OSError:
+                    pass
+        self.process.kill()
 
     def start_run(self, _checked: bool = False, *, quote_job: QuoteJob | None = None) -> None:
         if self.process is not None:
@@ -1679,6 +1834,7 @@ class ResearchHelperWindow(QMainWindow):
         if effective_override:
             args += ["--overrides", effective_override]
         self.run_id = ""
+        self._run_cancelled = False
         self.last_summary = {}
         self._output_buffer = ""
         self.event_evidence_message = ""
@@ -1690,6 +1846,7 @@ class ResearchHelperWindow(QMainWindow):
         self.status.setText(f"正在启动 {quote_job.job_id}…" if quote_job else "正在启动…")
         self.progress.setRange(0, 0)
         self.run_button.setEnabled(False)
+        self.stop_run_button.setEnabled(True)
         process = QProcess(self)
         process.setWorkingDirectory(str(ROOT))
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -1720,7 +1877,11 @@ class ResearchHelperWindow(QMainWindow):
                     continue
                 dialog = MarketConfirmationDialog(payload, self)
                 if dialog.exec():
-                    self.process.write((json.dumps(dialog.value(), ensure_ascii=False) + "\n").encode("utf-8"))
+                    # QProcess 的 stdin 在 Windows 上可能仍由子进程按本地代码页解码。
+                    # 市场、行业等确认项含中文，直接写 UTF-8 会被读成乱码（如 A股 变成
+                    # 非法市场值）。JSON 的 ASCII 转义在所有 Windows 代码页下语义相同。
+                    confirmation = json.dumps(dialog.value(), ensure_ascii=True) + "\n"
+                    self.process.write(confirmation.encode("ascii"))
                     self.status.setText("正在校验分析师确认…")
                 else:
                     self.process.write(b'{"cancelled":true}\n')
@@ -1765,6 +1926,7 @@ class ResearchHelperWindow(QMainWindow):
     def process_error(self, _error) -> None:
         if self.process:
             self.status.setText("启动失败：" + self.process.errorString())
+        self.stop_run_button.setEnabled(False)
 
     def refresh_active_summary(self) -> None:
         if not self.run_id:
@@ -1781,9 +1943,12 @@ class ResearchHelperWindow(QMainWindow):
         self.refresh_active_summary()
         completed_quote_job = self.active_quote_job
         self.run_button.setEnabled(True)
+        self.stop_run_button.setEnabled(False)
         self.progress.setRange(0, 1)
         self.progress.setValue(1 if exit_code == 0 else 0)
-        if self.event_evidence_message:
+        if self._run_cancelled:
+            self.status.setText("已停止本次运行；若有已生成文件，仅供内部复核。")
+        elif self.event_evidence_message:
             self.status.setText("未生成报告：" + self.event_evidence_message)
         elif self.last_summary:
             delivery = str((self.last_summary.get("metadata") or {}).get("一页通交付校验") or "")

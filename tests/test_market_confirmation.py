@@ -47,8 +47,10 @@ class MarketConfirmationTests(unittest.TestCase):
             "513050.SH": "中概互联ETF",
             "159992.SZ": "创新药ETF",
             "515980.SH": "人工智能ETF",
+            "515050.SH": "通信ETF",
             "515030.SH": "新能源车ETF",
             "588999.SH": "AI算力ETF",
+            "159937.SZ": "博时黄金ETF",
         })
         self.liquid = patch("core.history.series", return_value=[2.0e8] * 20)
         self.industry = patch("core.universe.validate_industries",
@@ -105,6 +107,66 @@ class MarketConfirmationTests(unittest.TestCase):
             )
         resolve.assert_not_called()
         self.assertEqual(values[0][-1], "512000.SH")
+
+    def test_generic_gold_etf_requires_confirmation_and_is_temporary_commodity_etf(self) -> None:
+        """泛称黄金 ETF 不得回退为贵金属个股或静态名单外的空对象。"""
+        b = brief("近期黄金价格波动加大，客户想了解黄金 ETF 的投资机会",
+                  "A股", ["贵金属"])
+        self.assertTrue(needs_confirmation(b))
+        checked = verify(Confirmation("A股", "贵金属", "159937.SZ"), b,
+                         provider=self.provider)
+        self.assertTrue(checked.ok, checked.errors)
+        self.assertEqual(checked.instrument.类型, "商品ETF")
+        apply_to_brief(checked, b, provider=self.provider)
+        self.assertEqual(b.确认挂钩标的, "159937.SZ")
+        self.assertEqual(b.确认挂钩标的类型, "商品ETF")
+        self.assertEqual(b.候选标的, [])  # 不建立“紫金矿业”之类的错误数据锚点
+
+    def test_commodity_fetch_uses_confirmed_etf_without_sector_fallback(self) -> None:
+        from core import fetcher
+
+        calls = []
+        def record(*args, **kwargs):
+            calls.append((args, kwargs))
+            return fetcher.FieldValue(field=str(args[0]), ok=True)
+
+        with patch("core.fetcher._fetch_one", side_effect=record):
+            fetcher.fetch_fields(["年化波动率"], "159937.SZ", object(), None,
+                                 analysis_etf="159937.SZ", asset_type="商品ETF")
+        self.assertEqual(calls[0][0][4], "159937.SZ")
+        self.assertEqual(calls[0][1]["asset_type"], "商品ETF")
+
+    def test_viewpoint_recovers_missing_structured_direction_from_conclusion(self) -> None:
+        """Writer 偶发漏 JSON 的推荐方向时，不能把已有的明确结论丢给报价链。"""
+        from core.viewpoint import _resolve_direction
+        from core.writer import ReportContent
+
+        ma = SimpleNamespace(plan=SimpleNamespace(整体方向=""))
+        rc = ReportContent(主题="测试", 类型="板块机会",
+                           核心结论="多空交织，整体呈现震荡格局，方向倾向震荡。")
+        self.assertEqual(_resolve_direction(ma, rc), ("震荡", "核心结论中的明确方向"))
+
+    def test_company_document_is_not_auto_recommended_as_sector_spine(self) -> None:
+        """单公司业绩点评可以人工作为案例选，但不能被证据厚度算法推成板块主轴。"""
+        from core.pipeline import Candidate, recommend
+
+        company = Candidate(kind="doc", id="doc_1", 名称="某公司利润高增",
+                            类别="盈利/基本面类", 方向="看涨", 证据范围="公司级")
+        self.assertEqual(recommend([company]), [])
+
+    def test_confirmation_keeps_research_theme_separate_from_basket_scope(self) -> None:
+        b = brief("光模块需求上修", "A股", ["通信设备"])
+        checked = verify(Confirmation("A股", "通信设备", "515050.SH",
+                                      research_theme="光模块"), b, provider=self.provider)
+        self.assertTrue(checked.ok, checked.errors)
+        apply_to_brief(checked, b, provider=self.provider)
+        self.assertEqual(b.研究主题, "光模块")
+        self.assertEqual(b.研究篮子口径, "通信设备")
+
+    def test_product_request_without_explicit_etf_code_requires_review(self) -> None:
+        b = brief("光模块产业链的产品机会", "A股", ["通信设备"])
+        b.客户产品诉求 = "推荐产品"
+        self.assertTrue(needs_confirmation(b))
 
     def test_global_korean_company_request_requires_cross_market_confirmation(self) -> None:
         from unittest.mock import MagicMock

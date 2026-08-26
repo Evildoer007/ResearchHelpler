@@ -842,6 +842,57 @@ def _optionhelper_section(oh) -> list[str]:
     return out
 
 
+def refresh_optionhelper_result(gap_path: str | Path, oh, *, html_path: str = "",
+                                pdf_path: str = "", pdf_pages: int | None = None,
+                                pdf_error: str = "") -> bool:
+    """在正式报价完成后，把内部底稿同步为本次**最终**状态。
+
+    GUI 的研究阶段会先生成 HTML/底稿，正式报价则在另一条异步进程中完成。
+    不能让前一阶段的“本次未调用”永久留在底稿中，更不能继续引用报价前的 PDF。
+    此函数只替换两个受控章节，保留原研究数据、复核记录与人工批注。
+    """
+    import re
+
+    path = Path(gap_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+    quote = "## 三、OptionHelper 正式参考报价调用结果\n\n" + "\n".join(_optionhelper_section(oh))
+    pattern = r"## 三、OptionHelper 正式参考报价调用结果\n.*?(?=\n---\n)"
+    if re.search(pattern, text, flags=re.DOTALL):
+        text = re.sub(pattern, quote.rstrip(), text, count=1, flags=re.DOTALL)
+    else:
+        text += "\n\n---\n\n" + quote
+
+    final_lines = [
+        "## 九、正式报价后最终交付状态",
+        "",
+        "- **状态**：正式报价完成后已同步更新交付物。",
+    ]
+    if html_path:
+        final_lines.append(f"- **最终一页通 HTML**：`{html_path}`")
+    if pdf_path and pdf_pages is not None:
+        status = "通过（1 页）" if pdf_pages == 1 else f"不通过（实测 {pdf_pages} 页）"
+        final_lines.append(f"- **PDF 校验**：{status}｜`{pdf_path}`")
+    elif pdf_error:
+        final_lines.append(f"- **PDF 校验**：未完成（{pdf_error}）")
+    else:
+        final_lines.append("- **PDF 校验**：待重新导出；报价表已改变版面，旧 PDF 不可作为最终交付。")
+    final = "\n".join(final_lines) + "\n"
+    final_pattern = r"## 九、正式报价后最终交付状态\n.*?(?=\n---\n|\Z)"
+    if re.search(final_pattern, text, flags=re.DOTALL):
+        text = re.sub(final_pattern, final.rstrip(), text, count=1, flags=re.DOTALL)
+    else:
+        text = text.rstrip() + "\n\n---\n\n" + final
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def _event_evidence_section(ma) -> list[str]:
     """记录事件事实与传导的来源，便于复核“为什么这件事会影响该 ETF”。"""
     evidence = dict(getattr(ma, "事件证据", {}) or {})

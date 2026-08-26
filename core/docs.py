@@ -69,6 +69,9 @@ class DocClaim:
     来源: str = ""          # 机构 + 标题 + 日期（取自文件名）
     文档日期: str = ""      # YYYY-MM-DD，取自文件名
     时效: str = ""          # 如 "4天前" / "⚠ 已过 412 天"
+    # 证据的外推边界。公司级研报只能作为该公司的案例，不能自动推出整个行业盈利/景气。
+    证据范围: str = ""      # 公司级 / 行业级 / 市场级
+    证据主体: str = ""
     校验: str = ""          # ok / 原文未匹配 / 数值未出现:xxx
     ok: bool = False
 
@@ -287,6 +290,10 @@ _SYSTEM = """你是研报的"观点抽取器"。从给定的研报正文中，�
    "大盘""沪深300""科创50"），不得编造成分股名单当标的名。
    这四个字段只在**陈述类型=事实陈述**时才有意义；不是这个形状的观点
    （单标的事实、无具体方向、事后归因、前瞻判断）一律留空，不要勉强凑。
+10. **标注证据范围，不得越级**：`证据范围` 只能填“公司级”“行业级”“市场级”。
+    一家公司的业绩、订单、估值、评级一律是“公司级”，即使该公司属于本次主题也不能
+    写成行业结论；只有原文明确讨论行业/产业链总体时才能填“行业级”。并填写
+    `证据主体`（公司名、行业名或市场名）。
 只输出一个 JSON 对象，不要多余文字。"""
 
 
@@ -355,11 +362,31 @@ def _build_prompt(text: str, categories: list[str], topic: str = "") -> str:
                     "条件方向": "涨|跌（不适用则留空）",
                     "观察标的": "如 消费",
                     "观察方向": "涨|跌（不适用则留空）",
+                    "证据范围": "公司级|行业级|市场级",
+                    "证据主体": "该论断直接讨论的公司、行业或市场名称",
                 }
             ]
         },
     }
     return json.dumps(spec, ensure_ascii=False, indent=1)
+
+
+def _claim_scope(item: dict, extract: DocExtract) -> str:
+    """给研报观点加保守的外推边界。
+
+    LLM 的范围标签只作候选；文件名出现证券代码或“业绩点评”时用机械规则降为公司级。
+    这样一份剑桥科技（6166.HK）点评不会被包装成“A 股光模块板块盈利高增”。
+    """
+    proposed = str(item.get("证据范围") or "").strip()
+    source = " ".join([extract.文件, extract.来源, str(item.get("观点") or "")])
+    company_markers = ("业绩点评", "公司深度", "公司跟踪", "公司公告")
+    has_code = bool(re.search(r"\b\d{4,6}\.(?:HK|SH|SZ|US|KS)\b", source, re.I))
+    if has_code or any(marker in source for marker in company_markers):
+        return "公司级"
+    if proposed in {"公司级", "行业级", "市场级"}:
+        return proposed
+    # 不认识范围时宁可按最窄处理；分析师仍可看到原文并将其作为案例选择。
+    return "公司级"
 
 
 def _build_chart_prompt(text: str, claims: list[DocClaim]) -> str:
@@ -594,6 +621,8 @@ def extract(path: Path, client: DeepSeekClient | None = None,
             条件方向=str(it.get("条件方向", "")).strip(),
             观察标的=str(it.get("观察标的", "")).strip(),
             观察方向=str(it.get("观察方向", "")).strip(),
+            证据范围=_claim_scope(it, out),
+            证据主体=str(it.get("证据主体", "")).strip(),
         )
         out.claims.append(_verify(c, pages))
 

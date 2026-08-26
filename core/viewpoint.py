@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from dataclasses import dataclass, field as dfield
 
 from .pipeline import MarketAnalysis
@@ -56,6 +57,7 @@ class MarketOutlook:
     """对未来市场状态的受控表述，不包含任何产品或条款建议。"""
 
     方向: str = ""
+    方向来源: str = ""
     窗口: list[str] = dfield(default_factory=list)
     支持因素: list[str] = dfield(default_factory=list)
     制约因素: list[str] = dfield(default_factory=list)
@@ -75,6 +77,7 @@ class ViewPackage:
     板块: str = ""
     板块理由: str = ""
     整体方向: str = ""              # rc.推荐方向
+    方向来源: str = ""              # writer 字段 / 核心结论受控提取 / 研究计划
     波动率看法: str = ""            # 年化波动率 + 历史分位，拼成一句人可读的话
     情景收益带: object | None = None  # 历史相似状态的未来收益分位，非预测/非产品建议
     市场事实: list[MarketFact] = dfield(default_factory=list)
@@ -85,6 +88,46 @@ class ViewPackage:
     风险提示汇总: list[str] = dfield(default_factory=list)   # 各条风险点去重保序
     ok: bool = False
     error: str = ""
+
+
+_DIRECTIONS = ("看涨", "看跌", "震荡", "中性")
+
+
+def _canonical_direction(value: object) -> str:
+    """将已存在的研究结论归一为 OptionHelper 能识别的单一市场观点。"""
+    text = str(value or "").strip()
+    if text in _DIRECTIONS:
+        return text
+    hit = [item for item in _DIRECTIONS if item in text]
+    if "震荡" in hit or ("看涨" in hit and "看跌" in hit):
+        return "震荡"
+    return hit[0] if len(hit) == 1 else ""
+
+
+def _resolve_direction(ma: MarketAnalysis, rc: ReportContent) -> tuple[str, str]:
+    """补齐 Writer 偶发漏掉的 JSON 字段，但绝不生成新的市场判断。
+
+    优先级：Writer 的结构化字段 > 核心结论中明确的“方向/倾向”句 > 已有研究计划。
+    如果三处都没有明确方向，保留空值，由报价桥接显式拦截，不能让 OptionHelper 猜。
+    """
+    direction = _canonical_direction(rc.推荐方向)
+    if direction:
+        return direction, "Writer 结构化推荐方向"
+    conclusion = str(rc.核心结论 or "")
+    patterns = (
+        r"(?:方向|走势)\s*(?:倾向|为|是)?\s*(看涨|看跌|震荡|中性)",
+        r"(?:呈现|维持)\s*(?:[^。；，]{0,16})?(看涨|看跌|震荡|中性)(?:格局|态势|走势)?",
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, conclusion)
+        if matches:
+            direction = _canonical_direction(matches[-1])
+            if direction:
+                return direction, "核心结论中的明确方向"
+    direction = _canonical_direction(getattr(getattr(ma, "plan", None), "整体方向", ""))
+    if direction:
+        return direction, "研究计划整体方向"
+    return "", ""
 
 
 def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
@@ -136,6 +179,7 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
                     f"{k.简称}{('·' + k.适合) if k.适合 else ''}" for k in 择优.picks[1:])
                    if len(择优.picks) > 1 else ""))
 
+    direction, direction_source = _resolve_direction(ma, rc)
     vp = ViewPackage(
         标的代码=inst.代码 if inst else "",
         标的名称=inst.简称 if inst else "",
@@ -144,7 +188,8 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
         数据代表标的=f"{getattr(ma, 'rep_name', '') or ''} {ma.rep_code}".strip(),
         板块=sector,
         板块理由=getattr(ma, "板块理由", "") or "",
-        整体方向=rc.推荐方向,
+        整体方向=direction,
+        方向来源=direction_source,
     )
 
     # 观点包只选已取到的、可追溯的市场数据；不读取 writer 的结论，避免把
@@ -244,6 +289,7 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
     vp.风险提示汇总 = list(dict.fromkeys(risks))   # 去重，保留出现顺序
     vp.市场展望 = MarketOutlook(
         方向=vp.整体方向,
+        方向来源=vp.方向来源,
         窗口=list(dict.fromkeys(windows))[:2],
         支持因素=list(dict.fromkeys(drivers))[:3],
         制约因素=list(dict.fromkeys(headwinds))[:3],
@@ -289,6 +335,8 @@ def render(vp: ViewPackage) -> str:
         lines += ["", "历史相似状态收益带（非预测）：", "  · " + render_compact(vp.情景收益带)]
     outlook = vp.市场展望
     lines += ["", "市场展望：", f"  · 方向：{outlook.方向 or '—'}"]
+    if outlook.方向来源:
+        lines.append(f"  · 方向依据：{outlook.方向来源}")
     if outlook.窗口:
         lines.append("  · 窗口：" + "、".join(outlook.窗口))
     if outlook.支持因素:

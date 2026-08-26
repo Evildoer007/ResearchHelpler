@@ -267,9 +267,13 @@ def recommend(vp: ViewPackage, *, project_root: str | Path | None = None,
     ready, _readiness_report, readiness_error = _readiness(root)
     if not ready:
         return OptionHelperRecommendation(error=readiness_error)
+    current_view = vp.市场展望.方向 or vp.整体方向
+    if not current_view:
+        return OptionHelperRecommendation(
+            error="研究观点包缺少明确的预计方向，已停止调用 OptionHelper；请补充市场判断后再报价。")
     constraints = _effective_constraints(
         {}, client_constraints, underlying=vp.标的代码,
-        market_view=vp.市场展望.方向 or vp.整体方向,
+        market_view=current_view,
     )
     # Recommender 只接受客户确认的约束；取数事实和市场判断留在 prompt 中，不混写为条款。
     payload = {
@@ -392,6 +396,8 @@ def _selection_payload(project_root: Path, vp: ViewPackage,
                "not_suitable_for", "main_risks")
     body: dict[str, Any] = {"selection": {key: selection[key] for key in allowed if key in selection}}
     current_view = vp.市场展望.方向 or vp.整体方向
+    if not current_view:
+        return {}, "研究观点包缺少明确的预计方向，不能发起正式报价。"
     body["constraints"] = _effective_constraints(
         raw,
         client_constraints,

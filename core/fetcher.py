@@ -331,7 +331,8 @@ def _fetch_derived(field: str, code: str, provider: DataProvider) -> FieldValue 
 
 
 def _fetch_one(field: str, code: str, provider: DataProvider,
-               sector: str | None = None, etf_code: str | None = None) -> FieldValue:
+               sector: str | None = None, etf_code: str | None = None,
+               asset_type: str = "") -> FieldValue:
     # 已实现的 DERIVED 计算字段。
     #
     # 行情类（波动率/涨跌幅分位/换手率/成交额分位）优先级（#73）：
@@ -341,7 +342,17 @@ def _fetch_one(field: str, code: str, provider: DataProvider,
     #   ② 没有合格 ETF（或成交太薄）→ 退回板块整体法聚合（#69）。
     # PB历史分位不参与①：ETF 和它跟踪的指数都不直接提供 PB 历史序列
     # （实测中证消费指数 PB 序列 0 点），这是数据源的硬限制，永远走②。
-    if sector and field in _SECTOR_DERIVED:
+    # 商品 ETF（黄金、原油等）没有股票行业的 PB/ROE/净利润/板块主力资金口径。
+    # 它们的研究对象就是已确认 ETF 本身；不应把“贵金属”股票板块当替身。
+    commodity = asset_type == "商品ETF"
+    if commodity and field in (_AGGREGATABLE | _SECTOR_SIGNAL_FIELDS.keys() | {"减持规模", "PB历史分位"}):
+        return FieldValue(field, None, True, "不适用·商品ETF", "", "", "不适用",
+                          "商品 ETF 不采用股票板块基本面、资金流或 PB 口径")
+
+    if (sector or commodity) and field in _SECTOR_DERIVED:
+        if commodity and etf_code:
+            # 商品 ETF 的行情、波动率、成交额均严格使用它自身的历史序列。
+            return _fetch_derived(field, etf_code, provider)
         if field != "PB历史分位" and etf_code:
             # #73：分析对象是 ETF 时，行情类分位就用这只 ETF **自身**的真实价格序列。
             # 成功或失败都以 ETF 口径返回——失败也是 ETF 代码来源的诚实缺口，
@@ -409,6 +420,7 @@ def _fetch_one(field: str, code: str, provider: DataProvider,
 def fetch_fields(
     fields: list[str], code: str, provider: DataProvider | None = None,
     sector: str | None = None, *, analysis_etf: str | None = None,
+    asset_type: str = "",
 ) -> tuple[list[FieldValue], list[str], DataProvider]:
     """取一批字段：个股字段用代表标的 code（iFinD），板块级字段用 sector（signals）。
 
@@ -427,7 +439,13 @@ def fetch_fields(
         i, _note = inst.resolve_analysis_etf(sector, provider=provider)
         etf_code = i.代码 if i else None
 
-    results = [_fetch_one(f, code, provider, sector, etf_code) for f in fields]
+    # 保持普通股票/行业 ETF 调用的既有参数形状；商品分支才显式带资产类型，
+    # 方便外部调用和已有测试继续把最后一个位置理解为 analysis_etf。
+    if asset_type:
+        results = [_fetch_one(f, code, provider, sector, etf_code, asset_type=asset_type)
+                   for f in fields]
+    else:
+        results = [_fetch_one(f, code, provider, sector, etf_code) for f in fields]
     gaps = [fv.field for fv in results if not fv.ok]
     return results, gaps, provider
 
