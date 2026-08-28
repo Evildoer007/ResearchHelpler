@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field as dfield
 
 from llm.client import DeepSeekClient
@@ -26,6 +27,8 @@ from . import genres as gr
 from .fetcher import FieldValue
 from .planner import DOC_FIELD_PREFIX, ArgumentPlan, PlanLogic
 from .provider import DataProvider, get_provider
+
+_THEME_BASKET_MIN = 5
 
 
 @dataclass
@@ -83,6 +86,12 @@ class MarketAnalysis:
     # brief 给的"为什么是这个板块"。此前成品从不交代分析对象是怎么选出来的，
     # 而板块确实选错过（芯片需求取到医疗服务成分股，#61），读者却无从察觉。
     板块理由: str = ""
+    # 三个对象必须分开留痕：研究主题决定报告回答什么；研究篮子决定整体法数据
+    # 算谁；挂钩 ETF 仅是将结论转成可报价工具。不能再由 ETF 反向覆盖前两者。
+    研究主题: str = ""
+    研究篮子口径: str = ""
+    研究篮子: list[str] = dfield(default_factory=list)
+    研究篮子状态: str = ""
     # 仅供底稿与 OptionHelper 独立交接；planner/writer 不读取。
     客户产品诉求: str = ""
     市场确认: dict | None = None
@@ -114,6 +123,8 @@ def fetch_profile(
     provider: DataProvider | None = None, *,
     trigger_code: str = "", trigger_name: str = "",
     analysis_etf: str = "",
+    theme_basket=None,
+    theme_basket_required: bool = False,
     overrides=None,
 ) -> dict[str, FieldValue]:
     """摸底取数：先把论点库判定所需 + 画像字段查一遍，不预设最后选哪条论点。
@@ -133,14 +144,19 @@ def fetch_profile(
     confirmed_type = str(getattr(_inst.get(analysis_etf), "类型", "") or "") if analysis_etf else ""
     commodity_etf = confirmed_type == "商品ETF"
 
-    # 用户点名了某只 ETF：先把板块名对齐到这只 ETF 规范代表的那一级（#85）。
+    theme_basket = list(theme_basket or [])
+    # 用户点名了某只 ETF：在普通板块研究中，先把板块名对齐到这只 ETF 规范代表的
+    # 那一级（#85）。细分主题已有确认的公司篮子时则绝不能这样做：例如研究“光模块”
+    # 时，通信 ETF 只负责挂钩，不能把研究对象改写成“通信设备”。
     # 否则 PB/波动率用对了 ETF 真实成分篮子，但板块级信号字段（资金净流入等，
     # 按板块名走 iwencai）仍量的是 LLM 自由生成的宽口径板块——又是一处张冠李戴。
-    if analysis_etf:
+    if analysis_etf and not theme_basket_required:
         aligned = _inst.sector_of_etf(analysis_etf)
         if aligned:
             sector = aligned
-    if sector and not commodity_etf:
+    # 细分主题有分析师确认的公司篮子时，保留主题名字；不能先解析为“通信设备”等
+    # 宽行业，否则以下所有整体法字段都将回答错问题。
+    if sector and not commodity_etf and not theme_basket_required:
         sector = universe.resolve_sector(sector, rep_code=rep_code, provider=provider)
 
     # 分析 ETF：显式指定优先；否则按板块名反推（#85）。它一旦确定，本次所有板块级
@@ -155,20 +171,28 @@ def fetch_profile(
         _i, _note = _inst.resolve_analysis_etf(sector, provider=provider)
         etf_code = _i.代码 if _i else ""
         etf_note = _note
-    basket = universe.etf_constituents(etf_code, provider=provider) if etf_code and not commodity_etf else []
+    theme_basket_ready = len(theme_basket) >= _THEME_BASKET_MIN
+    # 少于 5 只只能称为“核心样本”，不能用它输出行业整体 PB/ROE/盈利等聚合结论；
+    # 更不能退回通信设备等宽行业替代。行情类 ETF 字段仍可照常取，研究报告会如实
+    # 标注基本面整体法未启用。
+    if theme_basket_required:
+        basket = theme_basket if theme_basket_ready else []
+    else:
+        basket = universe.etf_constituents(etf_code, provider=provider) if etf_code and not commodity_etf else []
 
     fields = _all_fields()
     # 已确认 ETF 却暂取不到真实成分时，宁可把股票整体法字段标为缺口，
     # 也不能退回“通信/电子”等宽行业篮子冒充这只 ETF 的分析。商品 ETF 同理。
     # ETF 自身的价格、波动率、成交额等字段仍会通过 analysis_etf 正常取数。
-    fetch_sector = None if (commodity_etf or (etf_code and not basket)) else sector
+    fetch_sector = None if (commodity_etf or (theme_basket_required and not theme_basket_ready)
+                            or (etf_code and not basket)) else sector
     with universe.analysis_basket(fetch_sector or "", basket):
         results, _gaps, _prov = fetcher.fetch_fields(
             fields, rep_code, provider, fetch_sector, analysis_etf=etf_code,
             asset_type=confirmed_type,
         )
         profile = {fv.field: fv for fv in results}
-        if sector and not commodity_etf:
+        if sector and not commodity_etf and (not theme_basket_required or theme_basket_ready):
             for fv in (_components_detail(sector, provider),
                        _subsector_detail(sector, provider)):
                 if fv is not None:
@@ -196,9 +220,15 @@ def fetch_profile(
     profile["__etf_note__"] = etf_note
     profile["__etf_成分数__"] = len(basket)
     profile["__etf_basket_status__"] = (
-        "真实跟踪指数成分" if basket else ("商品 ETF（无股票成分）" if commodity_etf else
-                                           "未取得真实成分；不使用行业近似替代")
+        ("未选择主题公司篮子；不生成行业整体指标" if theme_basket_required and not theme_basket else
+         f"主题核心样本（{len(theme_basket)}只；少于{_THEME_BASKET_MIN}只，"
+         "不生成行业整体指标）" if theme_basket_required and not theme_basket_ready else
+         f"研究主题核验公司篮子（{len(theme_basket)}只）" if theme_basket_required else
+        ("真实跟踪指数成分" if basket else ("商品 ETF（无股票成分）" if commodity_etf else
+                                           "未取得真实成分；不使用行业近似替代"))
+        )
     )
+    profile["__theme_basket__"] = theme_basket_required
     profile["__asset_type__"] = confirmed_type
 
     # 人工覆盖放在**最后**：先让机器尽力取，取不到的才由人补，
@@ -455,7 +485,8 @@ def _structure_charts(sector: str, rep_code: str,
                          if r.get("代码") == rep_code), "")
         if len(pts) >= 8:
             out["成分股明细"] = {
-                "类型": "scatter", "标题": f"{sector}板块成分股：估值与盈利分布",
+                "类型": "scatter", "标题": f"{sector}板块成分股：估值与盈利存在分化",
+                "图表结论": f"{sector}板块成分股：估值与盈利存在分化",
                 "x轴": "PB(倍)", "y轴": "净利同比(%)", "高亮": rep_name or "",
                 "数据点": pts,
             }
@@ -479,7 +510,9 @@ def _structure_charts(sector: str, rep_code: str,
             # 挤在一根轴上柱高的相对关系没有意义，却看着像有意义——
             # 与"数字卡升级须同量纲"是同一条原则，这里是我方自拟的规格，同样要守。
             out["子行业明细"] = {
-                "类型": "bar_line", "标题": f"{sector}板块各子行业：盈利能力与估值",
+                "类型": "bar_line", "标题": f"{sector}板块各子行业：盈利与估值存在分化",
+                "图表结论": f"{sector}板块各子行业：盈利与估值存在分化",
+                "自动生成": True,
                 "柱标签": "ROE(%)", "线标签": "PB(倍)",
                 "数据点": [{"标签": x, "值": r, "值2": p}
                         for x, r, p in zip(labels, roe, pb)
@@ -494,7 +527,8 @@ def _structure_charts(sector: str, rep_code: str,
         v = None
     if v is not None and v.ok and getattr(v, "序列", None):
         out["年化波动率"] = {
-            "类型": "histogram", "标题": f"{sector}板块年化波动率三年分布",
+            "类型": "histogram", "标题": f"{sector}板块年化波动率处于历史分布中的当前位置",
+            "图表结论": f"{sector}板块年化波动率处于历史分布中的当前位置",
             "x轴": "年化波动率(%)",
             "数据点": [{"值": x} for x in v.序列],
             "当前值": v.当前, "分位": v.分位,
@@ -542,6 +576,8 @@ def prepare(rep_code: str, sector: str | None = None,
             with_docs: bool = False, topic: str = "",
             trigger_code: str = "", trigger_name: str = "",
             analysis_etf: str = "",
+            theme_basket=None,
+            theme_basket_required: bool = False,
             overrides=None) -> Prepared:
     """摸底取数 + 跑触发引擎（+ 可选抽取 sources/ 的研报），返回候选清单原料。
 
@@ -556,7 +592,9 @@ def prepare(rep_code: str, sector: str | None = None,
     provider = provider or get_provider()
     profile = fetch_profile(rep_code, sector, provider,
                             trigger_code=trigger_code, trigger_name=trigger_name,
-                            analysis_etf=analysis_etf, overrides=overrides)
+                            analysis_etf=analysis_etf, theme_basket=theme_basket,
+                            theme_basket_required=theme_basket_required,
+                            overrides=overrides)
     try:
         fired = th.triggered_theses(profile)
     except Exception:
@@ -565,17 +603,10 @@ def prepare(rep_code: str, sector: str | None = None,
     claims: list = []
     if with_docs:
         from . import docs as dc
-        from . import filings as fl
 
-        # 先把代表标的最新公告下载进 sources/，再一并抽取。公告是交易所官方披露文件，
-        # 合规风险远低于转载研报/新闻（详见 DESIGN §7.5）——但接口本身限制返回条数，
-        # 每次只能拿到 1~3 条，故只当"最新动态"的补充来源，不指望覆盖历史公告。
-        # 下载失败（无权限/无网络/无新公告）不阻塞后续研报抽取。
-        try:
-            fl.download_latest(rep_code, provider=provider)
-        except Exception:
-            pass
-
+        # ``sources/`` 只放分析师明确上传的材料。此前这里会按“代表标的”自动下载
+        # 最新公司公告；代表标的是数据锚点，不等于研究主题，因而会把无关公司公告
+        # 混入资料库和候选逻辑。公告若需要引用，应由分析师作为补充材料上传并核对。
         # 传入主题让抽取只留相关观点。不传的话，每日通讯这类汇编里
         # 几十家不相干公司的业绩预告会一并抽出来污染候选清单（#56 实测）。
         主题串 = " ".join(x for x in [topic, sector or ""] if x).strip()
@@ -779,6 +810,8 @@ def run(
     context: dict | None = None,
     sector: str | None = None,
     analysis_etf: str = "",
+    theme_basket=None,
+    theme_basket_required: bool = False,
     prepared: Prepared | None = None,
     chosen: list[str] | None = None,
     overrides=None,
@@ -794,7 +827,9 @@ def run(
     # ①【数据先行】摸底：先把论点库判定所需的全部字段查一遍，不预设最后选哪条论点
     if prepared is None:
         prepared = prepare(rep_code, sector, provider,
-                           analysis_etf=analysis_etf, overrides=overrides)
+                           analysis_etf=analysis_etf, theme_basket=theme_basket,
+                           theme_basket_required=theme_basket_required,
+                           overrides=overrides)
     profile = prepared.profile
 
     # 被勾选的研报观点（chosen 里 doc_ 打头的那些）
@@ -906,12 +941,14 @@ def run(
         doc_charts={c.id: c.图表 for c in doc_chosen if c.图表},
         doc_cats={c.id: c.类别 for c in doc_chosen if c.类别},
         doc_claims=list(doc_chosen),
-        auto_charts={
+        # 细分主题篮子尚没有同口径的长历史序列与全量成分分布时，不画“通信设备”等
+        # 宽行业的替代图。宁可不配图，也不能用看似精美但答非所问的行业图。
+        auto_charts=({} if profile.get("__theme_basket__") else {
             **_auto_series_charts(profile.get("__sector__") or sector or "",
                                   fv_map, provider),
             **_structure_charts(profile.get("__sector__") or sector or "",
                                 rep_code, provider),
-        },
+        }),
         tokens=client.total_tokens, data_vol=getattr(provider, "total_data_vol", 0),
         ok=True,
     )
@@ -948,13 +985,21 @@ def _explicit_etf_from_brief(b) -> str:
     时，模型若把酒ETF放进候选池，就会错误覆盖“消费 → 消费ETF”的既有映射。名称或
     代码必须出现在原始需求中，才可优先于板块映射；代表标的仍优先选个股供基本面取数。
     """
-    from . import universe
+    from . import instruments, universe
 
     confirmed = str(getattr(b, "确认挂钩标的", "") or "").strip()
     confirmed_type = str(getattr(b, "确认挂钩标的类型", "") or "")
     if confirmed and "ETF" in confirmed_type.upper():
         return confirmed
     raw = str(getattr(b, "原始需求", "") or "").upper()
+    # 受控目录里的 ETF 代码是已经人工/iFinD 核验过的静态事实；即使当次
+    # iFinD 基础资料请求临时失败，也不能把用户明确写出的 512690.SH 忘掉，
+    # 再悄悄换成另一只行业 ETF 或要求重选。行情取数仍会如实报告数据源失败。
+    # 同市场确认层：代码后常直接跟“的/、/，”，不能用 ``\b`` 漏识别中文边界。
+    for code in re.findall(r"(?<![0-9A-Za-z])\d{6}\.(?:SH|SZ)(?![0-9A-Za-z])", raw):
+        item = instruments.get(code)
+        if item is not None and "ETF" in item.类型.upper():
+            return code
     for t in getattr(b, "候选标的", []) or []:
         code = str(getattr(t, "代码", "") or "").upper()
         name = str(getattr(t, "名称", "") or "").strip()
@@ -962,6 +1007,35 @@ def _explicit_etf_from_brief(b) -> str:
         if getattr(t, "可用", False) and explicitly_named and universe._is_fund(code):
             return t.代码
     return ""
+
+
+def _theme_basket_from_brief(b):
+    """把分析师确认的细分主题候选转换为本次整体法篮子。
+
+    只使用需求解析阶段已实测验证的 A 股公司；不从挂钩 ETF 的完整成分、也不从宽行业
+    近似补齐。候选不足时返回空，后续字段会如实留缺口，避免“光模块”被扩为“通信设备”。
+    """
+    from . import universe
+
+    theme = str(getattr(b, "研究主题", "") or "").strip()
+    scope = str(getattr(b, "研究篮子口径", "") or "").strip()
+    # “证券→证券”这类普通行业仍走行业整体法；只有“光模块→通信设备”这类细分
+    # 主题才启用分析师确认的主题公司篮子。
+    if not theme or theme == scope:
+        return []
+    raw = list(getattr(b, "主题篮子候选", []) or [])
+    items = [item for item in raw if getattr(item, "可用", False)
+             and not universe._is_fund(str(getattr(item, "代码", "") or ""))]
+    if not items:
+        return []
+    return [universe.Leader(代码=item.代码, 简称=item.名称) for item in items]
+
+
+def _theme_basket_required(b) -> bool:
+    """细分主题即使暂未选公司，也必须阻断宽行业/ETF 成分的静默替代。"""
+    theme = str(getattr(b, "研究主题", "") or "").strip()
+    scope = str(getattr(b, "研究篮子口径", "") or "").strip()
+    return bool(theme and scope and theme != scope)
 
 
 def prepare_from_brief(b, *, provider: DataProvider | None = None,
@@ -983,10 +1057,14 @@ def prepare_from_brief(b, *, provider: DataProvider | None = None,
     trig = getattr(b, "触发实体", None)
     trigger_code = trig.代码 if trig is not None and trig.可用 else ""
     trigger_name = trig.名称 if trig is not None and trig.可用 else ""
+    theme_basket = _theme_basket_from_brief(b)
+    theme_basket_required = _theme_basket_required(b)
     return prepare(t.代码, (b.涉及板块[0] if b.涉及板块 else None), provider,
                    with_docs=with_docs, topic=主题,
                    trigger_code=trigger_code, trigger_name=trigger_name,
                    analysis_etf=explicit_etf,
+                   theme_basket=theme_basket,
+                   theme_basket_required=theme_basket_required,
                    overrides=overrides)
 
 
@@ -1034,11 +1112,24 @@ def run_from_brief(
     填好的 = dict(getattr(overrides, "外部事实", {}) or {})
     仍缺 = [x for x in b.外部事实待补 if x not in 填好的]
 
+    research_topic = getattr(b, "研究主题", "") or b.主题
+    theme_basket = _theme_basket_from_brief(b)
+    theme_basket_required = _theme_basket_required(b)
+    if theme_basket:
+        basket_state = (f"主题行业篮子（{len(theme_basket)}只）" if len(theme_basket) >= 8 else
+                        f"窄口径主题篮子（{len(theme_basket)}只）" if len(theme_basket) >= _THEME_BASKET_MIN else
+                        f"核心样本（{len(theme_basket)}只；不用于行业整体聚合）")
+    elif theme_basket_required:
+        basket_state = "未选择主题公司篮子；不用于行业整体聚合"
+    else:
+        basket_state = "行业整体法（非细分主题公司篮子）"
     ctx = {
         # 禁止把原始口语整段送入研究链：其中可能包含客户点名的产品结构。
         "研究需求": getattr(b, "研究主题", "") or b.主题,
         "研究主题（细分对象）": getattr(b, "研究主题", "") or b.主题,
         "研究篮子口径": getattr(b, "研究篮子口径", "") or "、".join(b.涉及板块 or []),
+        "研究篮子构成": "、".join(f"{item.简称}（{item.代码}）" for item in theme_basket) or "—",
+        "研究篮子使用限制": basket_state,
         "触发事件": b.触发事件,
         "用户关注点": b.关注点,
         "涉及板块": b.涉及板块,
@@ -1049,17 +1140,26 @@ def run_from_brief(
     }
     if 填好的:
         ctx["外部事实_分析师已人工填写_可直接引用"] = 填好的
-    research_topic = getattr(b, "研究主题", "") or b.主题
     ma = run(research_topic, b.主导类型, target.代码, client=client, provider=provider,
              genre=b.混合体裁, context=ctx,
              sector=(b.涉及板块[0] if b.涉及板块 else None),
              analysis_etf=explicit_etf,
+             theme_basket=theme_basket,
+             theme_basket_required=theme_basket_required,
              prepared=prepared, chosen=chosen, overrides=overrides)
     ma.外部事实待补 = 仍缺
     ma.外部事实已填 = 填好的
     event_evidence.attach_to_analysis(ma, b, evidence)
     ma.rep_name = target.名称          # 正文首次提及要写名称，只有代码读者认不出
     ma.板块理由 = getattr(b, "板块理由", "")
+    ma.研究主题 = research_topic
+    ma.研究篮子口径 = getattr(b, "研究篮子口径", "")
+    ma.研究篮子 = [
+        f"{item.名称}（{item.代码}）"
+        for item in (getattr(b, "主题篮子候选", []) or [])
+        if getattr(item, "可用", False)
+    ]
+    ma.研究篮子状态 = basket_state
     ma.客户产品诉求 = getattr(b, "客户产品诉求", "")
     ma.市场确认 = confirmation
     ma.确认挂钩标的 = getattr(b, "确认挂钩标的", "")

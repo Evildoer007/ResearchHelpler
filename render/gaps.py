@@ -126,15 +126,23 @@ def _effective_type(spec) -> str:
     与 `layout` 里那段升级逻辑必须保持一致——两处判据一旦分叉，
     体检报的就不是读者看到的东西。故这里直接复用 layout 的判定函数。
     """
-    from render.layout import _num, _units
+    from render.layout import _num, _ordered_time_labels, _units
 
     s = spec or {}
     t = s.get("类型") or "?"
+    pts = s.get("数据点") or []
+    numeric = [p for p in pts if _num(p.get("值")) is not None]
+    # 与 layout._chart_for 保持一致：不能把底稿体检做在读者实际看不到的图型上。
+    if t == "line" and (not _ordered_time_labels([str(p.get("标签", "")) for p in numeric])
+                        or len(_units(numeric)) != 1):
+        return "number_cards"
+    if t in {"bar", "contribution_bar"} and len(_units(numeric)) != 1:
+        return "number_cards"
+    if t == "bar_line" and not s.get("自动生成"):
+        return "number_cards"
     if t != "number_cards":
         return t
-    pts = s.get("数据点") or []
-    nums = [p for p in pts if _num(p.get("值")) is not None]
-    if len(nums) >= 3 and len(nums) == len(pts) and len(_units(pts)) == 1:
+    if len(numeric) >= 3 and len(numeric) == len(pts) and len(_units(pts)) == 1:
         return "bar"          # 渲染层会升级成柱状图
     return t
 
@@ -800,7 +808,12 @@ def _optionhelper_section(oh) -> list[str]:
     不能只在客户版面留一句"报价由交易台确定"就把真实原因吞掉。
     """
     if oh is None:
-        return ["（本次未调用——生成时未加 `--optionhelper` 开关）", ""]
+        return [
+            "- **结构推荐**：尚未发起。",
+            "- **正式参考报价**：尚未发起（研究生成阶段不直接报价；桌面端需先由 OptionHelper "
+            "形成候选并经分析师确认，命令行则需显式加 `--optionhelper`）。",
+            "",
+        ]
     constraints = getattr(oh, "client_constraints", {}) or {}
     if not getattr(oh, "ok", False):
         out = [f"- **状态**：失败（{oh.stage or '未知阶段'}）", f"- **原因**：{oh.error or '（无详细信息）'}"]
@@ -842,6 +855,57 @@ def _optionhelper_section(oh) -> list[str]:
     return out
 
 
+def refresh_optionhelper_recommender_result(gap_path: str | Path, record: dict) -> bool:
+    """把 GUI 异步完成的 OptionHelper 结构推荐同步写入内部底稿。
+
+    推荐与正式报价是两个独立阶段：前者已运行但尚待人工确认时，不能把底稿写成
+    “未调用”；后者没运行也要明确说明原因，避免分析师误以为报价结果遗失。
+    """
+    import re
+
+    path = Path(gap_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    status = str(record.get("status") or "failed")
+    message = str(record.get("message") or "（无详细信息）")
+    candidates = [item for item in (record.get("candidates") or []) if isinstance(item, dict)]
+    lines = ["## 三、OptionHelper 正式参考报价调用结果", ""]
+    if candidates:
+        lines += [
+            f"- **结构推荐**：已完成（{len(candidates)} 个候选，等待分析师确认）。",
+            "- **正式参考报价**：尚未发起（原因：必须先由分析师确认 OptionHelper 候选；未确认前不创建一次性 selection）。",
+            "- **推荐诊断**：" + (message or "结构推荐已完成。"),
+            "- **候选摘要**：",
+        ]
+        for item in candidates:
+            title = str(item.get("product_name") or item.get("product_id") or "未命名候选")
+            reason = str(item.get("reason") or "（未提供理由）")
+            lines.append(f"  - {title}：{reason}")
+    else:
+        lines += [
+            "- **结构推荐**：未形成候选（状态：" + status + "）。",
+            "- **未生成正式参考报价的原因**：结构推荐阶段未完成，不能跳过候选确认直接报价。",
+            "- **推荐诊断**：" + message,
+        ]
+        stderr = str(record.get("stderr") or "").strip()
+        if stderr:
+            lines.append("- **进程诊断**：" + stderr[-1000:])
+    lines.append("")
+    section = "\n".join(lines)
+    pattern = r"## 三、OptionHelper 正式参考报价调用结果\n.*?(?=\n---\n)"
+    if re.search(pattern, text, flags=re.DOTALL):
+        text = re.sub(pattern, section.rstrip(), text, count=1, flags=re.DOTALL)
+    else:
+        text = text.rstrip() + "\n\n---\n\n" + section
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def refresh_optionhelper_result(gap_path: str | Path, oh, *, html_path: str = "",
                                 pdf_path: str = "", pdf_pages: int | None = None,
                                 pdf_error: str = "") -> bool:
@@ -866,10 +930,12 @@ def refresh_optionhelper_result(gap_path: str | Path, oh, *, html_path: str = ""
     else:
         text += "\n\n---\n\n" + quote
 
+    quote_ok = bool(getattr(oh, "ok", False))
     final_lines = [
         "## 九、正式报价后最终交付状态",
         "",
-        "- **状态**：正式报价完成后已同步更新交付物。",
+        "- **状态**：正式报价完成后已同步更新交付物。" if quote_ok else
+        "- **状态**：正式报价未完成；保留研究报告，未把任何报价前 PDF 标为正式交付。",
     ]
     if html_path:
         final_lines.append(f"- **最终一页通 HTML**：`{html_path}`")
@@ -878,7 +944,7 @@ def refresh_optionhelper_result(gap_path: str | Path, oh, *, html_path: str = ""
         final_lines.append(f"- **PDF 校验**：{status}｜`{pdf_path}`")
     elif pdf_error:
         final_lines.append(f"- **PDF 校验**：未完成（{pdf_error}）")
-    else:
+    elif quote_ok:
         final_lines.append("- **PDF 校验**：待重新导出；报价表已改变版面，旧 PDF 不可作为最终交付。")
     final = "\n".join(final_lines) + "\n"
     final_pattern = r"## 九、正式报价后最终交付状态\n.*?(?=\n---\n|\Z)"

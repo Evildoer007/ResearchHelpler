@@ -193,6 +193,16 @@ _SYSTEM = """你是场外衍生品投资策略研报的"撰稿器"。根据论�
      标明属于哪一组，如 {组:"本板块", 标签:"证券", 值:"13.9倍"}、
      {组:"同业中位数", 标签:"保险", 值:"18.2倍"}。最多两组。
      可另给 `说明` 作为图下方的一句结论。
+   - `contribution_bar`：同一主题篮子内的成分股**同一口径**涨跌幅/贡献，按数值排序；
+     不是任意一组公司指标的通用替代品。每点 {标签, 值}，单位必须一致。
+   - `histogram`：同一字段的足够长历史样本（至少 30 个观测值），用于展示分布与当前位置；
+     不得把 2~4 个孤立指标伪装成“分布”。
+   - `evidence_flow`：事件型研究中已核验的“事件事实 → 传导依据 → A股主题影响”链，
+     每点 {标签, 说明}，只可写已给出的传导证据；它不是数值趋势图。
+4.1.1 **标题必须是一句可核对的结论，而非“XX走势/XX分析”这类栏目名。** 同时为每张图给
+   `数据截至`、`单位`、`样本口径` 与 `图表结论`；若输入没有日期、样本或单位，明确写“见底稿”，
+   不得猜测。图上只高亮一个重点，其余数据弱化；不得使用彩虹色或以颜色替代数值/标签。
+   `图表结论` 与标题同义，便于渲染器在标题被程序图覆盖时仍保留结论。
 4.2 数据点的值**只能来自给你的真实数据**（可用数据/板块全景/成分股明细/研报依据），
    一个都不许编。画不出来就不给图表规格，宁可无图也不要假数据。
 5. 核心结论最后综合全部逻辑（含推荐方向），一段话，**180~280 字**。
@@ -383,7 +393,11 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
                     "图表规格列表": [
                         {
                             "类型": "沿用惯用图类型，或按下方数据形态另选",
-                            "标题": "字符串",
+                            "标题": "一句可核对的结论标题，不写‘走势/分析’等栏目名",
+                            "图表结论": "与标题同义的结论句",
+                            "数据截至": "输入给出的日期；没有则写‘见底稿’",
+                            "单位": "%，倍，亿元，或双轴单位；没有则写‘见底稿’",
+                            "样本口径": "如‘主题研究篮子（8只）’；没有则写‘见底稿’",
                             "数据点": [{"标签": "字段名或说明", "值": "真实值"}],
                             "说明": "可选",
                         }
@@ -441,6 +455,65 @@ def _parse(d: dict, ma: MarketAnalysis, rc: ReportContent) -> list[str]:
     # 一路无声地渲染出去（#68 实测撞到：一份 3 条逻辑齐全的报告核心结论整段为空）。
     head = [] if rc.核心结论 else ["核心结论"]
     return head + empty + sorted(missing)
+
+
+def _chart_data_as_of(ma: MarketAnalysis) -> str:
+    """从已验证字段中取可追溯的最新截止日；缺失时宁可明确留痕。"""
+    dates: list[str] = []
+    for value in (ma.field_values or {}).values():
+        as_of = str(getattr(value, "as_of", "") or "").strip()
+        if re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", as_of):
+            dates.append(as_of)
+    return sorted(dates)[-1] if dates else "见底稿"
+
+
+def _chart_sample_scope(ma: MarketAnalysis) -> str:
+    """图表不能暗示比实际更广的样本；优先使用明确的研究篮子口径。"""
+    if ma.研究篮子口径:
+        return ma.研究篮子口径
+    basket = [str(x) for x in (ma.研究篮子 or []) if str(x)]
+    if basket:
+        return f"主题研究篮子（{len(basket)}只）"
+    sector = (ma.field_values or {}).get("__sector__") or ""
+    return f"{sector}整体口径" if sector else "见底稿"
+
+
+def _chart_unit(spec: dict) -> str:
+    """优先保留规格已声明的单位；否则只从真实的展示值推断，不做单位换算。"""
+    if spec.get("单位"):
+        return str(spec["单位"])
+    if spec.get("类型") == "scatter":
+        return f"{spec.get('x轴') or 'x轴'} × {spec.get('y轴') or 'y轴'}"
+    if spec.get("类型") == "bar_line":
+        return f"{spec.get('柱标签') or '左轴'} × {spec.get('线标签') or '右轴'}"
+    if spec.get("x轴"):
+        return str(spec["x轴"])
+    units = set()
+    for point in spec.get("数据点") or []:
+        match = re.search(r"(万亿元|亿元|万元|万亿|亿|元|倍|%|个百分点|pct|bp)\s*$",
+                          str((point or {}).get("值", "")).strip())
+        if match:
+            units.add(match.group(1))
+    return next(iter(units)) if len(units) == 1 else "见坐标轴/数据卡"
+
+
+def _normalise_chart_specs(ma: MarketAnalysis, rc: ReportContent) -> None:
+    """为 LLM 与程序生成的图表统一补齐审计元信息。
+
+    这一步只补口径，不改数据点、不制造结论。渲染层再做量纲、时间轴等硬校验；
+    两层分工让“模型写了不合规图”不会静默进入成品。
+    """
+    as_of = _chart_data_as_of(ma)
+    scope = _chart_sample_scope(ma)
+    for logic in rc.logics:
+        for spec in logic.图表规格列表 or []:
+            if not isinstance(spec, dict):
+                continue
+            if spec.get("图表结论"):
+                spec["标题"] = str(spec["图表结论"])
+            spec.setdefault("数据截至", as_of)
+            spec.setdefault("样本口径", scope)
+            spec.setdefault("单位", _chart_unit(spec))
 
 
 def write(ma: MarketAnalysis, client: DeepSeekClient | None = None) -> ReportContent:
@@ -524,6 +597,10 @@ def write(ma: MarketAnalysis, client: DeepSeekClient | None = None) -> ReportCon
             if key not in auto or key in 用过 or not 可挂:
                 continue
             _attach(min(可挂, key=lambda x: len(x.图表规格列表)), key)
+
+    # 图题、截止日、单位与样本口径必须同时进入 LLM 自拟图、研报已校验图和
+    # 程序自动图；不能只要求某一条来源遵守图表规范。
+    _normalise_chart_specs(ma, rc)
 
     # 补写后仍缺的，如实标记，绝不代笔编造内容。
     rc.空缺逻辑 = gaps

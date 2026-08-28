@@ -222,9 +222,42 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
         if 择优理由:
             vp.标的选择说明 = 择优理由
         else:
-            vp.标的选择说明 = (
-                f"该 ETF 与{sector or '本次'}研究主题匹配，且已通过取数阶段的流动性检查。"
-            )
+            # 细分主题（如“光模块”）与 ETF 的规范行业（如“通信设备”）通常不完全同名。
+            # 报告必须明确：前文研究的是经核验的主题公司篮子；ETF 是把该主题所在
+            # 产业链转成可交易价格标的的工具。不能只写一句“主题匹配”，否则读者会误以为
+            # 前面的基本面结论来自这只 ETF 的全部成分股。
+            theme = str(getattr(ma, "研究主题", "") or sector or "本次")
+            scope = str(getattr(ma, "研究篮子口径", "") or "").strip()
+            basket = list(getattr(ma, "研究篮子", []) or [])
+            if basket:
+                preview = "、".join(basket[:3])
+                if len(basket) > 3:
+                    preview += "等"
+                basket_state = str(getattr(ma, "研究篮子状态", "") or "")
+                if "核心样本" in basket_state:
+                    relationship = (
+                        f"前文围绕“{theme}”主题展开，以经核验的核心样本（{preview}）观察；"
+                        "样本不足以代表行业整体，未据此输出行业整体基本面结论。"
+                    )
+                else:
+                    relationship = (
+                        f"前文围绕“{theme}”主题展开，基本面判断取自经核验的主题公司篮子"
+                        f"（{preview}）。"
+                    )
+                if scope and scope != theme:
+                    relationship += (
+                        f"{inst.简称}提供“{scope}”的可交易行业表达，覆盖“{theme}”所在产业链；"
+                    )
+                else:
+                    relationship += f"{inst.简称}是该主题的可交易表达工具；"
+                vp.标的选择说明 = (
+                    relationship + "经分析师确认并通过近20日流动性检查，故作为挂钩标的；"
+                    "报价、波动率和情景收益均以该 ETF 自身行情为准。"
+                )
+            else:
+                vp.标的选择说明 = (
+                    f"该 ETF 与{theme}研究主题匹配，且已通过取数阶段的流动性检查。"
+                )
 
     # 波动率是期权定价的核心输入（DESIGN §9.4 的"⑧衍生品维度"）。
     # 这两个字段本就在摸底阶段的必查清单里（required_fields 含"年化波动率"/

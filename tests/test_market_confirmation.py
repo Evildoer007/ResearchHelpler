@@ -51,12 +51,13 @@ class MarketConfirmationTests(unittest.TestCase):
             "515030.SH": "新能源车ETF",
             "588999.SH": "AI算力ETF",
             "159937.SZ": "博时黄金ETF",
+            "516520.SH": "华泰柏瑞智能驾驶ETF",
         })
         self.liquid = patch("core.history.series", return_value=[2.0e8] * 20)
         self.industry = patch("core.universe.validate_industries",
                               side_effect=lambda names, provider=None: (
-                                  [n for n in names if n in {"半导体", "通信设备", "计算机设备", "元件", "汽车", "电子"}],
-                                  [n for n in names if n not in {"半导体", "通信设备", "计算机设备", "元件", "汽车", "电子"}],
+                                  [n for n in names if n in {"半导体", "通信设备", "计算机设备", "元件", "汽车", "电子", "白酒"}],
+                                  [n for n in names if n not in {"半导体", "通信设备", "计算机设备", "元件", "汽车", "电子", "白酒"}],
                               ))
         self.liquid.start()
         self.industry.start()
@@ -89,6 +90,26 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertEqual(b.候选标的[0].名称, "券商ETF")
         b.候选标的[0].校验 = check
         self.assertEqual(pipeline._explicit_etf_from_brief(b), "512000.SH")
+
+    def test_catalogued_explicit_etf_skips_confirmation_even_without_llm_candidate(self) -> None:
+        """用户点名已知 ETF 时，不应再要求选择同一只工具或主题公司篮子。"""
+        # 自然语言里代码后通常直接接“的”，不能依赖 ASCII 的单词边界。
+        b = brief("根据目前酒ETF 512690.SH的市场情况推荐产品", "A股", ["白酒"])
+        b.候选标的 = []  # 模拟解析器遗漏候选；判断必须只看用户原文和受控目录。
+        self.assertFalse(needs_confirmation(b))
+
+    def test_ordinary_sector_does_not_turn_llm_candidates_into_theme_basket(self) -> None:
+        """普通白酒行业不应把单个贵州茅台显示为“主题研究篮子”。"""
+        b = brief("白酒板块投资机会", "A股", ["白酒"])
+        b.候选标的 = [TargetRef("贵州茅台", "600519.SH", "ok:贵州茅台")]
+        payload = proposal(b, provider=self.provider)
+        self.assertEqual(payload["theme_basket_candidates"], [])
+
+    def test_system_normalizes_colloquial_wine_sector_before_showing_confirmation(self) -> None:
+        """分析师不应看到系统自填、但数据源不承认的“酒类”选项。"""
+        b = brief("酒ETF投资机会", "A股", ["酒类"])
+        payload = proposal(b, provider=self.provider)
+        self.assertEqual(payload["verified_scope_options"], ["白酒"])
 
     def test_explicit_etf_is_forwarded_to_sector_derived_fetches(self) -> None:
         """用户点名 ETF 时，行情字段不得回退到板块的默认 ETF。"""
@@ -162,6 +183,125 @@ class MarketConfirmationTests(unittest.TestCase):
         apply_to_brief(checked, b, provider=self.provider)
         self.assertEqual(b.研究主题, "光模块")
         self.assertEqual(b.研究篮子口径, "通信设备")
+
+    def test_confirmation_proposal_separates_fine_theme_from_standard_industry(self) -> None:
+        """系统不能把“通信设备、光模块”原样塞进标准行业校验字段。"""
+        b = brief("光模块需求上修", "A股", ["通信设备", "光模块"])
+        payload = proposal(b, provider=self.provider)
+        self.assertEqual(payload["proposed_theme"], "光模块")
+        self.assertEqual(payload["verified_scope_options"], ["通信设备"])
+        self.assertEqual(payload["proposed_scope"], "通信设备")
+
+    def test_confirmed_theme_keeps_verified_company_basket_not_etf_constituents(self) -> None:
+        from core.pipeline import _theme_basket_from_brief
+
+        b = brief("光模块需求上修", "A股", ["通信设备"])
+        b.候选标的 = [
+            TargetRef("中际旭创", "300308.SZ", "ok:中际旭创"),
+            TargetRef("新易盛", "300502.SZ", "ok:新易盛"),
+            TargetRef("天孚通信", "300394.SZ", "ok:天孚通信"),
+        ]
+        checked = verify(Confirmation("A股", "通信设备", "515050.SH",
+                                      research_theme="光模块"), b, provider=self.provider)
+        self.assertTrue(checked.ok, checked.errors)
+        apply_to_brief(checked, b, provider=self.provider)
+        self.assertEqual(b.涉及板块, ["光模块"])
+        self.assertEqual([item.代码 for item in _theme_basket_from_brief(b)],
+                         ["300308.SZ", "300502.SZ", "300394.SZ"])
+
+    def test_theme_basket_prevents_etf_from_overwriting_research_subject(self) -> None:
+        """光模块篮子配通信 ETF 时，ETF 不得把研究对象改回通信设备。"""
+        from core import pipeline, universe
+
+        basket = [universe.Leader("300308.SZ", "中际旭创")]
+        with patch("core.pipeline._all_fields", return_value=[]), \
+                patch("core.fetcher.fetch_fields", return_value=([], [], object())), \
+                patch("core.pipeline._components_detail", return_value=None), \
+                patch("core.pipeline._subsector_detail", return_value=None), \
+                patch("core.instruments.sector_of_etf") as aligned:
+            profile = pipeline.fetch_profile(
+                "300308.SZ", "光模块", self.provider,
+                analysis_etf="515050.SH", theme_basket=basket, theme_basket_required=True,
+            )
+        aligned.assert_not_called()
+        self.assertEqual(profile["__sector__"], "光模块")
+        self.assertTrue(profile["__theme_basket__"])
+
+    def test_underlying_reason_explains_theme_basket_to_etf_mapping(self) -> None:
+        """客户版必须解释前文主题篮子与报价 ETF 的关系，不能只写“主题匹配”。"""
+        from core import scenario_band, viewpoint
+        from core.writer import ReportContent
+
+        ma = SimpleNamespace(
+            ok=True, rep_code="300308.SZ", rep_name="中际旭创", field_values={
+                "__sector__": "光模块", "__etf__": "515050.SH",
+            }, 确认挂钩标的="515050.SH", 仅研究=False, 挂钩择优=None,
+            研究主题="光模块", 研究篮子口径="通信设备",
+            研究篮子=["中际旭创（300308.SZ）", "新易盛（300502.SZ）"],
+            板块理由="", plan=SimpleNamespace(整体方向=""), logics=[],
+        )
+        rc = ReportContent(主题="光模块", 类型="产业趋势", 推荐方向="看涨", ok=True)
+        with patch.object(scenario_band, "calculate", side_effect=RuntimeError("skip")):
+            pkg = viewpoint.build(ma, rc)
+        self.assertIn("主题公司篮子", pkg.标的选择说明)
+        self.assertIn("通信设备", pkg.标的选择说明)
+        self.assertIn("可交易行业表达", pkg.标的选择说明)
+
+    def test_analyst_selected_theme_basket_is_frozen_for_this_run(self) -> None:
+        b = brief("光模块需求上修", "A股", ["通信设备"])
+        pool = [TargetRef(f"候选{i}", f"300{i:03d}.SZ", "ok:主题候选") for i in range(6)]
+        b.主题篮子候选池 = pool
+        selected = [item.代码 for item in pool[:5]]
+        checked = verify(Confirmation(
+            "A股", "通信设备", "515050.SH", research_theme="光模块",
+            theme_basket_codes=selected, theme_basket_confirmed=True,
+        ), b, provider=self.provider)
+        self.assertTrue(checked.ok, checked.errors)
+        apply_to_brief(checked, b, provider=self.provider)
+        self.assertEqual([item.代码 for item in b.主题篮子候选], selected)
+
+    def test_sub_minimum_theme_basket_never_falls_back_to_wide_sector(self) -> None:
+        """3 只核心样本可观察，但不能偷换为通信设备的行业整体数据。"""
+        from core import pipeline, universe
+
+        calls = []
+        def fake_fields(*args, **kwargs):
+            calls.append((args, kwargs))
+            return [], [], object()
+
+        small_basket = [universe.Leader("300308.SZ", "中际旭创"),
+                        universe.Leader("300502.SZ", "新易盛"),
+                        universe.Leader("300394.SZ", "天孚通信")]
+        with patch("core.pipeline._all_fields", return_value=[]), \
+                patch("core.fetcher.fetch_fields", side_effect=fake_fields), \
+                patch("core.pipeline._components_detail", return_value=None), \
+                patch("core.pipeline._subsector_detail", return_value=None):
+            profile = pipeline.fetch_profile(
+                "300308.SZ", "光模块", self.provider,
+                analysis_etf="515050.SH", theme_basket=small_basket, theme_basket_required=True,
+            )
+        self.assertIsNone(calls[0][0][3])  # fetcher 的板块参数，禁止回退为通信设备
+        self.assertIn("不生成行业整体指标", profile["__etf_basket_status__"])
+
+    def test_dynamic_etf_discovery_pre_filters_and_caps_rows_before_official_checks(self) -> None:
+        """问财返回上千行时，确认页不能逐只发基础数据请求。"""
+        from core.market_confirmation import _DISCOVERY_SCAN_LIMIT, _discovery_rows
+
+        b = brief("光模块投资机会", "A股", ["通信设备"])
+        codes = [f"{500000 + i:06d}.SH" for i in range(_DISCOVERY_SCAN_LIMIT + 30)]
+        names = [f"通信ETF{i}" for i in range(len(codes))]
+        names[-1] = "光通信主题ETF"
+        rows = _discovery_rows(codes, names, b)
+        self.assertEqual(len(rows), _DISCOVERY_SCAN_LIMIT)
+        self.assertEqual(rows[0][1], "光通信主题ETF")
+
+    def test_dynamic_discovery_only_fills_remaining_suggestion_slots(self) -> None:
+        from core import market_confirmation
+
+        b = brief("光模块投资机会", "A股", ["通信设备"])
+        with patch.object(market_confirmation, "discover_etfs", return_value=[]) as discover:
+            market_confirmation._suggestions(b, provider=self.provider)
+        self.assertEqual(discover.call_args.kwargs["limit"], 7)  # 通信ETF 已是起始候选
 
     def test_product_request_without_explicit_etf_code_requires_review(self) -> None:
         b = brief("光模块产业链的产品机会", "A股", ["通信设备"])
@@ -246,6 +386,63 @@ class MarketConfirmationTests(unittest.TestCase):
                          provider=self.provider)
         self.assertTrue(checked.ok, checked.errors)
         self.assertEqual(checked.confirmation.industries, ["汽车", "电子"])
+
+    def test_auto_electronics_expands_to_related_etf_search_terms(self) -> None:
+        """发散只生成检索语义，不直接猜基金代码。"""
+        from core.market_confirmation import _discovery_terms
+
+        b = brief("基于A股汽车电子产业智能化加速的投资机会", "A股", ["汽车电子"])
+        b.ETF检索词 = ["汽车电子", "智能驾驶"]
+        terms = _discovery_terms(b)
+        self.assertIn("汽车电子", terms)
+        self.assertIn("智能驾驶", terms)
+        self.assertIn("智能汽车", terms)
+        self.assertNotIn("516520.SH", terms)
+
+    def test_verified_theme_etf_route_does_not_require_fake_standard_industry(self) -> None:
+        """汽车电子可按智能驾驶 ETF 真实成分研究，不必把主题冒充标准行业。"""
+        b = brief("基于A股汽车电子产业智能化加速的投资机会", "A股", ["汽车电子"])
+        checked = verify(Confirmation(
+            "A股", "汽车电子", "516520.SH",
+            research_theme="汽车电子", research_mode="theme_etf",
+        ), b, provider=self.provider)
+        self.assertTrue(checked.ok, checked.errors)
+        apply_to_brief(checked, b, provider=self.provider)
+        self.assertEqual(b.研究主题, "汽车电子")
+        self.assertEqual(b.研究篮子口径, "汽车电子")
+        self.assertEqual(b.涉及板块, ["汽车电子"])
+        self.assertEqual(b.确认挂钩标的, "516520.SH")
+        self.assertEqual(b.主题篮子候选, [])
+
+    def test_common_ss_suffix_is_normalized_for_ifind(self) -> None:
+        from core.market_confirmation import from_dict
+
+        value = from_dict({
+            "market": "A股", "research_scope": "汽车电子",
+            "research_theme": "汽车电子", "research_mode": "theme_etf",
+            "underlying_code": "516520.SS",
+        })
+        self.assertEqual(value.underlying_code, "516520.SH")
+
+    def test_theme_etf_between_minimum_and_preferred_liquidity_passes_with_warning(self) -> None:
+        b = brief("汽车电子智能化投资机会", "A股", ["汽车电子"])
+        with patch("core.history.series", return_value=[4.5e7] * 20):
+            checked = verify(Confirmation(
+                "A股", "汽车电子", "516520.SH",
+                research_theme="汽车电子", research_mode="theme_etf",
+            ), b, provider=self.provider)
+        self.assertTrue(checked.ok, checked.errors)
+        self.assertTrue(any("优选门槛" in warning for warning in checked.warnings))
+
+    def test_theme_etf_below_minimum_liquidity_is_rejected(self) -> None:
+        b = brief("汽车电子智能化投资机会", "A股", ["汽车电子"])
+        with patch("core.history.series", return_value=[2.0e7] * 20):
+            checked = verify(Confirmation(
+                "A股", "汽车电子", "516520.SH",
+                research_theme="汽车电子", research_mode="theme_etf",
+            ), b, provider=self.provider)
+        self.assertFalse(checked.ok)
+        self.assertTrue(any("最低门槛" in error for error in checked.errors))
 
     def test_hk_innovation_cannot_be_silently_confirmed_as_chemical_pharma(self) -> None:
         b = brief("基于港股创新药板块的投资机会", "港股", ["化学制药"])

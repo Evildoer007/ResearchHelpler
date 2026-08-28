@@ -61,6 +61,12 @@ class Brief:
     # 不能再把“通信、电子”等宽行业名同时拿来当全部三者的名称。
     研究主题: str = ""
     研究篮子口径: str = ""
+    # 细分主题经分析师确认时，保留需求解析阶段已核验的相关公司，作为本次主题篮子。
+    # 它与挂钩 ETF 的完整成分股不是同一对象：前者回答“研究什么”，后者只负责报价。
+    主题篮子候选: list[TargetRef] = dfield(default_factory=list)
+    # 市场确认页动态发现的主题公司候选池，只在本次运行内使用。分析师勾选其中的公司
+    # 后才写入上面的“主题篮子候选”；绝不把本次发现结果写回人工维护的证券/行业库。
+    主题篮子候选池: list[TargetRef] = dfield(default_factory=list)
     主题: str = ""
     主导类型: str = ""
     附加类型: list[str] = dfield(default_factory=list)
@@ -69,6 +75,10 @@ class Brief:
     # 客户点名的结构/报价诉求：保留作 OptionHelper 的独立输入与审计留痕，
     # 绝不进入研究主题、研究关注点或 planner/writer 的上下文。
     客户产品诉求: str = ""
+    # 用于全市场 ETF 动态发现的主题词/同义词。LLM 只负责给出“查什么”，
+    # 不允许在这里生成基金代码或直接指定产品；代码、名称、跟踪指数和流动性
+    # 均由 iFinD 在后续确认阶段独立核验。
+    ETF检索词: list[str] = dfield(default_factory=list)
     涉及板块: list[str] = dfield(default_factory=list)
     宽口径成分行业: list[str] = dfield(default_factory=list)  # 大类拆解，已逐个校验可取数
     宽口径弃用行业: list[str] = dfield(default_factory=list)  # 拆出来但校验没过的，须让人看见
@@ -172,6 +182,11 @@ _SYSTEM = """你是券商研究部的"需求解析器"。用户（老板/销售/
    期限、损失限制或“推荐某结构”，这些只属于 `客户产品诉求原文摘录`；`研究主题`、
    `研究关注点`、`触发事件`、市场判断和板块理由只描述市场对象、市场状态及待验证问题，
    不得出现结构名称、报价、执行价或产品推荐。
+8. **给出 2~6 个 `ETF检索主题`，用于后续在全市场基金目录中动态检索。**
+   这里只能写主题词或常用同义词，不得写基金名称、基金代码或产品结构。
+   检索词应覆盖与研究主题具有直接业务暴露的相邻表达，而不是无限泛化。
+   例：汽车电子 → 汽车电子、智能驾驶、智能汽车、车联网、汽车智能化；
+   光模块 → 光模块、光通信、通信设备；白酒 → 白酒、酒。
 只输出一个 JSON 对象，不要多余文字。"""
 
 
@@ -191,6 +206,7 @@ def _build_prompt(text: str, bundle: sg.SignalBundle) -> str:
             "触发事件": "需求中的引发事件，一句话",
             "研究关注点": "用户真正想知道的市场问题，不得出现产品/结构词",
             "客户产品诉求原文摘录": "仅摘录用户原文中与结构、报价、期限、损失或收益偏好有关的片段；无则留空，不得改写或补充",
+            "ETF检索主题": ["2~6个主题词/同义词；不得填写基金代码、基金名称或结构名称"],
             "涉及板块": ["A股口径板块名，优先取自信号；按业务对口而非概念联想"],
             "宽口径成分行业": ["仅当涉及板块是大类（消费/周期/科技…）时填：它由哪几个A股一级行业构成；否则空数组"],
             "板块理由": "一句话：这个板块为何与需求直接相关（会印进报告）",
@@ -350,6 +366,20 @@ def parse(
     b.触发事件 = _research_only(str(d.get("触发事件", "")).strip())
     b.关注点 = _research_only(str(d.get("研究关注点") or d.get("关注点") or "").strip())
     b.涉及板块 = [str(x).strip() for x in (d.get("涉及板块") or []) if str(x).strip()]
+    search_terms: list[str] = []
+    raw_search_terms = d.get("ETF检索主题") or []
+    if isinstance(raw_search_terms, str):
+        raw_search_terms = [raw_search_terms]
+    for value in raw_search_terms:
+        term = str(value or "").strip()
+        # 检索协议只接收短主题词。代码和明显的基金全名一律丢弃，避免把
+        # LLM 的产品记忆当成证券事实传给确认页。
+        if (not term or len(term) > 20 or _SECURITY_CODE_RE.search(term)
+                or re.search(r"ETF|基金|期权|价差|鲨鱼鳍|雪球", term, re.I)):
+            continue
+        if term not in search_terms:
+            search_terms.append(term)
+    b.ETF检索词 = search_terms[:6]
     b.客户产品诉求 = _product_mentions(text)
     if not b.主题:
         b.主题 = f"{b.涉及板块[0]}市场情况研究" if b.涉及板块 else "市场情况研究"

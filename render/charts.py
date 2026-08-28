@@ -459,8 +459,15 @@ def histogram(values: list[float], *, current: float | None = None,
     """
     S.apply_style()
     fig, ax = plt.subplots(figsize=(5.2, 1.92))
-    ax.hist(values, bins=bins, color=S.PRIMARY, alpha=0.55,
-            edgecolor="white", linewidth=0.6, zorder=2)
+    # seaborn 只负责直方图的分箱与边缘细节；不可用时仍保持纯 matplotlib
+    # 回退，避免为了视觉样式给桌面版增加一个硬运行依赖。
+    try:
+        import seaborn as sns
+        sns.histplot(values, bins=bins, stat="count", color=S.PRIMARY,
+                     alpha=0.55, edgecolor="white", linewidth=0.6, ax=ax)
+    except (ImportError, RuntimeError):
+        ax.hist(values, bins=bins, color=S.PRIMARY, alpha=0.55,
+                edgecolor="white", linewidth=0.6, zorder=2)
     cur = current if current is not None else values[-1]
     ax.axvline(cur, color=S.PRIMARY_D, linewidth=1.6, zorder=3)
     lab = f"当前 {cur:,.1f}"
@@ -477,3 +484,19 @@ def histogram(values: list[float], *, current: float | None = None,
     ax.grid(axis="x", visible=False)
     fig.tight_layout()
     return fig
+
+
+def contribution_bar(labels: list[str], values: list[float], *, title: str | None = None,
+                     ylabel: str | None = None):
+    """排序贡献条：展示主题篮子中谁在拉动、谁在拖累。
+
+    与普通柱状图的差别不是配色，而是语义：这里的横轴必须是同一主题篮子的
+    成分，纵轴必须是同一种可加总或可比较的贡献/涨跌幅。渲染时强制按数值排序，
+    让正负贡献与离群值直接可读，不能被随意的输入顺序掩盖。
+    """
+    pairs = sorted(zip(labels, values), key=lambda pair: pair[1])
+    if not pairs:
+        return bar([], [], title=title, ylabel=ylabel, signed=True)
+    ordered_labels, ordered_values = zip(*pairs)
+    return bar(list(ordered_labels), list(ordered_values), title=title,
+               ylabel=ylabel, signed=True)

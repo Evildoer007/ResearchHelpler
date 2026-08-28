@@ -721,6 +721,8 @@ class MarketConfirmationDialog(QDialog):
     def __init__(self, payload: dict, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.payload = payload
+        previous = payload.get("previous_confirmation") or {}
+        previous = previous if isinstance(previous, dict) else {}
         self.setWindowTitle("确认研究市场、行业口径与挂钩工具")
         self.resize(720, 430)
 
@@ -737,10 +739,82 @@ class MarketConfirmationDialog(QDialog):
 
         self.market = QComboBox()
         self.market.addItems(["A股", "港股", "跨市场"])
-        self.theme = QLineEdit(str(payload.get("proposed_theme") or ""))
+        self.theme = QLineEdit(str(previous.get("research_theme")
+                                   or payload.get("proposed_theme") or ""))
         self.theme.setPlaceholderText("例如：光模块 / 黄金；说明本次真正研究的细分主题")
-        self.scope = QLineEdit(str(payload.get("proposed_scope") or ""))
-        self.scope.setPlaceholderText("多个 A 股一级行业用“、”分隔；不能只填数字")
+        # 分析师选择的是“如何取数”，不是替系统猜行业名。细分主题若找到可验证
+        # ETF，可直接按 ETF 真实成分研究；标准行业只是另一条可选路径。
+        self.scope = QComboBox()
+        scope_options = [str(item).strip() for item in (payload.get("verified_scope_options") or [])
+                         if str(item).strip()]
+        if not scope_options and str(payload.get("proposed_scope") or "").strip():
+            scope_options = [str(payload.get("proposed_scope") or "").strip()]
+        theme_route = bool(payload.get("theme_etf_route"))
+        theme_scope = str(payload.get("theme_etf_scope") or payload.get("proposed_theme") or "").strip()
+        if theme_route and theme_scope:
+            self.scope.addItem(
+                f"{theme_scope}（主题 ETF 路径：按所选 ETF 真实成分研究）",
+                {"scope": theme_scope, "mode": "theme_etf"},
+            )
+        for scope in dict.fromkeys(scope_options):
+            self.scope.addItem(
+                f"{scope}（标准行业路径：按行业或人工确认主题篮子研究）",
+                {"scope": scope, "mode": "industry"},
+            )
+        if not scope_options and not (theme_route and theme_scope):
+            self.scope.addItem("未形成可用研究路径，请改为仅研究或取消本次运行",
+                               {"scope": "", "mode": "industry"})
+        previous_scope = str(previous.get("research_scope") or "").strip()
+        previous_research_mode = str(previous.get("research_mode") or "").strip()
+        if previous_scope:
+            for index in range(self.scope.count()):
+                data = self.scope.itemData(index)
+                data = data if isinstance(data, dict) else {"scope": data, "mode": "industry"}
+                if (str(data.get("scope") or "").strip() == previous_scope
+                        and (not previous_research_mode
+                             or str(data.get("mode") or "") == previous_research_mode)):
+                    self.scope.setCurrentIndex(index)
+                    break
+        self.scope_hint = QLabel(
+            "主题 ETF 路径不要求细分主题冒充标准行业：提交后会校验 ETF 官方名称、跟踪指数、主题暴露与流动性，再按真实成分取数。")
+        self.scope_hint.setWordWrap(True)
+        self.scope_hint.setStyleSheet("color:#666;")
+        basket = [item for item in (payload.get("theme_basket_candidates") or [])
+                  if isinstance(item, dict) and item.get("code")]
+        self.theme_basket_min = int(payload.get("theme_basket_min") or 5)
+        self.theme_basket_codes: list[QListWidgetItem] = []
+        basket_box = QWidget()
+        basket_layout = QVBoxLayout(basket_box)
+        basket_layout.setContentsMargins(0, 0, 0, 0)
+        self.theme_basket = QListWidget()
+        self.theme_basket.setMaximumHeight(165)
+        self.theme_basket.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        if basket:
+            for candidate in basket:
+                name, code = str(candidate.get("name") or ""), str(candidate.get("code") or "")
+                origin, note = str(candidate.get("origin") or "候选"), str(candidate.get("note") or "")
+                item = QListWidgetItem(f"{name}（{code}）｜{origin}｜{note}")
+                item.setData(Qt.ItemDataRole.UserRole, code)
+                item.setToolTip(note)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                # 需求解析已经核验过的公司属于核心样本；iFinD 动态扩展项必须由分析师
+                # 主动勾选，不能悄悄加入研究整体法。
+                item.setCheckState(Qt.CheckState.Checked if candidate.get("core") else Qt.CheckState.Unchecked)
+                self.theme_basket.addItem(item)
+                self.theme_basket_codes.append(item)
+            self.theme_basket.itemChanged.connect(self._sync_theme_basket_hint)
+            basket_layout.addWidget(self.theme_basket)
+            self.theme_basket_hint = QLabel()
+            self.theme_basket_hint.setWordWrap(True)
+            self.theme_basket_hint.setStyleSheet("color:#a66a00;")
+            basket_layout.addWidget(self.theme_basket_hint)
+        else:
+            self.theme_basket = None
+            self.theme_basket_hint = QLabel("尚未形成可核验主题公司候选；本次不会拿宽行业成分替代。")
+            self.theme_basket_hint.setWordWrap(True)
+            self.theme_basket_hint.setStyleSheet("color:#666;")
+            basket_layout.addWidget(self.theme_basket_hint)
+        self.theme_basket_selector = basket_box
         self.underlying = QComboBox()
         self.underlying.setEditable(True)
         self.underlying.addItem("", {"code": "", "name": ""})
@@ -748,6 +822,17 @@ class MarketConfirmationDialog(QDialog):
             origin = str(item.get("origin") or "")
             label = f"{item.get('code', '')}｜{item.get('name', '')}｜{origin}｜{item.get('note', '')}"
             self.underlying.addItem(label, item)
+        previous_code = str(previous.get("underlying_code") or "").strip().upper()
+        if previous_code:
+            previous_code = (previous_code[:-3] + ".SH"
+                             if previous_code.endswith(".SS") else previous_code)
+            matched_index = next((index for index in range(self.underlying.count())
+                                  if str((self.underlying.itemData(index) or {}).get("code") or "").upper()
+                                  == previous_code), -1)
+            if matched_index >= 0:
+                self.underlying.setCurrentIndex(matched_index)
+            else:
+                self.underlying.setEditText(previous_code)
         self.underlying.lineEdit().setPlaceholderText("请选择建议标的；也可输入代码，例如 513050.SH")
         self.underlying_hint = QLabel("请选择候选后查看其主题匹配与流动性说明；手工输入代码会在提交后重新核验。")
         self.underlying_hint.setWordWrap(True)
@@ -767,6 +852,7 @@ class MarketConfirmationDialog(QDialog):
         confirm.clicked.connect(self._submit)
         cancel.clicked.connect(self.reject)
         self.mode.currentIndexChanged.connect(self._sync_mode)
+        self.scope.currentIndexChanged.connect(self._sync_scope_path)
         self.underlying.currentIndexChanged.connect(self._sync_underlying_hint)
 
         form = QFormLayout(self)
@@ -774,14 +860,20 @@ class MarketConfirmationDialog(QDialog):
         form.addRow("处理方式", self.mode)
         form.addRow("确认市场", self.market)
         form.addRow("研究主题（研究什么）", self.theme)
-        form.addRow("研究口径", self.scope)
+        scope_box = QWidget()
+        scope_layout = QVBoxLayout(scope_box); scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.addWidget(self.scope); scope_layout.addWidget(self.scope_hint)
+        form.addRow("研究取数路径（系统建议）", scope_box)
+        form.addRow("主题研究篮子（取数用）", self.theme_basket_selector)
         form.addRow("ETF / 指数（产品路径必填）", self.underlying)
         form.addRow("候选理由", self.underlying_hint)
         form.addRow("映射理由", self.reason)
         form.addRow("", self.message)
         form.addRow("", ResearchHelperWindow._row(confirm, cancel))
         self._sync_mode()
+        self._sync_scope_path()
         self._sync_underlying_hint()
+        self._sync_theme_basket_hint()
 
     def _sync_mode(self) -> None:
         mode = self.mode.currentData()
@@ -808,25 +900,82 @@ class MarketConfirmationDialog(QDialog):
         else:
             self.underlying_hint.setText("手工输入代码将在提交后校验证券真实性、主题暴露与近20日流动性。")
 
+    def _scope_value(self) -> tuple[str, str]:
+        data = self.scope.currentData() if self.scope.currentIndex() >= 0 else {}
+        if isinstance(data, dict):
+            return str(data.get("scope") or "").strip(), str(data.get("mode") or "industry").strip()
+        # 兼容旧 payload/测试代码。
+        return str(data or "").strip(), "industry"
+
+    def _sync_scope_path(self, *_args) -> None:
+        scope, research_mode = self._scope_value()
+        if research_mode == "theme_etf":
+            self.scope_hint.setText(
+                f"将研究“{scope or self.theme.text().strip()}”：所选 ETF 通过官方信息校验后，"
+                "系统直接使用其真实成分作为研究篮子；下方主题公司勾选不参与本路径。")
+            if self.theme_basket is not None:
+                self.theme_basket.setEnabled(False)
+            self.theme_basket_hint.setText("主题 ETF 路径将使用 ETF 真实成分，无需人工拼主题公司篮子。")
+        else:
+            self.scope_hint.setText(
+                "标准行业路径会校验行业名称；细分研究主题与标准行业保持分离，"
+                "如显示主题公司候选，需由分析师确认后才进入聚合。")
+            if self.theme_basket is not None:
+                self.theme_basket.setEnabled(True)
+            self._sync_theme_basket_hint()
+
+    def _selected_theme_basket_codes(self) -> list[str]:
+        return [str(item.data(Qt.ItemDataRole.UserRole) or "").strip().upper()
+                for item in self.theme_basket_codes
+                if item.checkState() == Qt.CheckState.Checked and item.data(Qt.ItemDataRole.UserRole)]
+
+    def _sync_theme_basket_hint(self, *_args) -> None:
+        if not hasattr(self, "theme_basket_hint"):
+            return
+        if hasattr(self, "scope") and self._scope_value()[1] == "theme_etf":
+            self.theme_basket_hint.setText("主题 ETF 路径将使用 ETF 真实成分，无需人工拼主题公司篮子。")
+            return
+        count = len(self._selected_theme_basket_codes())
+        if not self.theme_basket_codes:
+            return
+        if count < self.theme_basket_min:
+            self.theme_basket_hint.setText(
+                f"当前已选 {count} 只：仅作为核心样本，不生成“行业整体”PB、ROE、盈利等聚合结论；"
+                f"建议至少勾选 {self.theme_basket_min} 只。")
+        elif count < 8:
+            self.theme_basket_hint.setText(
+                f"当前已选 {count} 只：将按窄口径主题篮子聚合，报告会标注样本范围。")
+        else:
+            self.theme_basket_hint.setText(
+                f"当前已选 {count} 只：将按主题行业篮子做整体法聚合（最多保留 20 只）。")
+
     def value(self) -> dict:
         mode = str(self.mode.currentData() or "")
         raw = self.underlying.currentText().strip()
         data = self.underlying.currentData() if self.underlying.currentIndex() >= 0 else {}
         data = data if isinstance(data, dict) else {}
         code = str(data.get("code") or raw.split("｜", 1)[0]).strip().upper()
+        if code.endswith(".SS"):
+            code = code[:-3] + ".SH"
         name = str(data.get("name") or "").strip()
         # “映射到 A 股”与“仅研究原市场”下市场下拉框是禁用控件。不要依赖禁用
         # 控件在不同 Qt/Windows 组合里是否保留 currentText，而是由处理方式确定值。
         market = "A股" if mode == "map_a" else (self.original if mode == "research_only"
                                                   else self.market.currentText().strip())
+        scope, research_mode = self._scope_value()
+        if research_mode == "theme_etf":
+            scope = self.theme.text().strip() or scope
         return {
             "market": market,
             "research_theme": self.theme.text().strip(),
-            "research_scope": self.scope.text().strip(),
+            "research_scope": scope,
+            "research_mode": research_mode,
             "underlying_code": "" if mode == "research_only" else code,
             "underlying_name": "" if mode == "research_only" else name,
             "research_only": mode == "research_only",
             "reason": self.reason.text().strip(),
+            "theme_basket_codes": ([] if research_mode == "theme_etf"
+                                   else self._selected_theme_basket_codes()),
         }
 
     def _submit(self) -> None:
@@ -836,7 +985,11 @@ class MarketConfirmationDialog(QDialog):
             QMessageBox.information(self, "请确认研究主题", "请填写本次真正要研究的细分主题，例如“光模块”或“黄金”。")
             return
         if not value["research_scope"]:
-            QMessageBox.information(self, "请确认研究口径", "请填写研究篮子/行业口径。")
+            QMessageBox.information(
+                self, "未形成可用研究路径",
+                "系统既没有形成可校验标准行业，也没有形成可用的主题 ETF 路径。\n\n"
+                "请改为“仅研究原市场”，或取消后调整客户需求再试。",
+            )
             return
         if not value["research_only"] and not value["underlying_code"]:
             QMessageBox.information(
@@ -845,6 +998,17 @@ class MarketConfirmationDialog(QDialog):
                 "如果这次只需要行业研究、不做产品报价，请把“处理方式”改为“仅研究原市场，不生成产品报价”。",
             )
             return
+        if (value.get("research_mode") == "industry" and self.theme_basket_codes
+                and len(value["theme_basket_codes"]) < self.theme_basket_min):
+            answer = QMessageBox.question(
+                self, "主题篮子样本较少",
+                f"当前只选择 {len(value['theme_basket_codes'])} 只主题公司。系统会保留研究，"
+                "但不会输出行业整体估值、盈利或历史分位结论。\n\n仍要继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
         self.accept()
 
 class ResearchHelperWindow(QMainWindow):
@@ -1254,6 +1418,27 @@ class ResearchHelperWindow(QMainWindow):
                 self.quote_queue.setCurrentItem(item)
         self._sync_quote_queue_actions()
 
+    def _sync_quote_runtime_to_summary(self, job: QuoteJob) -> None:
+        """把报价子任务状态写回研究摘要，避免队列、进度和预览各说各话。"""
+        if not self.last_summary:
+            return
+        metadata = self.last_summary.setdefault("metadata", {})
+        metadata["正式报价状态"] = f"{job.status}｜{job.job_id}｜{job.message}"
+        stages = self.last_summary.setdefault("stages", [])
+        stage = next((item for item in stages if item.get("key") == "optionhelper_quote_gui"), None)
+        if stage is None:
+            stage = {"key": "optionhelper_quote_gui", "label": "正式报价（GUI 后台任务）"}
+            stages.append(stage)
+        stage.update({
+            "status": job.status,
+            "detail": job.message,
+            "error": job.message if job.status in {"failed", "blocked", "cancelled"} else "",
+        })
+        self._persist_quote_delivery()
+        # 顶部摘要和报价预览必须与队列在同一次 UI 刷新中更新，不能等下一轮
+        # 研究日志轮询才让用户看到“报价进行中”。
+        self.show_summary(self.last_summary)
+
     def _selected_quote_job_id(self) -> str:
         item = self.quote_queue.currentItem()
         return str(item.data(Qt.ItemDataRole.UserRole)) if item else ""
@@ -1441,6 +1626,14 @@ class ResearchHelperWindow(QMainWindow):
             "status": status,
             "message": message,
             "candidate_count": len(candidates),
+            "candidates": [
+                {
+                    "product_id": str(item.get("product_id") or ""),
+                    "product_name": str(item.get("product_name") or ""),
+                    "reason": str(item.get("reason") or ""),
+                }
+                for item in candidates if isinstance(item, dict)
+            ],
             "stderr": stderr[-2000:],
         }
         path = RUNS / f"{run_id}.optionhelper-recommender.json"
@@ -1461,6 +1654,12 @@ class ResearchHelperWindow(QMainWindow):
             (RUNS / f"{run_id}.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8",
             )
+            # 研究报告已先落盘，结构推荐随后在 GUI 异步进程完成；同步替换底稿中的
+            # “尚未调用”，并说明正式报价为什么尚未发起。
+            gap_path = self._gap_artifact(summary)
+            if gap_path:
+                from render import gaps
+                gaps.refresh_optionhelper_recommender_result(gap_path, record)
         except OSError:
             # 日志辅助功能不应妨碍分析师在 UI 中获得本次推荐结果。
             pass
@@ -1541,7 +1740,10 @@ class ResearchHelperWindow(QMainWindow):
         from core import config
         job.status, job.message, job.forced_stop_reason = "running", "正在使用本次已确认候选生成正式报价", ""
         self.active_quote_job = job
+        self._sync_quote_runtime_to_summary(job)
         self._refresh_quote_queue()
+        # 研究阶段的 100% 不能被误读成正式报价已完成；报价阶段改为不定进度。
+        self.progress.setRange(0, 0)
         self.status.setText(f"{job.job_id}：正在调用 OptionHelper 正式报价，不会重跑研究…")
         payload = {
             "skill_root": config.OPTIONHELPER_SKILL_ROOT, "project_root": str(ROOT),
@@ -1580,6 +1782,7 @@ class ResearchHelperWindow(QMainWindow):
         if job is None or self.option_process is None:
             return
         job.message = "报价超过 60 秒，仍在等待 OptionHelper/iFinD 响应（180 秒后自动停止）"
+        self._sync_quote_runtime_to_summary(job)
         self._refresh_quote_queue()
         self.status.setText(f"{job.job_id}：{job.message}")
 
@@ -1617,9 +1820,29 @@ class ResearchHelperWindow(QMainWindow):
         except OSError:
             pass
 
+    def _sync_failed_quote_to_gap(self, job: QuoteJob) -> None:
+        """正式报价未形成时也写入底稿，不能只在队列里留一行失败文字。"""
+        gap_path = self._gap_artifact(self.last_summary)
+        if not gap_path:
+            return
+        try:
+            from core.optionhelper_bridge import OptionHelperResult
+            from render import gaps
+            result = OptionHelperResult(
+                ok=False, stage="quote", error=job.message,
+                client_constraints=dict(job.selection_payload.get("constraints") or {}),
+                recovery_action="核对 OptionHelper/iFinD 诊断后重新发起本次报价；不要复用旧 selection。",
+            )
+            gaps.refresh_optionhelper_result(gap_path, result)
+        except (OSError, TypeError):
+            pass
+
     def _complete_direct_quote(self, job: QuoteJob) -> None:
         self._quote_pdf_exporting = False
+        self._sync_quote_runtime_to_summary(job)
         self.active_quote_job = None
+        self.progress.setRange(0, 1)
+        self.progress.setValue(1)
         self._refresh_quote_queue()
         self._refresh_previews(self.last_summary)
         self._sync_delivery_status(self.last_summary)
@@ -1700,6 +1923,8 @@ class ResearchHelperWindow(QMainWindow):
         self.option_process = None
         if job.forced_stop_reason:
             job.status, job.message = "failed", job.forced_stop_reason
+            self._sync_failed_quote_to_gap(job)
+            self._persist_quote_delivery()
             self.active_quote_job = None
             self._refresh_quote_queue()
             self.status.setText(f"{job.job_id}：{job.message}")
@@ -1755,6 +1980,9 @@ class ResearchHelperWindow(QMainWindow):
                     return
                 except OSError as error:
                     job.status, job.message = "failed", f"报价完成但无法更新研究报告：{error}"[:180]
+        if job.status == "failed":
+            self._sync_failed_quote_to_gap(job)
+            self._persist_quote_delivery()
         self._complete_direct_quote(job)
 
     def edit_llm_settings(self) -> None:
@@ -1791,6 +2019,13 @@ class ResearchHelperWindow(QMainWindow):
 
     def start_run(self, _checked: bool = False, *, quote_job: QuoteJob | None = None) -> None:
         if self.process is not None:
+            return
+        if quote_job is None and (self.option_process is not None or self.active_quote_job is not None):
+            QMessageBox.information(
+                self, "正式报价进行中",
+                "当前正式报价尚未结束。请等待其完成、失败或取消后，再发起新的研究运行；"
+                "这样不会覆盖报价任务关联的研究摘要和预览。",
+            )
             return
         if quote_job is None and any(job.status == "queued" for job in self.quote_jobs):
             QMessageBox.information(
@@ -2003,6 +2238,12 @@ class ResearchHelperWindow(QMainWindow):
                        for item in data.get("stages", [])],
             "recovery_actions": data.get("recovery_actions", []),
         }
+        if self.active_quote_job is not None:
+            compact["正式报价后台任务"] = {
+                "job_id": self.active_quote_job.job_id,
+                "status": self.active_quote_job.status,
+                "message": self.active_quote_job.message,
+            }
         if self.event_evidence_message:
             compact["report_blocked"] = self.event_evidence_message
         self.summary.setPlainText(json.dumps(compact, ensure_ascii=False, indent=2))
@@ -2063,6 +2304,13 @@ class ResearchHelperWindow(QMainWindow):
             return
         # 这仅是 UI 从最终 HTML 中截取冻结报价表的展示片段；正式报价事实仍由
         # OptionHelper designer-input 生成，GUI 不从这里提取字段、更不做二次计算。
+        active = self.active_quote_job
+        if active is not None and active.status == "running":
+            self.quote_preview.setHtml(
+                f"<p><b>正式报价生成中</b>（{active.job_id}）。研究报告已完成；"
+                "报价表将在 OptionHelper 返回并写入最终报告后显示。</p>"
+            )
+            return
         matched = re.search(r'(<section class="quote">.*?</section>)', html, flags=re.DOTALL)
         if matched:
             self.quote_preview.setHtml(matched.group(1))

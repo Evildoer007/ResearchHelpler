@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import base64
+import html
 import io
+import json
 import re
 
 from core.planner import SRC_SPINE
@@ -46,10 +48,25 @@ def _fig_to_datauri(fig) -> str:
     return f"data:image/png;base64,{b64}"
 
 
-def _img_html(fig) -> str:
+def _chart_meta_html(spec: dict) -> str:
+    """图下的最小可审计元信息。
+
+    图的标题负责说结论，图下这一行负责交代读者如何理解该结论。它不应靠
+    正文或页尾来源让读者猜样本、单位和截止日；但字号保持很小，避免把一页
+    通重新撑成两页。缺少的字段如实写“见底稿”，不伪造日期或样本口径。
+    """
+    as_of = str(spec.get("数据截至") or "见底稿")
+    unit = str(spec.get("单位") or "见坐标轴/数据卡")
+    scope = str(spec.get("样本口径") or "见底稿")
+    return (f'<div class="chart-meta">截至：{_esc(as_of)}｜单位：{_esc(unit)}'
+            f'｜样本：{_esc(scope)}</div>')
+
+
+def _img_html(fig, spec: dict | None = None) -> str:
     """把 figure 转成按 CSS_DPI 定宽的 <img>——宽度写死才能让字号与正文对齐。"""
     w = int(round(fig.get_figwidth() * CSS_DPI))
-    return f'<div class="chart"><img src="{_fig_to_datauri(fig)}" width="{w}"></div>'
+    meta = _chart_meta_html(spec or {})
+    return f'<div class="chart"><img src="{_fig_to_datauri(fig)}" width="{w}">{meta}</div>'
 
 
 def _units(pts: list) -> set[str]:
@@ -228,13 +245,127 @@ def _html_card_compare(spec: dict, pts: list) -> str | None:
     return f'<div class="htmlchart">{ttl}<div class="cc">{"".join(cards)}</div></div>'
 
 
+def _html_evidence_flow(spec: dict, pts: list) -> str | None:
+    """事件→传导→板块影响的原生 HTML 流程图。
+
+    这不是趋势图：节点间的箭头只表示已核验的传导链，不暗示数值上的连续变化。
+    每个数据点使用 {标签, 说明}，最多四步，以免一页通出现难以核对的大流程图。
+    """
+    nodes = []
+    for point in pts[:4]:
+        label = str(point.get("标签", "")).strip()
+        if not label:
+            continue
+        note = str(point.get("说明") or point.get("值") or "").strip()
+        nodes.append(
+            f'<div class="ef-node"><b>{_esc(label)}</b>'
+            f'{f"<span>{_esc(note)}</span>" if note else ""}</div>'
+        )
+    if len(nodes) < 2:
+        return None
+    ttl = f'<div class="c-title">{_esc(spec.get("标题", ""))}</div>' if spec.get("标题") else ""
+    return f'<div class="htmlchart">{ttl}<div class="evidence-flow">{"<i>→</i>".join(nodes)}</div></div>'
+
+
 _HTML_CHARTS = {"gauge": _html_gauge, "two_col": _html_two_col,
-                "card_compare": _html_card_compare}
+                "card_compare": _html_card_compare, "evidence_flow": _html_evidence_flow}
 
 
 #  排版型图渲染失败的记录，供缺口清单交代"这条为什么没有图"。
 #  静默失败是最难查的一类问题：图凭空消失，成品上看不出、日志里也没有。
 CHART_FALLBACKS: list[str] = []
+
+
+def _interactive_config(spec: dict) -> dict | None:
+    """把已通过图表规范的数列转为 ECharts 配置输入。
+
+    客户版 HTML 的交互层只接受本模块已经能安全静态渲染的数据关系：同字段时间
+    序列、同量纲横向比较、同一篮子的二维散点，以及程序受控的双轴比较。这里不
+    尝试从正文或模型文字推断坐标关系，避免把旧式的混量纲图以交互形式再画一遍。
+
+    返回的是极小的中间配置，而非任意 JavaScript；页面末尾的固定脚本再将其转换
+    为 ECharts option，因此图表标签中的文本不会被当作脚本执行。
+    """
+    pts = list(spec.get("数据点") or [])
+    typ = str(spec.get("类型") or "")
+    title = str(spec.get("标题") or "")
+    ylabel = str(spec.get("y轴") or "")
+
+    if typ == "scatter":
+        rows = [
+            {"name": str(p.get("标签") or ""), "x": _num(p.get("x")), "y": _num(p.get("y"))}
+            for p in pts
+        ]
+        rows = [r for r in rows if r["name"] and r["x"] is not None and r["y"] is not None]
+        if len(rows) < 5:
+            return None
+        return {"kind": "scatter", "title": title, "xlabel": str(spec.get("x轴") or ""),
+                "ylabel": ylabel, "points": rows, "highlight": str(spec.get("高亮") or "")}
+
+    if typ == "grouped_bar":
+        labels = [str(p.get("标签") or "") for p in pts]
+        series = []
+        for item in spec.get("系列") or []:
+            values = [_num(value) for value in (item.get("值") or [])]
+            if len(values) == len(labels) and all(value is not None for value in values):
+                series.append({"name": str(item.get("名称") or ""), "values": values})
+        if not labels or not series:
+            return None
+        return {"kind": "grouped_bar", "title": title, "ylabel": ylabel,
+                "labels": labels, "series": series[:3]}
+
+    if typ in {"hist_band", "line"}:
+        rows = [(str(p.get("标签") or ""), _num(p.get("值"))) for p in pts]
+        rows = [(label, value) for label, value in rows if label and value is not None]
+        valid_line = typ == "hist_band" or (
+            _ordered_time_labels([label for label, _ in rows])
+            and len(_units([p for p in pts if _num(p.get("值")) is not None])) == 1
+        )
+        if len(rows) < 2 or not valid_line:
+            return None
+        return {"kind": "line", "title": title, "ylabel": ylabel,
+                "labels": [label for label, _ in rows], "values": [value for _, value in rows]}
+
+    if typ in {"bar", "contribution_bar"}:
+        value_pts = [p for p in pts if _num(p.get("值")) is not None]
+        if len(value_pts) < 2 or len(_units(value_pts)) != 1:
+            return None
+        rows = [(str(p.get("标签") or ""), _num(p.get("值"))) for p in value_pts]
+        if typ == "contribution_bar":
+            rows.sort(key=lambda item: item[1])
+        return {"kind": "bar", "title": title, "ylabel": ylabel,
+                "labels": [label for label, _ in rows], "values": [value for _, value in rows]}
+
+    if typ == "bar_line" and spec.get("自动生成"):
+        rows = [(str(p.get("标签") or ""), _num(p.get("值")), _num(p.get("值2"))) for p in pts]
+        if not rows or any(first is None or second is None for _, first, second in rows):
+            return None
+        return {"kind": "bar_line", "title": title, "ylabel": ylabel,
+                "labels": [label for label, _, _ in rows],
+                "bars": [first for _, first, _ in rows], "lines": [second for _, _, second in rows],
+                "bar_name": str(spec.get("柱标签") or ""), "line_name": str(spec.get("线标签") or "")}
+    return None
+
+
+def _interactive_chart_wrapper(spec: dict, static_html: str) -> str:
+    """为可交互图保留静态打印回退。
+
+    浏览 HTML 时显示本地 ECharts；PDF/打印媒体强制显示同一数据生成的静态图。
+    即便报告被单独复制、相邻的本地 JS 文件缺失，页面也默认保留静态图，不会出现
+    空白图表位。
+    """
+    config = _interactive_config(spec)
+    if not config or not static_html:
+        return static_html
+    payload = html.escape(json.dumps(config, ensure_ascii=False, separators=(",", ":")), quote=True)
+    return (
+        '<div class="chart-switch">'
+        f'<div class="chart interactive-screen" data-rh-echarts="{payload}">'
+        '<div class="interactive-canvas" aria-label="可交互图表"></div>'
+        f'{_chart_meta_html(spec)}</div>'
+        f'<div class="chart-print">{static_html}</div>'
+        '</div>'
+    )
 
 
 def _one_chart(spec: dict, logic_id: str) -> str:
@@ -249,7 +380,7 @@ def _one_chart(spec: dict, logic_id: str) -> str:
         else:
             err = "数据点不符合该图型要求"
         if html:
-            return f'<div class="chart">{html}</div>'
+            return f'<div class="chart">{html}{_chart_meta_html(spec)}</div>'
         # **回退到数值型图，而不是直接放弃。** gauge 对数据点要求严
         # （值须是 0~100 的百分位、不得带量纲），writer 填错就整张图没了；
         # 而这些数据点本身是真实的，画成柱状图照样能用。
@@ -257,7 +388,8 @@ def _one_chart(spec: dict, logic_id: str) -> str:
         CHART_FALLBACKS.append(f"{logic_id}：{spec.get('类型')} → bar（{err}）")
         spec2 = dict(spec, 类型="bar")
         return _chart_for(type("X", (), {"图表规格": spec2})()) or ""
-    return _chart_for(type("X", (), {"图表规格": spec})()) or ""
+    static_html = _chart_for(type("X", (), {"图表规格": spec})()) or ""
+    return _interactive_chart_wrapper(spec, static_html)
 
 
 def _chart_block(lc) -> str:
@@ -303,11 +435,11 @@ def _chart_for(lc) -> str | None:
             # 倍与百分比同轴，柱高看着可比实则是两回事，属于"图对、含义错"。
             if len(nums) >= 3 and len(nums) == len(pts) and len(_units(pts)) == 1:
                 return _img_html(C.bar([r[0] for r in nums], [r[1] for r in nums],
-                                       title=spec.get("标题"), signed=True))
+                                       title=spec.get("标题"), signed=True), spec)
             cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
                       "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
                      for p in pts]
-            return _img_html(C.number_cards(cards))
+            return _img_html(C.number_cards(cards, title=spec.get("标题")), spec)
         if typ == "scatter":
             ps = [{"标签": str(p.get("标签", "")), "x": _num(p.get("x")), "y": _num(p.get("y"))}
                   for p in pts]
@@ -316,7 +448,7 @@ def _chart_for(lc) -> str | None:
                 return None
             return _img_html(C.scatter(ps, title=spec.get("标题"),
                                        xlabel=spec.get("x轴", ""), ylabel=spec.get("y轴", ""),
-                                       highlight=spec.get("高亮", "")))
+                                       highlight=spec.get("高亮", "")), spec)
         if typ == "grouped_bar":
             series = []
             for s in spec.get("系列") or []:
@@ -327,7 +459,7 @@ def _chart_for(lc) -> str | None:
             if not series or not labels:
                 return None
             return _img_html(C.grouped_bar(labels, series, title=spec.get("标题"),
-                                           ylabel=spec.get("y轴")))
+                                           ylabel=spec.get("y轴")), spec)
         if typ == "histogram":
             vals = [_num(p.get("值")) for p in pts]
             vals = [v for v in vals if v is not None]
@@ -335,10 +467,10 @@ def _chart_for(lc) -> str | None:
                 return None
             return _img_html(C.histogram(vals, current=_num(spec.get("当前值")),
                                          pctl=_num(spec.get("分位")),
-                                         title=spec.get("标题"), xlabel=spec.get("x轴", "")))
+                                         title=spec.get("标题"), xlabel=spec.get("x轴", "")), spec)
         if typ == "table":
             rows = [[p.get("标签", ""), p.get("值", "")] for p in pts]
-            return _img_html(C.table(["指标", "数值"], rows))
+            return _img_html(C.table(["指标", "数值"], rows, title=spec.get("标题")), spec)
         if typ == "hist_band":
             rows = [(str(p.get("标签", "")), _num(p.get("值"))) for p in pts]
             rows = [r for r in rows if r[1] is not None]
@@ -347,8 +479,8 @@ def _chart_for(lc) -> str | None:
             return _img_html(C.hist_band(
                 [r[0] for r in rows], [r[1] for r in rows],
                 title=spec.get("标题"), ylabel=spec.get("y轴"),
-                current=_num(spec.get("当前值")), pctl=_num(spec.get("分位"))))
-        if typ in ("bar", "line", "bar_line"):
+                current=_num(spec.get("当前值")), pctl=_num(spec.get("分位"))), spec)
+        if typ in ("bar", "contribution_bar", "line", "bar_line"):
             # 解析不出数值的点**整点丢弃**，绝不用 0 顶替（见 _num 的说明）
             rows = [(p.get("标签", ""), _num(p.get("值")), _num(p.get("值2")))
                     for p in pts]
@@ -366,15 +498,36 @@ def _chart_for(lc) -> str | None:
                     cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
                               "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
                              for p in pts]
-                    return _img_html(C.number_cards(cards, title=spec.get("标题")))
-                return _img_html(C.line(labels, vals, title=spec.get("标题")))
+                    return _img_html(C.number_cards(cards, title=spec.get("标题")), spec)
+                return _img_html(C.line(labels, vals, title=spec.get("标题"),
+                                        ylabel=spec.get("y轴")), spec)
+            if typ == "bar_line" and not spec.get("自动生成"):
+                # LLM 常把“ROE 与净利率”这种不同财务口径的当前/去年数值拼成柱线图；
+                # 双轴会制造不存在的联动关系。仅允许程序生成、且已知含义的双轴图。
+                CHART_FALLBACKS.append(f"{getattr(lc, '逻辑id', '?')}：bar_line → number_cards（非受控双轴比较）")
+                cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
+                          "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
+                         for p in pts]
+                return _img_html(C.number_cards(cards, title=spec.get("标题")), spec)
             if typ == "bar_line" and all(r[2] is not None for r in rows):
                 return _img_html(C.bar_line(
                     labels, vals, [r[2] for r in rows], title=spec.get("标题"),
-                    bar_label=spec.get("柱标签", ""), line_label=spec.get("线标签", "")))
+                    bar_label=spec.get("柱标签", ""), line_label=spec.get("线标签", "")), spec)
             # bar，以及 bar_line 缺第二列时的退化
+            # 横向比较的柱状图也必须同量纲。否则“PE、收益率、流入额”会以柱高
+            # 暗示可比关系；这正是过去那类错误图的另一种形态。
+            value_pts = [p for p in pts if _num(p.get("值")) is not None]
+            if typ != "bar_line" and len(_units(value_pts)) != 1:
+                CHART_FALLBACKS.append(f"{getattr(lc, '逻辑id', '?')}：{typ} → number_cards（横向指标量纲不一致）")
+                cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
+                          "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
+                         for p in pts]
+                return _img_html(C.number_cards(cards, title=spec.get("标题")), spec)
+            if typ == "contribution_bar":
+                return _img_html(C.contribution_bar(labels, vals, title=spec.get("标题"),
+                                                    ylabel=spec.get("y轴")), spec)
             return _img_html(C.bar(labels, vals, signed=True,
-                                         title=spec.get("标题")))
+                                   title=spec.get("标题"), ylabel=spec.get("y轴")), spec)
     except Exception:
         return None
     return None  # bubble/timeline 等待补
@@ -466,6 +619,30 @@ h1 .accent { color:var(--oh-brand-red); }
 .chart { text-align:center; margin:7px 0; }
 /* 宽度由 <img width> 按 CSS_DPI 定死，这里只兜底防溢出 */
 .chart img { max-width:100%; height:auto; }
+/* 屏幕版与打印版共用同一份已校验数列：
+   - HTML 打开后，本地 ECharts 提供缩放、悬停与数据查看；
+   - PDF / 打印仍使用静态 PNG，确保一页通版面与离线转发稳定。
+   默认先显示静态图；只有 JS 成功初始化后才切换，避免报告被单独复制时因缺少
+   assets/vendor/echarts.min.js 而留下空白区域。 */
+.interactive-screen { display:none; }
+.chart-print { display:block; }
+/* ECharts 不能在 display:none 的容器里初始化，否则拿到的宽度接近 0，显示后
+   会挤成一条窄图。准备阶段让容器参与布局但不绘到屏幕；每张图初始化成功后
+   只切换自己的 wrapper，某一张失败时仍保留对应的静态图。 */
+.rh-echarts-preparing .interactive-screen { display:block; visibility:hidden; }
+.chart-switch.rh-echarts-item-ready .interactive-screen { display:block; visibility:visible; }
+.chart-switch.rh-echarts-item-ready .chart-print { display:none; }
+.interactive-canvas { width:100%; height:178px; background:var(--oh-surface); }
+.interactive-screen .chart-meta { margin-top:3px; }
+.chart-switch { margin:7px 0; min-width:0; }
+@media print {
+  .interactive-screen { display:none !important; }
+  .chart-print { display:block !important; }
+  .chart-switch.rh-echarts-item-ready .chart-print { display:block !important; }
+}
+/* 图题说结论，这一行只说审计口径；7.5px 是在一页预算内仍可辨认的下限。 */
+.chart-meta { margin-top:1px; font-size:7.5px; line-height:1.25; color:var(--oh-muted);
+              text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 /* 一条逻辑配 2~3 张图时并排显示（而非竖向堆叠），省纵向版面。
    每张图已收窄到正文宽的 53~74%，故用 wrap 而非硬挤一行——
    两张通常并得下，第三张若挤不下会自动换到下一行，不会溢出页面。 */
@@ -476,8 +653,9 @@ h1 .accent { color:var(--oh-brand-red); }
    图内文字仍清晰）；三张时第三张换行，靠 max-width 防止它被拉满整行。 */
 .chart-row { display:flex; flex-wrap:wrap; justify-content:center; gap:6px; margin:7px 0;
              align-items:flex-start; }
-.chart-row .chart, .chart-row .htmlchart { margin:0; flex:1 1 340px; min-width:0; max-width:400px; }
+.chart-row .chart, .chart-row .htmlchart, .chart-row .chart-switch { margin:0; flex:1 1 340px; min-width:0; max-width:400px; }
 .chart-row .chart img { width:100%; height:auto; }
+.chart-row .chart-switch .chart-print .chart { margin:0; }
 
 /* ---- HTML 原生图表（排版型，不走 matplotlib）---- */
 /* 限宽并居中，与 matplotlib 图的显示宽度（约 55~70% 正文宽）保持一致，
@@ -485,6 +663,14 @@ h1 .accent { color:var(--oh-brand-red); }
 .htmlchart { text-align:left; border:1px solid var(--oh-rule); background:var(--oh-surface); padding:10px 12px;
              max-width:560px; margin:0 auto; font-size:12px; }
 .c-title { font-size:11px; font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red); text-align:center; margin-bottom:7px; }
+
+/* 事件证据链：箭头只表达已核验的传导顺序，卡片本身不做因果强度或概率暗示。 */
+.evidence-flow { display:flex; align-items:stretch; justify-content:center; gap:5px; }
+.ef-node { flex:1 1 0; min-width:0; padding:5px 6px; border:1px solid var(--oh-red-border-soft);
+           background:var(--oh-red-surface); text-align:left; }
+.ef-node b { display:block; color:var(--oh-ink); font-size:9px; line-height:1.25; }
+.ef-node span { display:block; color:var(--oh-muted); font-size:8px; line-height:1.25; margin-top:2px; }
+.evidence-flow i { align-self:center; color:var(--oh-brand-red); font-size:14px; font-style:normal; }
 
 /* 分位标尺 */
 .g-row { margin:10px 0; }
@@ -561,6 +747,118 @@ h1 .accent { color:var(--oh-brand-red); }
 
 _CN_NUM = ["一", "二", "三", "四", "五", "六"]
 
+
+def _echarts_assets() -> str:
+    """返回客户版 HTML 的离线交互图运行层。
+
+    不能用 CDN：一页通通常在内网或断网环境中打开。ECharts 文件与报告输出目录
+    同属项目根目录，故报告位于 ``output/`` 时相对引用为 ``../assets/vendor/``。
+    运行层不调用网络、不重新取数，只把 Python 侧校验过的中间配置画出来。
+    """
+    return r'''<script src="../assets/vendor/echarts.min.js"></script>
+<script>
+(() => {
+  if (!window.echarts) return;
+  const red = '#C8102E', blue = '#49647D', muted = '#6E5F63', grid = '#E9DADC';
+  const rendered = [];
+  const title = (text) => ({ text: text || '', left: 'center', top: 2,
+    textStyle: { color: '#241D20', fontSize: 10, fontWeight: 700,
+      width: 310, overflow: 'truncate', ellipsis: '…' } });
+  const common = (config) => ({
+    title: title(config.title),
+    grid: { left: 14, right: 14, top: 30, bottom: 24, containLabel: true },
+    tooltip: { trigger: config.kind === 'scatter' ? 'item' : 'axis', confine: true },
+    textStyle: { fontFamily: 'Source Han Sans SC, Noto Sans CJK SC, sans-serif' },
+    animationDuration: 240,
+  });
+  const lineOption = (config) => {
+    const option = common(config);
+    option.xAxis = { type: 'category', boundaryGap: false, data: config.labels,
+      axisLabel: { color: muted, fontSize: 8, hideOverlap: true }, axisLine: { lineStyle: { color: grid } } };
+    option.yAxis = { type: 'value', name: config.ylabel || '', nameTextStyle: { color: muted, fontSize: 8 },
+      axisLabel: { color: muted, fontSize: 8 }, splitLine: { lineStyle: { color: grid } } };
+    option.series = [{ type: 'line', name: config.ylabel || '数值', data: config.values,
+      showSymbol: false, smooth: false, lineStyle: { color: red, width: 2 },
+      areaStyle: { color: 'rgba(200,16,46,.10)' } }];
+    if (config.labels.length > 18) option.dataZoom = [{ type: 'inside', start: 72, end: 100 },
+      { type: 'slider', height: 12, bottom: 2, start: 72, end: 100 }];
+    return option;
+  };
+  const barOption = (config) => {
+    const option = common(config);
+    option.xAxis = { type: 'category', data: config.labels, axisLabel: { color: muted, fontSize: 8,
+      interval: 'auto', hideOverlap: true, formatter: value => String(value).length > 7 ? `${String(value).slice(0, 7)}…` : value },
+      axisLine: { lineStyle: { color: grid } } };
+    option.yAxis = { type: 'value', name: config.ylabel || '', nameTextStyle: { color: muted, fontSize: 8 },
+      axisLabel: { color: muted, fontSize: 8 }, splitLine: { lineStyle: { color: grid } } };
+    option.series = [{ type: 'bar', data: config.values.map(value => ({ value, itemStyle: { color: value < 0 ? blue : red } })),
+      barMaxWidth: 30, label: { show: true, position: 'top', color: '#44383C', fontSize: 8,
+      formatter: item => String(item.value) } }];
+    return option;
+  };
+  const groupedOption = (config) => {
+    const option = common(config);
+    option.legend = { top: 18, textStyle: { color: muted, fontSize: 8 } };
+    option.grid.top = 48;
+    option.xAxis = { type: 'category', data: config.labels, axisLabel: { color: muted, fontSize: 8,
+      interval: 'auto', hideOverlap: true, formatter: value => String(value).length > 7 ? `${String(value).slice(0, 7)}…` : value } };
+    option.yAxis = { type: 'value', name: config.ylabel || '', axisLabel: { color: muted, fontSize: 8 },
+      splitLine: { lineStyle: { color: grid } } };
+    option.series = config.series.map((series, index) => ({ type: 'bar', name: series.name || `系列${index + 1}`,
+      data: series.values, barMaxWidth: 24, itemStyle: { color: [red, blue, '#855E22'][index] } }));
+    return option;
+  };
+  const scatterOption = (config) => {
+    const option = common(config);
+    option.xAxis = { type: 'value', name: config.xlabel || '', nameTextStyle: { color: muted, fontSize: 8 },
+      axisLabel: { color: muted, fontSize: 8 }, splitLine: { lineStyle: { color: grid } } };
+    option.yAxis = { type: 'value', name: config.ylabel || '', nameTextStyle: { color: muted, fontSize: 8 },
+      axisLabel: { color: muted, fontSize: 8 }, splitLine: { lineStyle: { color: grid } } };
+    option.tooltip = { trigger: 'item', confine: true, formatter: item => `${item.data.name}<br/>${config.xlabel || 'x'}：${item.value[0]}<br/>${config.ylabel || 'y'}：${item.value[1]}` };
+    option.series = [{ type: 'scatter', data: config.points.map(point => ({ name: point.name, value: [point.x, point.y],
+      symbolSize: point.name === config.highlight ? 13 : 8,
+      itemStyle: { color: point.name === config.highlight ? '#890D26' : red, opacity: .72 } })),
+      label: { show: false } }];
+    return option;
+  };
+  const barLineOption = (config) => {
+    const option = barOption({ ...config, values: config.bars });
+    option.legend = { top: 18, textStyle: { color: muted, fontSize: 8 } };
+    option.grid.top = 48;
+    option.series[0].name = config.bar_name || '柱状指标';
+    option.series.push({ type: 'line', name: config.line_name || '线状指标', data: config.lines,
+      yAxisIndex: 1, showSymbol: true, symbolSize: 5, lineStyle: { color: '#241D20', width: 1.8 },
+      itemStyle: { color: '#241D20' } });
+    option.yAxis = [option.yAxis, { type: 'value', axisLabel: { color: muted, fontSize: 8 },
+      splitLine: { show: false } }];
+    return option;
+  };
+  const holders = [...document.querySelectorAll('[data-rh-echarts]')];
+  if (!holders.length) return;
+  document.documentElement.classList.add('rh-echarts-preparing');
+  requestAnimationFrame(() => {
+    for (const holder of holders) {
+      try {
+        const config = JSON.parse(holder.dataset.rhEcharts);
+        const canvas = holder.querySelector('.interactive-canvas');
+        if (!canvas) continue;
+        const options = { line: lineOption, bar: barOption, grouped_bar: groupedOption,
+          scatter: scatterOption, bar_line: barLineOption };
+        if (!options[config.kind]) continue;
+        const chart = echarts.init(canvas, null, { renderer: 'canvas' });
+        chart.setOption(options[config.kind](config), true);
+        const wrapper = holder.closest('.chart-switch');
+        if (wrapper) wrapper.classList.add('rh-echarts-item-ready');
+        rendered.push(chart);
+      } catch (_) { /* 该图继续显示静态回退，不阻断整页。 */ }
+    }
+    document.documentElement.classList.remove('rh-echarts-preparing');
+    requestAnimationFrame(() => rendered.forEach(chart => chart.resize()));
+  });
+  window.addEventListener('resize', () => rendered.forEach(chart => chart.resize()));
+})();
+</script>'''
+
 # 核心结论缺失时**明写出来**，而不是渲染成一个空框。空框在成品上看不出是"模型漏写"
 # 还是"本来就没有"，隔几天回头看更判断不了；写明缺失才符合"如实标记、绝不代笔"。
 _MISSING_CONCL = "（核心结论缺失：撰写与补写两轮均未产出，需人工补写后再交付）"
@@ -632,14 +930,19 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None
     if quote_html:
         sections.append(quote_html)
 
+    body_html = ''.join(sections)
+    # 只有本页确有合规的可交互数列才引用本地 ECharts。无图报告保持完全自包含；
+    # 有图报告则仍保有静态回退，便于单独转发与 PDF 一页交付。
+    interactive_assets = _echarts_assets() if 'data-rh-echarts=' in body_html else ''
+
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>{_CSS}</style></head><body>
     <div class="page">
       <h1>场外衍生品投资策略 <span class="accent">—— {ma.plan.主题}</span></h1>
       <div class="sub">策略研究 · {date}</div>
       <div class="concl"><span class="lbl">核心结论</span>{rc.核心结论 or _MISSING_CONCL}</div>
-      {''.join(sections)}
+      {body_html}
       {_footer_block(ma)}
-    </div></body></html>"""
+    </div>{interactive_assets}</body></html>"""
 
 
 def _underlying_block(ma, rc, oh=None) -> str:
@@ -678,7 +981,8 @@ def _underlying_block(ma, rc, oh=None) -> str:
     if pkg.波动率看法:
         rows.append(pkg.波动率看法)
     head = "　｜　".join(rows)
-    body = (f'<div class="u-why"><b>选取原因</b>：{_esc(理由)}</div>' if 理由 else "")
+    body = (f'<div class="u-why"><b>与研究主题的关联及选取原因</b>：{_esc(理由)}</div>'
+            if 理由 else "")
 
     return (f'<div class="under"><div class="u-line"><span class="lbl">挂钩标的</span>'
             f'<span class="u-main">{head}</span></div>{body}</div>')

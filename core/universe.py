@@ -55,7 +55,10 @@ def analysis_basket(sector: str, constituents: list["Leader"]):
     退出时恢复原状。`fetch_profile` 用它把 ETF 真实成分喂给整条聚合链路，
     使"当前 PB"与"历史 PB 序列"、板块快照、各分位字段算的都是**同一个真实篮子**。
     """
-    key = resolve_sector(sector) if sector else ""
+    # 细分主题（例如“光模块”）有自己的可核验公司篮子时，必须保留这个原始键。
+    # 若先 resolve_sector("光模块") → "通信设备"，后续就会把主题篮子悄悄扩成
+    # 通信设备行业或某只通信 ETF 的全部成分，正是本轮用户发现的口径错配。
+    key = (sector or "").strip()
     if not key or not constituents:
         yield
         return
@@ -76,7 +79,8 @@ def has_basket_override(sector: str) -> bool:
     aggregate/history 用它决定**跳过按板块名缓存**——ETF 真实篮子算出的结果不能
     和 iwencai 行业篮子算出的结果共用一个缓存键，否则两者会互相污染。
     """
-    return bool(sector) and resolve_sector(sector) in _BASKET_OVERRIDE
+    raw = (sector or "").strip()
+    return bool(raw) and (raw in _BASKET_OVERRIDE or resolve_sector(raw) in _BASKET_OVERRIDE)
 
 
 def etf_constituents(etf_code: str, *, provider=None, use_cache: bool = True) -> list["Leader"]:
@@ -520,7 +524,12 @@ def sector_leaders(
         merged = sorted(pool.values(), key=lambda x: x.总市值 or 0, reverse=True)
         return merged[:top]
 
-    sector = resolve_sector(sector)
+    # 先查原始主题键，才允许解析成一级行业。主题篮子是一次运行内的显式契约，
+    # 不应被“概念 → 行业”的通用兜底覆盖。
+    raw_sector = (sector or "").strip()
+    if raw_sector in _BASKET_OVERRIDE:
+        return list(_BASKET_OVERRIDE[raw_sector])[:top]
+    sector = resolve_sector(raw_sector)
 
     # 分析对象是 ETF 时，成分股锁定为它真实跟踪指数的成分（#85）。直接返回，
     # 不走 iwencai、不读写按板块名的缓存——ETF 真实篮子与行业分类篮子不能混。

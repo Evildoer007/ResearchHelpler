@@ -35,6 +35,7 @@ from __future__ import annotations
 import sys
 import warnings
 import json
+from dataclasses import asdict
 from pathlib import Path
 
 # 终端输出含 ✓ ✗ ⚠ 与中文，而 Windows 控制台/重定向默认走 GBK，
@@ -246,6 +247,17 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
         tracker.add_artifact("研究报告", out)
         tracker.add_artifact("内部底稿", gap_path)
 
+    interactive_path, interactive_error = _write_interactive_review(ma, rc, out)
+    if interactive_path:
+        print(f"  ✓ 内部交互复核：{interactive_path}")
+        if tracker:
+            tracker.add_artifact("内部交互复核", interactive_path)
+    elif interactive_error:
+        # 不把一份辅助复核页的错误升级为研究交付失败，但必须留下可读诊断。
+        print(f"  ⚠ 未生成内部交互复核：{interactive_error}")
+        if tracker:
+            tracker.add_metadata("内部交互复核", f"未生成：{interactive_error}")
+
     # PDF 页数是“一页通”正式交付的硬门：HTML 可无限滚动，不能替代真实打印结果。
     # 不导出 PDF 的运行仍保留研究 HTML，但只能算内部草稿；绝不能把“没有测过”写成“一页”。
     if _WANT_PDF:
@@ -319,6 +331,25 @@ def _write_report_artifacts(ma, rc, vr, title: str, oh_result,
     _write_research_html(ma, rc, out, oh_result=oh_result)
     gap_path = gaps.write_gap_report(ma, rc, vr, title=title, html_path=out, oh_result=oh_result)
     return out, gap_path
+
+
+def _interactive_review_path(report_path: str) -> str:
+    path = Path(report_path)
+    return str(path.with_name(f"{path.stem}_内部交互复核.html"))
+
+
+def _write_interactive_review(ma, rc, report_path: str) -> tuple[str, str]:
+    """生成非阻断的分析师交互复核页。
+
+    它只复用本次已经确认的数据；pyecharts 或本地 JS 缺失不能影响客户版 HTML、
+    内部底稿和 PDF 的交付。
+    """
+    try:
+        from render.interactive import render_internal_review
+        path = render_internal_review(ma, rc, _interactive_review_path(report_path))
+        return path, ""
+    except Exception as error:
+        return "", f"{type(error).__name__}: {error}"
 
 
 def _ask_picks(prepared) -> list[str] | None:
@@ -473,6 +504,9 @@ def generate_from_brief(text: str, *, pick: bool = False,
                 checked = market_confirmation.verify(value, b, provider=provider)
             if not checked.ok:
                 payload["errors"] = checked.errors
+                # 重新弹窗时保留分析师刚才的选择；代码采用后端规范化后的值，
+                # 例如 516520.SS 会显示为 iFinD 使用的 516520.SH。
+                payload["previous_confirmation"] = asdict(value)
                 print("MARKET_CONFIRMATION_REJECTED=" + json.dumps(
                     {"errors": checked.errors}, ensure_ascii=False), flush=True)
                 continue
