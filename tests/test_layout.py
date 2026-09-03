@@ -3,10 +3,20 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from render.layout import CHART_FALLBACKS, _chart_for, _echarts_assets, _one_chart, _ordered_time_labels
+from render.layout import (
+    CHART_FALLBACKS, _chart_for, _echarts_assets, _one_chart, _ordered_time_labels,
+    _report_title, multi_quote_block,
+)
 
 
 class ChartAxisTests(unittest.TestCase):
+    def test_delivery_title_prefers_full_report_title_over_research_scope(self) -> None:
+        analysis = SimpleNamespace(
+            报告标题="基于A股汽车电子产业智能化加速的投资机会",
+            plan=SimpleNamespace(主题="汽车电子"),
+        )
+        self.assertEqual(_report_title(analysis), "基于A股汽车电子产业智能化加速的投资机会")
+
     def test_metric_names_are_not_treated_as_a_trend_axis(self) -> None:
         self.assertFalse(_ordered_time_labels(["PB历史分位", "归母净利同比", "板块区间涨跌幅"]))
 
@@ -98,3 +108,46 @@ class ChartAxisTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             self.assertIn("结构推荐**：已完成", text)
             self.assertIn("正式参考报价**：尚未发起", text)
+
+    def test_selected_multi_underlying_quotes_keep_each_identity_and_frozen_columns(self) -> None:
+        html = multi_quote_block([
+            {
+                "underlying": "515880.SH", "product_name": "看涨期权", "product_id": "call",
+                "reason": "看涨观点", "quote_date": "2026-09-02",
+                "groups": [{"title": "参考报价", "columns": [
+                    {"key": "term", "label": "期限"}, {"key": "price", "label": "期权费"},
+                ], "rows": [{"term": "3个月", "price": "5%"}]}],
+            },
+            {
+                "underlying": "300750.SZ", "product_name": "看跌期权", "product_id": "put",
+                "reason": "风险对冲", "quote_date": "2026-09-02",
+                "groups": [{"title": "参考报价", "columns": [
+                    {"key": "term", "label": "期限"}, {"key": "price", "label": "期权费"},
+                ], "rows": [{"term": "1个月", "price": "3%"}]}],
+            },
+        ])
+        self.assertIn("已选产品 · 参考报价", html)
+        self.assertIn("515880.SH｜看涨期权（call）", html)
+        self.assertIn("300750.SZ｜看跌期权（put）", html)
+        self.assertIn("<th scope=\"col\">期权费</th>", html)
+
+    def test_multi_quote_gap_records_all_analyst_selected_quotes(self) -> None:
+        from render.gaps import refresh_optionhelper_multi_result
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "draft.md"
+            path.write_text(
+                "## 三、OptionHelper 正式参考报价调用结果\n\n（本次未调用）\n\n---\n\n## 四、缺口\n",
+                encoding="utf-8",
+            )
+            entries = [
+                {"underlying": "515880.SH", "product_name": "看涨期权", "groups": [{"rows": [{}, {}]}],
+                 "report_path": "C:/quote-a.html"},
+                {"underlying": "300750.SZ", "product_name": "看跌期权", "groups": [{"rows": [{}]}],
+                 "report_path": "C:/quote-b.html"},
+            ]
+            self.assertTrue(refresh_optionhelper_multi_result(path, entries, html_path="C:/onepager.html"))
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("分析师选择 2 份写入一页通", text)
+            self.assertIn("515880.SH", text)
+            self.assertIn("300750.SZ", text)

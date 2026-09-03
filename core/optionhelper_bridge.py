@@ -192,7 +192,8 @@ def missing_setup() -> list[str]:
 
 
 def build_prompt(vp: ViewPackage, client_constraints: Mapping[str, Any] | None = None,
-                 client_product_intent: str = "") -> str:
+                 client_product_intent: str = "",
+                 product_profile: Mapping[str, Any] | None = None) -> str:
     """只描述已验证市场状态；不向 OptionHelper 夹带产品或条款建议。"""
     lines: list[str] = []
     if vp.标的名称:
@@ -252,13 +253,22 @@ def build_prompt(vp: ViewPackage, client_constraints: Mapping[str, Any] | None =
     if client_product_intent:
         lines.append("客户已提出的产品诉求（独立于市场研究，须经 Recommender 与合规校验，不构成研究建议）："
                      + client_product_intent)
+    if product_profile:
+        # 画像是 Research Helper 在结构推荐前按统一口径取得的标的事实；它不能替代
+        # OptionHelper 正式报价阶段的实时行情、波动率曲面、利率及日历取数。
+        from .product_profile import render_for_prompt
+
+        rendered_profile = render_for_prompt(product_profile)
+        if rendered_profile:
+            lines.append(rendered_profile)
     lines.append("以上市场部分不包含产品、结构或执行价建议；客户约束单独列示，不由研究层推导。")
     return "\n".join(lines)
 
 
 def recommend(vp: ViewPackage, *, project_root: str | Path | None = None,
               client_constraints: Mapping[str, Any] | None = None,
-              client_product_intent: str = "") -> OptionHelperRecommendation:
+              client_product_intent: str = "",
+              product_profile: Mapping[str, Any] | None = None) -> OptionHelperRecommendation:
     """运行最新版 Skill 的 Recommender，返回候选而不写 pending selection、不报价。"""
     root = Path(project_root).resolve() if project_root else _PROJECT_ROOT
     missing = missing_setup()
@@ -279,7 +289,7 @@ def recommend(vp: ViewPackage, *, project_root: str | Path | None = None,
     payload = {
         "skill_root": str(Path(config.OPTIONHELPER_SKILL_ROOT).resolve()),
         "project_root": str(root),
-        "prompt": build_prompt(vp, constraints, client_product_intent),
+        "prompt": build_prompt(vp, constraints, client_product_intent, product_profile),
         "constraints": constraints,
     }
     env = dict(os.environ)

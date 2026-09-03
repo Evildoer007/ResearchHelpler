@@ -32,6 +32,7 @@ _THEME_BASKET_MAX = 20
 # 这是检索语言，不是“主题→基金代码”白名单。它只补充行业中常见、且业务暴露
 # 直接相关的表达；证券事实仍必须由 iFinD 官方简称、跟踪指数和流动性校验。
 _ETF_SEARCH_ALIASES: dict[str, tuple[str, ...]] = {
+    "消费电子": ("消费电子", "智能终端", "电子"),
     "汽车电子": ("汽车电子", "智能驾驶", "智能汽车", "车联网", "汽车智能化"),
     "智能驾驶": ("智能驾驶", "智能汽车", "汽车电子", "车联网"),
     "智能汽车": ("智能汽车", "智能驾驶", "汽车电子", "车联网"),
@@ -57,8 +58,8 @@ class Confirmation:
     research_theme: str = ""         # 细分研究主题；放在末尾以兼容旧位置参数
     theme_basket_codes: list[str] = field(default_factory=list)  # 分析师确认的本次主题公司篮子
     theme_basket_confirmed: bool = False
-    # industry=按标准行业/人工主题篮子研究；theme_etf=不强迫细分主题冒充标准行业，
-    # 直接以已核验主题 ETF 的真实成分作为研究篮子。
+    # industry=按数据源标准行业成分研究；theme_basket=按分析师确认的主题公司篮子
+    # 研究；theme_etf=按已核验主题 ETF 的真实成分研究。三者不能混用。
     research_mode: str = "industry"
 
     @property
@@ -102,16 +103,19 @@ def validate(value: Confirmation) -> list[str]:
     errors: list[str] = []
     if value.market not in MARKETS:
         errors.append("市场范围必须是 A股、港股或跨市场")
-    if value.research_mode not in {"industry", "theme_etf"}:
-        errors.append("研究取数路径必须是标准行业或主题 ETF")
+    if value.research_mode not in {"industry", "theme_basket", "theme_etf"}:
+        errors.append("研究取数路径必须是标准行业、人工主题篮子或主题 ETF")
     if not value.research_scope.strip():
         errors.append("必须确认研究口径")
     elif _INVALID_SCOPE_RE.fullmatch(value.research_scope.strip()):
         errors.append("研究口径不能只是数字或符号")
-    if not value.research_only and not value.underlying_code.strip():
-        errors.append("必须选择挂钩标的，或明确选择仅研究")
+    # 行业研究与产品报价是两件事：标准行业路径可以先完成研究，再在正式报价
+    # 阶段选择挂钩工具。只有主题 ETF 路径需要 ETF 的真实成分作为研究数据源，
+    # 因而必须在这里确定代码。
     if value.research_mode == "theme_etf" and not value.underlying_code.strip():
         errors.append("主题 ETF 取数路径必须选择一只经校验的 ETF")
+    if value.research_mode == "theme_basket" and not value.theme_basket_codes:
+        errors.append("人工主题篮子取数路径必须至少选择一只已核验主题公司")
     return errors
 
 
@@ -124,8 +128,15 @@ def needs_confirmation(brief) -> bool:
     # “选 ETF + 主题公司篮子”的确认页没有新增决策价值，反而可能把报告标题
     # 当成问财概念股检索词，混进无关公司。
     # 白名单外代码仍须走确认页和数据源核验，绝不因“像 ETF 代码”而放行。
-    if _explicit_catalogued_etf(brief):
+    # 客户若只点名 ETF，ETF 已经同时限定研究对象和潜在挂钩工具，确认页没有
+    # 新的研究决策价值；但“ETF + 若干个股”是两条并行输入：ETF 不能吞掉
+    # 客户明确要求研究的公司篮子，仍须展示给分析师确认。
+    if _explicit_catalogued_etf(brief) and not _explicit_stock_codes(brief):
         return False
+    # 客户点名个股时，必须展示并确认研究篮子；不能由系统静默决定哪些公司
+    # 参与整体法聚合，即使该需求本身不是传统的“高风险主题”。
+    if _explicit_stock_codes(brief):
+        return True
     sectors = list(getattr(brief, "涉及板块", []) or [])
     parts = list(getattr(brief, "宽口径成分行业", []) or [])
     if len(sectors) > 1 or len(parts) > 1:
@@ -150,6 +161,22 @@ def _explicit_catalogued_etf(brief) -> str:
         if item is not None and "ETF" in item.类型.upper():
             return code
     return ""
+
+
+def _explicit_stock_codes(brief) -> list[str]:
+    """返回客户原文明确写出的 A 股个股代码（不含 ETF）。
+
+    这只负责判断客户是否提出了“公司研究篮子”的明确输入，证券真实性仍由
+    ``brief.parse`` 的代码核验链处理。不能只看 ``候选标的``，否则 LLM 漏掉
+    客户点名公司时，又会被误判成“仅 ETF 需求”。
+    """
+    raw = str(getattr(brief, "原始需求", "") or "")
+    codes: list[str] = []
+    for match in _ETF_CODE_RE.finditer(raw):
+        code = match.group(0).upper()
+        if not universe._is_fund(code) and code not in codes:
+            codes.append(code)
+    return codes
 
 
 def _normalize_code(value: object) -> str:
@@ -221,7 +248,10 @@ def _proposed_theme(brief) -> str:
     """
     text = " ".join([str(getattr(brief, "原始需求", "") or ""),
                      str(getattr(brief, "主题", "") or "")])
-    for word in ("汽车电子", "智能驾驶", "智能汽车", "光模块", "光通信", "黄金",
+    # 先处理由两个细分环节共同构成的主题，避免在确认页只留下其中一个关键词。
+    if "固态电池" in text and "锂电池" in text:
+        return "锂电池与固态电池"
+    for word in ("固态电池", "锂电池", "电池", "汽车电子", "消费电子", "智能驾驶", "智能汽车", "光模块", "光通信", "黄金",
                  "白银", "原油", "创新药", "券商", "证券", "白酒", "酒", "消费",
                  "半导体", "人工智能", "算力"):
         if word.lower() in text.lower():
@@ -234,6 +264,7 @@ def _discovery_keywords(brief) -> tuple[str, ...]:
     terms = list(_discovery_terms(brief))
     # 排序词可比实际请求略宽，但不能宽到“科技/电子”这种几乎什么都能命中的词。
     extras = {
+        "消费电子": ("智能终端",),
         "创新药": ("医疗",),
         "黄金": ("上海金", "贵金属"),
         "光模块": ("光通信", "通信设备", "通信"),
@@ -479,18 +510,34 @@ def discover_theme_companies(brief, *, provider: DataProvider | None = None,
 
 def _theme_basket_candidates(brief, *, provider: DataProvider | None = None) -> list[dict]:
     """仅为“细分主题→标准行业”模式生成公司研究篮子。"""
-    if _explicit_catalogued_etf(brief):
+    explicit_stock_codes = _explicit_stock_codes(brief)
+    if _explicit_catalogued_etf(brief) and not explicit_stock_codes:
         return []
     proposed_theme = _proposed_theme(brief)
     proposed_scope = "、".join(getattr(brief, "宽口径成分行业", []) or
                                  getattr(brief, "涉及板块", []) or [])
     scope_parts = {part.strip() for part in _SPLIT_RE.split(proposed_scope) if part.strip()}
-    # 普通行业、以及未能明确识别细分主题的需求，直接走行业/ETF 成分口径；
-    # 不能把 LLM 给出的候选个股重新贴成“主题核心样本”。
-    if not proposed_theme or not proposed_scope or proposed_theme in scope_parts:
-        return []
     out: list[dict] = []
     known: set[str] = set()
+
+    # 用户点名的公司不依赖 LLM 是否复述，也不依赖问财是否刚好收录这个主题词。
+    # 这些公司已在 Brief 解析阶段逐只完成“代码存在 + 简称匹配”校验；确认页要把
+    # 它们作为可删减、默认勾选的核心样本展示，而不是被同一需求中的 ETF 遮蔽。
+    by_code = {str(getattr(item, "代码", "") or "").upper(): item
+               for item in (getattr(brief, "候选标的", []) or [])}
+    for code in explicit_stock_codes:
+        item = by_code.get(code)
+        if item is None or not getattr(item, "可用", False):
+            continue
+        out.append({"code": code, "name": item.名称, "origin": "客户点名（已核验）",
+                    "note": "客户在原始需求中明确列示的个股，代码与简称已核验",
+                    "core": True})
+        known.add(code)
+
+    # 普通行业、以及未能明确识别细分主题的需求，仍不把 LLM 自行给出的候选个股
+    # 伪装成主题核心样本；但上面的“客户点名”样本必须保留。
+    if not proposed_theme or not proposed_scope or proposed_theme in scope_parts:
+        return out
     for item in (getattr(brief, "候选标的", []) or []):
         code = str(getattr(item, "代码", "") or "").upper()
         if not code or not getattr(item, "可用", False) or universe._is_fund(code) or code in known:
@@ -596,6 +643,12 @@ def proposal(brief, *, provider: DataProvider | None = None) -> dict:
         "theme_basket_candidates": basket_candidates,
         "theme_basket_min": _THEME_BASKET_MIN,
         "theme_basket_max": _THEME_BASKET_MAX,
+        # 三条路径互斥：有需人工确认的细分主题公司时走主题篮子；主题本身就是
+        # 数据源已验证行业时直接走行业成分；只有没有可用行业/篮子时才建议 ETF。
+        "recommended_research_mode": (
+            "theme_basket" if basket_candidates
+            else ("industry" if scope_options else ("theme_etf" if proposed_theme else "industry"))
+        ),
         "reason": getattr(brief, "板块理由", ""),
         "suggested_instruments": suggested,
         "discovery_notice": discovery_note,
@@ -635,15 +688,19 @@ def _exposure_matches(scope: str, item: instruments.Instrument, actual_name: str
         "光通信": ("光通信", "光模块", "通信设备", "通信", "5g"),
         "半导体": ("半导体", "芯片"),
         "通信": ("通信", "5g"),
+        "消费电子": ("消费电子", "智能终端", "电子"),
         "消费": ("消费", "食品", "酒", "家电"),
         "黄金": ("黄金", "上海金", "贵金属", "商品"),
         "贵金属": ("黄金", "白银", "贵金属", "上海金", "商品"),
         "原油": ("原油", "能源", "商品"),
     }
     scope_lower = scope.lower()
-    for key, words in aliases.items():
-        if key in scope_lower and any(word.lower() in text for word in words):
-            return True
+    # 只使用命中的最长主题规则。“消费电子”若继续落到更宽的“消费”规则，白酒、
+    # 酒店 ETF 也会被误判为有直接暴露，正是主题被截短时的同类错误。
+    matched_keys = [key for key in aliases if key in scope_lower]
+    if matched_keys:
+        key = max(matched_keys, key=len)
+        return any(word.lower() in text for word in aliases[key])
     tokens = [x for x in re.split(r"[\s、,，产业链板块主题]+", scope_lower) if len(x) >= 2]
     return any(token in text for token in tokens)
 
@@ -661,7 +718,7 @@ def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = N
         value.research_scope, str(getattr(brief, "原始需求", "") or ""),
     ])))
     if value.market == "A股":
-        if value.research_mode == "industry" and not commodity_scope:
+        if value.research_mode in {"industry", "theme_basket"} and not commodity_scope:
             to_check = [name for name in industries if not universe.is_broad(name)]
             if to_check:
                 _ok, bad = universe.validate_industries(to_check, provider=provider)
@@ -673,7 +730,7 @@ def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = N
         if not any(name in raw or name in topic for name in industries):
             result.errors.append("港股/跨市场研究口径必须能在原始需求中找到依据")
 
-    if brief is not None and value.theme_basket_codes:
+    if brief is not None and value.research_mode == "theme_basket" and value.theme_basket_codes:
         # 主题篮子只能从本次确认页展示、且已核验过代码的候选中选择。这样既允许动态
         # 发现白名单外公司，也不会让 UI 回传任意股票混入整体法聚合。
         pool = list(getattr(brief, "主题篮子候选池", []) or
@@ -686,6 +743,12 @@ def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = N
     if value.reason == "":
         result.warnings.append("未填写映射理由（选填）")
     if value.research_only:
+        result.ok = not result.errors
+        return result
+
+    # 标准行业研究不需要预先绑定产品。没有客户明确标的时，后续正式报价按钮
+    # 会保持不可用；这比强迫分析师在研究前随意挑一只 ETF 更符合职责边界。
+    if not value.underlying_code.strip():
         result.ok = not result.errors
         return result
 
@@ -737,11 +800,11 @@ def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = N
         str(getattr(brief, "原始需求", "") or ""), item, exposure_text))
     # 单一 A 股行业映射必须与工具本身对口；只有多行业产业链或原市场研究，
     # 才可用原始主题补足“AI→半导体/通信”等跨行业词汇差异。
-    exposure_ok = ((theme_match or original_match) if value.research_mode == "theme_etf"
+    exposure_ok = ((theme_match or original_match) if value.research_mode in {"theme_basket", "theme_etf"}
                    else (scope_match or (len(industries) > 1 and original_match)
                          or (value.market != "A股" and original_match)))
     if not exposure_ok:
-        target_scope = value.theme if value.research_mode == "theme_etf" else value.research_scope
+        target_scope = value.theme if value.research_mode in {"theme_basket", "theme_etf"} else value.research_scope
         result.errors.append(
             f"无法通过 ETF 官方名称或跟踪指数验证 {item.简称} 与研究主题「{target_scope}」具有直接暴露")
 
@@ -781,12 +844,23 @@ def apply_to_brief(result: ValidationResult, brief, *, provider: DataProvider | 
     if not result.ok:
         raise ValueError("不能应用未通过校验的市场确认")
     value = result.confirmation
+    # 兼容 2026-09-03 前保存的确认 JSON：旧版把“标准行业 + 主题公司篮子”合并
+    # 为 industry；只要其中确实带有已选公司，就按新的 theme_basket 解释。商品 ETF
+    # 的旧确认同理按 ETF 自身研究，避免升级后历史运行突然去查询矿业股锚点。
+    effective_mode = value.research_mode
+    if effective_mode == "industry" and value.theme_basket_codes:
+        effective_mode = "theme_basket"
+    if (effective_mode == "industry" and result.instrument is not None
+            and result.instrument.类型 == "商品ETF"):
+        effective_mode = "theme_etf"
     brief.市场范围 = value.market
     brief.市场确认 = asdict(value)
+    brief.市场确认["research_mode"] = effective_mode
     brief.研究主题 = value.theme
-    # 主题 ETF 路径直接以该 ETF 真实成分作为研究篮子，不再制造一个并不存在的
-    # “标准行业”；行业路径仍保留分析师确认行业作审计口径。
-    brief.研究篮子口径 = value.theme if value.research_mode == "theme_etf" else value.research_scope
+    # 三条取数路径互斥：标准行业使用行业成分，人工主题篮子使用分析师勾选公司，
+    # 主题 ETF 使用 ETF 真实成分。挂钩工具只是报价对象，不能反过来改写研究篮子。
+    brief.研究篮子口径 = (value.research_scope if effective_mode == "industry"
+                          else value.theme)
     brief.确认挂钩标的 = value.underlying_code if result.instrument else ""
     brief.确认挂钩标的类型 = result.instrument.类型 if result.instrument else ""
     brief.研究资产类型 = result.instrument.类型 if result.instrument else ""
@@ -804,22 +878,21 @@ def apply_to_brief(result: ValidationResult, brief, *, provider: DataProvider | 
                 getattr(brief, "候选标的", []) or [])
     by_code = {str(item.代码 or "").upper(): item for item in pool
                if item.可用 and not _is_fund(item.代码)}
-    # 兼容旧 CLI 确认 JSON：未出现该字段时仍沿用原有核心候选。新版 GUI 明确传空
-    # 列表则代表分析师不采用主题篮子，不能擅自把全部动态候选塞回去。
-    selected_codes = ([] if value.research_mode == "theme_etf" else
-                      (value.theme_basket_codes if value.theme_basket_confirmed else list(by_code)))
+    # 只有显式选择“人工主题篮子”时，公司复选结果才进入取数。标准行业路径即使
+    # payload 里残留旧候选也必须忽略，避免行业整体法被一小撮公司暗中替换。
+    selected_codes = (value.theme_basket_codes if effective_mode == "theme_basket" else [])
     brief.主题篮子候选 = [by_code[code] for code in dict.fromkeys(selected_codes)
                        if code in by_code][:_THEME_BASKET_MAX]
     parts = value.industries
     if value.market == "A股":
-        if value.research_mode == "theme_etf":
+        if effective_mode == "theme_etf":
             brief.涉及板块 = [value.theme]
             brief.宽口径成分行业 = []
             brief.候选标的 = []
             return
-        # 主题与确认行业不相同（光模块 vs 通信设备）时，研究对象必须仍是主题篮子；
-        # 确认行业只用于验证 A 股映射和 ETF 暴露，不能反过来替代研究主题。
-        theme_mode = bool(value.theme and value.theme != value.research_scope)
+        # 人工主题篮子路径保留细分主题名；标准行业路径始终使用已验证行业，不能再
+        # 通过“主题名与行业名不同”这种隐式条件切换口径。
+        theme_mode = effective_mode == "theme_basket"
         if theme_mode:
             brief.涉及板块 = [value.theme]
             brief.宽口径成分行业 = []
@@ -833,9 +906,15 @@ def apply_to_brief(result: ValidationResult, brief, *, provider: DataProvider | 
             brief.宽口径成分行业 = []
         brief.候选标的 = []
         # 商品 ETF 是研究对象本身，不存在“拿一只矿业股当数据锚点”的合理口径。
-        lead = None if (theme_mode or (result.instrument and result.instrument.类型 == "商品ETF")) else \
-            universe.pick_representative(brief.涉及板块[:1], provider=provider or get_provider())
-        if theme_mode and brief.主题篮子候选:
+        # 已确认 ETF 时主入口会直接以该 ETF 作为研究对象，不再额外查一只行业龙头；
+        # 已确认主题篮子时以篮子首个样本作内部锚点；标准行业无论是否另选报价 ETF，
+        # 都从行业成分选内部锚点，避免报价工具改写研究取数对象。
+        lead = (None if theme_mode else
+                universe.pick_representative(brief.涉及板块[:1], provider=provider or get_provider()))
+        # 细分主题的动态候选已经由 iFinD/代码校验确认过时，优先把它作为本次
+        # 取数锚点。行业龙头检索偶发超时不应把“只研究、不报价”误判为必须补 ETF。
+        # 这只影响内部取数锚点，不会把该公司写成客户看到的推荐标的。
+        if lead is None and brief.主题篮子候选:
             first = brief.主题篮子候选[0]
             lead = type("ThemeLead", (), {"简称": first.名称, "代码": first.代码})()
         if lead:

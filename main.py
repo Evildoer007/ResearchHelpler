@@ -178,11 +178,16 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
         else:
             if _OH_OUTPUT == "recommend":
                 print("  · 正在调用 OptionHelper 结构推荐链路；不会发起正式报价…")
+                # 结构推荐前由 Research Helper 为本轮挂钩标的取得统一画像；正式报价
+                # 仍由 OptionHelper 自取实时定价行情、波动率曲面和交易日历。
+                from core import product_profile
+                profile = product_profile.collect(vp.标的代码, name=vp.标的名称)
                 if tracker:
                     with tracker.stage("optionhelper_recommender", "生成 OptionHelper 结构推荐") as stage:
                         recommendation = ohb.recommend(
                             vp, client_constraints=_CLIENT_CONSTRAINTS,
                             client_product_intent=client_product_intent,
+                            product_profile=profile,
                         )
                         if not recommendation.ok:
                             tracker.fail_stage(stage, recommendation.error)
@@ -191,6 +196,7 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
                             path = tracker.directory / f"{tracker.run_id}.optionhelper-recommendation.json"
                             path.write_text(json.dumps({
                                 "run_id": tracker.run_id,
+                                "product_profile": profile,
                                 "constraints": recommendation.constraints,
                                 "candidates": recommendation.candidates,
                             }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -200,6 +206,7 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
                     recommendation = ohb.recommend(
                         vp, client_constraints=_CLIENT_CONSTRAINTS,
                         client_product_intent=client_product_intent,
+                        product_profile=profile,
                     )
                     if not recommendation.ok:
                         print(f"  ⚠ OptionHelper Recommender 未完成：{recommendation.error}")
@@ -513,6 +520,17 @@ def generate_from_brief(text: str, *, pick: bool = False,
             market_confirmation.apply_to_brief(checked, b, provider=provider)
             if tracker:
                 tracker.add_metadata("分析师确认", json.dumps(b.市场确认, ensure_ascii=False))
+                # 标准行业路径可以不预先选 ETF，但若客户明确需要产品，确认页已经
+                # 根据主题/行业发现了一批可交易候选。冻结到本次 run，供研究完成后的
+                # 报价审核选择；不能只因分析师暂不把 ETF 用作研究数据源就丢掉它们。
+                suggested = [
+                    {key: item.get(key) for key in ("code", "name", "type", "note", "origin",
+                                                     "average_daily_amount")}
+                    for item in (payload.get("suggested_instruments") or [])
+                    if isinstance(item, dict) and str(item.get("code") or "").strip()
+                ]
+                if suggested:
+                    tracker.add_metadata("系统建议挂钩工具", json.dumps(suggested, ensure_ascii=False))
             for warning in checked.warnings:
                 print(f"  ⚠ {warning}")
             print(f"  ✓ 已确认：{value.market}｜{value.research_scope}｜"
@@ -545,18 +563,39 @@ def generate_from_brief(text: str, *, pick: bool = False,
         print("    可用来源：公司 IR/交易所披露、已上传研报（写明页码）、或其他可核验材料。")
         return None
 
+    research_only = bool((getattr(b, "市场确认", None) or {}).get("research_only"))
     t = b.代表标的
-    # 分析师确认的 ETF 就是研究对象与挂钩标的；不再展示或使用一只行业龙头
-    # 作为“代表标的”，避免中国移动之类的宽行业龙头污染光模块主题。
+    # 只有“主题 ETF 路径”中的 ETF 同时是研究对象与挂钩标的；标准行业和人工
+    # 主题篮子路径里的 ETF 仅供报价，不能取代各自的研究篮子。
     confirmed_code = str(getattr(b, "确认挂钩标的", "") or "").strip()
     confirmed_type = str(getattr(b, "确认挂钩标的类型", "") or "")
-    if confirmed_code and "ETF" in confirmed_type.upper():
+    confirmed = getattr(b, "市场确认", None) or {}
+    confirmed_mode = str(confirmed.get("research_mode") or "industry")
+    if (confirmed_code and "ETF" in confirmed_type.upper()
+            and confirmed_mode == "theme_etf"):
         from core import instruments
         item = instruments.get(confirmed_code)
         t = brief.TargetRef(item.简称 if item else confirmed_code, confirmed_code,
                             "ok:分析师确认ETF")
+    if (t is None or not t.可用) and b.市场范围 == "A股" and \
+            confirmed_mode == "industry":
+        # 标准行业路径本来就允许不选 ETF。若行业龙头检索在确认阶段短暂失败，
+        # 再按分析师确认的标准行业补一次内部取数锚点；无论是否报价都不能误报成
+        # “请确认 ETF”。
+        from core import universe
+        scope = str(confirmed.get("research_scope") or "").strip()
+        lead = universe.pick_representative([scope], provider=get_provider()) if scope else None
+        if lead:
+            t = brief.TargetRef(lead.简称, lead.代码, f"ok:{lead.简称}（仅研究取数锚点）")
+            b.候选标的 = [t]
     if t is None or not t.可用:
-        print("  ⚠ 未能确定可用的研究对象，请确认 ETF/指数代码后重试。")
+        message = ("当前研究口径没有取得可用的研究数据对象；"
+                   "标准行业路径不需要 ETF，主题 ETF 路径才需要确认 ETF 代码。")
+        print(f"  ⚠ {message}")
+        print("    请改选可用的标准行业路径，或选择主题 ETF 取数路径并填写 ETF 代码后重试。")
+        if tracker:
+            tracker.add_metadata("终止原因", message)
+            tracker.add_recovery("确认研究取数路径和可用研究对象后重试；无需为标准行业研究补填报价 ETF。")
         return None
     print(f"\n▶ 生成：{b.主题}  代表标的 {t.名称} {t.代码}")
     if not o.为空:
@@ -580,7 +619,6 @@ def generate_from_brief(text: str, *, pick: bool = False,
                 tracker.fail_stage(stage, ma.error or "市场研究生成失败")
     else:
         ma = pipeline.run_from_brief(b, prepared=prepared, chosen=chosen, overrides=o)
-    research_only = bool((getattr(b, "市场确认", None) or {}).get("research_only"))
     if research_only and _OH_OUTPUT:
         print("  · 分析师选择“仅研究”，本次跳过 OptionHelper 正式报价。")
     return _finish(ma, b.主题, tracker=tracker, client_product_intent=b.客户产品诉求,
@@ -600,7 +638,10 @@ def _run_tracked(tracker: RunTracker, work) -> object:
             status = "completed_not_deliverable"
         elif status == "completed" and tracker.recovery_actions:
             status = "completed_with_warnings"
-        tracker.finish(status=status)
+        error = ""
+        if status == "failed":
+            error = str(tracker.metadata.get("终止原因") or "运行未形成交付结果，请查看实时输出。")
+        tracker.finish(status=status, error=error)
         return result
     except Exception as error:  # noqa: BLE001
         message = f"{type(error).__name__}: {str(error)[:300]}"

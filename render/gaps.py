@@ -959,6 +959,68 @@ def refresh_optionhelper_result(gap_path: str | Path, oh, *, html_path: str = ""
     return True
 
 
+def refresh_optionhelper_multi_result(gap_path: str | Path, entries: list[dict], *, html_path: str = "",
+                                      pdf_path: str = "", pdf_pages: int | None = None,
+                                      pdf_error: str = "") -> bool:
+    """将分析师选入一页通的多标的冻结报价同步至内部底稿。"""
+    import re
+
+    path = Path(gap_path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    valid = [entry for entry in entries if isinstance(entry, dict)]
+    lines = ["## 三、OptionHelper 正式参考报价调用结果", "",
+             f"- **状态**：多标的正式报价已完成；分析师选择 {len(valid)} 份写入一页通。",
+             "- **说明**：各项均为 OptionHelper 独立冻结报价；本系统未计算、推断或按胜率排序。",
+             "- **已纳入一页通的报价**："]
+    for entry in valid:
+        underlying = str(entry.get("underlying") or "—")
+        product = str(entry.get("product_name") or entry.get("product_id") or "—")
+        product_id = str(entry.get("product_id") or "")
+        reason = str(entry.get("reason") or "（无）")
+        groups = [group for group in (entry.get("groups") or []) if isinstance(group, dict)]
+        row_count = sum(len(group.get("rows") or []) for group in groups)
+        lines.append(
+            f"  - **{underlying}**：{product}" + (f"（{product_id}）" if product_id else "")
+            + f"；理由：{reason}；表格 {len(groups)} 组 / {row_count} 行。"
+        )
+        report_path = str(entry.get("report_path") or "")
+        if report_path:
+            lines.append(f"    - 正式 Quote 文件：`{report_path}`")
+    lines += ["", "> 合同、取数、收益结构、定价与冻结交付由 OptionHelper 完成；"
+              "Research Helper 仅按分析师勾选写入已有的表格，不改写任何报价数值。", ""]
+    quote = "\n".join(lines)
+    pattern = r"## 三、OptionHelper 正式参考报价调用结果\n.*?(?=\n---\n)"
+    if re.search(pattern, text, flags=re.DOTALL):
+        text = re.sub(pattern, quote.rstrip(), text, count=1, flags=re.DOTALL)
+    else:
+        text += "\n\n---\n\n" + quote
+
+    final_lines = ["## 九、正式报价后最终交付状态", "", "- **状态**：所选多标的正式报价已同步更新交付物。"]
+    if html_path:
+        final_lines.append(f"- **最终一页通 HTML**：`{html_path}`")
+    if pdf_path and pdf_pages is not None:
+        status = "通过（1 页）" if pdf_pages == 1 else f"不通过（实测 {pdf_pages} 页）"
+        final_lines.append(f"- **PDF 校验**：{status}｜`{pdf_path}`")
+    elif pdf_error:
+        final_lines.append(f"- **PDF 校验**：未完成（{pdf_error}）")
+    else:
+        final_lines.append("- **PDF 校验**：待重新导出；所选报价已改变版面，旧 PDF 不可作为最终交付。")
+    final = "\n".join(final_lines) + "\n"
+    final_pattern = r"## 九、正式报价后最终交付状态\n.*?(?=\n---\n|\Z)"
+    if re.search(final_pattern, text, flags=re.DOTALL):
+        text = re.sub(final_pattern, final.rstrip(), text, count=1, flags=re.DOTALL)
+    else:
+        text = text.rstrip() + "\n\n---\n\n" + final
+    try:
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
 def _event_evidence_section(ma) -> list[str]:
     """记录事件事实与传导的来源，便于复核“为什么这件事会影响该 ETF”。"""
     evidence = dict(getattr(ma, "事件证据", {}) or {})

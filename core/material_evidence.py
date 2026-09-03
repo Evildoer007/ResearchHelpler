@@ -36,7 +36,8 @@ def _read_pages(path: Path) -> list[str]:
         from .docs import read_pages
         return read_pages(path)
     if suffix in {".txt", ".md"}:
-        return [path.read_text(encoding="utf-8", errors="replace")]
+        from .docs import read_pages
+        return read_pages(path)
     if suffix == ".docx":
         try:
             from docx import Document
@@ -79,6 +80,14 @@ def extract_candidates(path: Path, *, query: str = "", limit: int = 60,
     tokens = _query_tokens(query)
     candidates: list[tuple[int, int, MaterialCandidate]] = []
     ref = reference or str(path.resolve())
+    # 粘贴材料显示分析师填写的出处，不是难以辨认的本地临时文件名；
+    # 普通 TXT/MD 仍保持历史行为，以完整文件名供用户定位。
+    label = path.name
+    if path.suffix.lower() in {".txt", ".md"}:
+        from .docs import _read_pasted_text
+        manual_source, _ = _read_pasted_text(path)
+        if manual_source:
+            label = manual_source
     for page_no, page in enumerate(_read_pages(path), 1):
         for position, text in enumerate(_split_snippets(page)):
             lower = text.lower()
@@ -89,7 +98,7 @@ def extract_candidates(path: Path, *, query: str = "", limit: int = 60,
                 text, re.I)))
             candidate = MaterialCandidate(
                 content=text,
-                source=f"{path.name} p{page_no}",
+                source=f"{label} p{page_no}",
                 reference=ref,
                 page=page_no,
             )

@@ -732,6 +732,10 @@ h1 .accent { color:var(--oh-brand-red); }
 .q-meta { display:flex; justify-content:space-between; align-items:flex-end; gap:8px;
           font-size:9px; color:var(--oh-muted); margin:5px 0 3px; }
 .q-group-title { color:var(--oh-table-head-ink); font-family:var(--f-med); font-weight:500; }
+.q-selected { margin:7px 0 2px; padding:4px 6px; background:var(--oh-blue-gray-soft);
+              border-left:2px solid var(--oh-blue-gray); font-size:9px; color:var(--oh-ink-soft); }
+.q-selected b { color:var(--oh-ink); font-family:var(--f-heavy); font-weight:700; margin-right:7px; }
+.q-selected span { color:var(--oh-muted); }
 .q-table { width:100%; border-collapse:collapse; table-layout:fixed; font-size:9px; line-height:1.35; }
 .q-table th, .q-table td { border:1px solid var(--oh-table-border); padding:3px 4px; text-align:center;
                            vertical-align:middle; overflow-wrap:anywhere; }
@@ -873,6 +877,14 @@ def _today_cn() -> str:
     return f"{d.year}年{d.month}月{d.day}日"
 
 
+def _report_title(ma) -> str:
+    """交付标题优先使用需求解析的完整主题，不能退化为取数用的行业名。"""
+    title = str(getattr(ma, "报告标题", "") or "").strip()
+    if title:
+        return title
+    return str(getattr(getattr(ma, "plan", None), "主题", "") or "本次投资机会分析").strip()
+
+
 def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None) -> str:
     """正文展开"主轴"标记的 2~3 条论点，其余（可选池/自由槽）压成一行补充观察。
 
@@ -937,7 +949,7 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None
 
     return f"""<!doctype html><html><head><meta charset="utf-8"><style>{_CSS}</style></head><body>
     <div class="page">
-      <h1>场外衍生品投资策略 <span class="accent">—— {ma.plan.主题}</span></h1>
+      <h1>场外衍生品投资策略 <span class="accent">—— {_esc(_report_title(ma))}</span></h1>
       <div class="sub">策略研究 · {date}</div>
       <div class="concl"><span class="lbl">核心结论</span>{rc.核心结论 or _MISSING_CONCL}</div>
       {body_html}
@@ -1033,6 +1045,62 @@ def _quote_block(oh) -> str:
     note = oh.quote_note or "以上为参考报价，实际以交易台正式报价为准。"
     return ('<section class="quote"><div class="q-heading">推荐结构 · 参考报价</div>'
             + "".join(rendered) + f'<p class="q-note">{_esc(note)}</p></section>')
+
+
+def multi_quote_block(entries: list[dict]) -> str:
+    """渲染分析师从多标的正式报价中勾选的冻结表格。
+
+    ``entries`` 必须来自 GUI 保存的 OptionHelper ``designer-input`` 事实，不能由
+    Research Helper 补全、合并或重新计算任一报价字段。多份报价共用一个一页通区块，
+    但每份仍保留自己的标的、产品、理由和原始列结构，避免把不同产品误读为同一张表。
+    """
+    rendered: list[str] = []
+    notes: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        underlying = _esc(str(entry.get("underlying") or "—"))
+        product_name = _esc(str(entry.get("product_name") or entry.get("product_id") or "—"))
+        product_id = _esc(str(entry.get("product_id") or ""))
+        product = product_name + (f"（{product_id}）" if product_id and product_id not in product_name else "")
+        reason = _esc(str(entry.get("reason") or ""))
+        date = _esc(str(entry.get("quote_date") or ""))
+        header = f'<div class="q-selected"><b>{underlying}｜{product}</b>'
+        if reason:
+            header += f'<span>推荐理由：{reason}</span>'
+        header += "</div>"
+        groups_html: list[str] = []
+        for group in entry.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            columns = [item for item in (group.get("columns") or [])
+                       if isinstance(item, dict) and item.get("key") and item.get("label")]
+            rows = [item for item in (group.get("rows") or []) if isinstance(item, dict)]
+            if not columns or not rows:
+                continue
+            head = "".join(f'<th scope="col">{_esc(str(column["label"]))}</th>' for column in columns)
+            body = "".join(
+                "<tr>" + "".join(
+                    f'<td>{_esc(str(row.get(column["key"]) or "—"))}</td>' for column in columns
+                ) + "</tr>" for row in rows
+            )
+            meta = f'<span>报价日期：{date}</span>' if date else ""
+            groups_html.append(
+                '<div class="q-group">'
+                f'<div class="q-meta"><span class="q-group-title">{_esc(str(group.get("title") or "参考报价"))}</span>{meta}</div>'
+                f'<table class="q-table"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+            )
+        if not groups_html:
+            continue
+        rendered.append(header + "".join(groups_html))
+        note = str(entry.get("quote_note") or "").strip()
+        if note and note not in notes:
+            notes.append(note)
+    if not rendered:
+        return ""
+    note_text = "；".join(notes) or "以上为参考报价，实际以交易台正式报价为准。"
+    return ('<section class="quote"><div class="q-heading">已选产品 · 参考报价</div>'
+            + "".join(rendered) + f'<p class="q-note">{_esc(note_text)}</p></section>')
 
 
 _DISCLAIMER = (

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field as dfield
 
 from llm.client import DeepSeekClient
@@ -95,6 +96,26 @@ def _normalize_name(s: str) -> str:
     return s
 
 
+def _etf_theme_alias_matches(actual: str, suggested: str) -> bool:
+    """判断 ETF 的口语主题简称是否与官方基金名一致。
+
+    动态发现的 ETF 不一定在 ``INSTRUMENTS`` 人工目录中，因此不能只依赖人工
+    别名。例如“智能汽车ETF”对应的官方名可为“富国中证智能汽车主题ETF”。
+    代码已经由数据源核验后，只要去掉 ETF 后的主题简称完整出现在官方名称中，
+    就是同一工具的合理简称，不应误报“名称不符”。
+
+    此规则只用于 ETF，且要求主题词至少 3 个字符；不能放宽到普通个股，避免
+    “中信”之类短词把真实但无关的代码张冠李戴。
+    """
+    actual_normalized = _normalize_name(actual)
+    suggested_normalized = _normalize_name(suggested)
+    if not actual_normalized.endswith("ETF"):
+        return False
+    actual_theme = re.sub(r"ETF$", "", actual_normalized, flags=re.IGNORECASE)
+    suggested_theme = re.sub(r"ETF$", "", suggested_normalized, flags=re.IGNORECASE)
+    return len(suggested_theme) >= 3 and suggested_theme in actual_theme
+
+
 def _verify_code(code: str, name: str, provider: DataProvider) -> str:
     """校验代码是否真实**且与建议标的名称相符**。
 
@@ -115,6 +136,8 @@ def _verify_code(code: str, name: str, provider: DataProvider) -> str:
         return f"待确认:未给标的名称(该代码为{actual})"
     if a == b or a in b or b in a:
         return f"ok:{actual}"
+    if _etf_theme_alias_matches(actual, name):
+        return f"ok:{actual}（ETF主题简称已核验）"
     # ETF 同时有交易简称和基金全称。iFinD 往往返回后者，例如 512000.SH 的
     # “华宝中证全指证券公司ETF”，而用户/LLM自然会写交易简称“券商ETF”。
     # 两者并不矛盾；若代码在已校验的工具目录中，必须拿目录别名做第二次比对，

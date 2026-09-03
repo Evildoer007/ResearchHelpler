@@ -46,6 +46,7 @@ def _field_display(ma, name: str) -> str:
 def _overview_html(ma, rc) -> str:
     """不把混量纲指标硬画图；以数据卡展示本次研究与方向的审计摘要。"""
     theme = str(getattr(ma, "研究主题", "") or getattr(getattr(ma, "plan", None), "主题", "") or "本次研究")
+    report_title = str(getattr(ma, "报告标题", "") or theme)
     scope = str(getattr(ma, "研究篮子口径", "") or "见内部底稿")
     basket = [str(item) for item in (getattr(ma, "研究篮子", []) or []) if str(item)]
     cards = [
@@ -66,7 +67,7 @@ def _overview_html(ma, rc) -> str:
     return f"""
     <header>
       <div class="eyebrow">RESEARCH HELPER · INTERNAL REVIEW</div>
-      <h1>{_escape(theme)}｜内部交互复核</h1>
+      <h1>{_escape(report_title)}｜内部交互复核</h1>
       <p>本页仅用于分析师复核。图表和数据卡均来自本次已验证数据，不重新取数、不产生新结论。</p>
     </header>
     <section class="overview"><h2>本次研究摘要</h2><div class="metrics">{card_html}</div>

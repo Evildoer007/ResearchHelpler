@@ -1,4 +1,4 @@
-"""文档抽取：从 `sources/` 的研报 PDF 里提炼**可核查的观点候选**。
+"""文档抽取：从 `sources/` 的研报 PDF 或分析师粘贴材料里提炼**可核查的观点候选**。
 
 ## 为什么这个模块通篇在做"校验"
 
@@ -104,8 +104,35 @@ class DocExtract:
 
 # ---------------- PDF 读取 ----------------
 
+def _read_pasted_text(path: Path) -> tuple[str, str]:
+    """读取 GUI 写入的文字材料，返回 ``(来源, 正文)``。
+
+    GUI 用首行 ``来源：`` 保存分析师填写的出处，正文与出处分离：前者才交给
+    LLM 抽取，后者只作为候选和最终报告的可追溯标签。未按这个格式保存的 TXT/MD
+    仍可读取，只是回退为文件名来源，方便分析师手工放入 sources/ 的旧材料。
+    """
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    lines = raw.splitlines()
+    source = ""
+    body_start = 0
+    if lines:
+        match = re.match(r"^\s*(?:来源|source)\s*[：:]\s*(.+?)\s*$", lines[0], re.I)
+        if match:
+            source = match.group(1).strip()
+            body_start = 1
+            # GUI 会额外写入录入时间与分隔线；这两行不是可引用原文。
+            if body_start < len(lines) and re.match(r"^\s*(?:录入时间|created)\s*[：:]", lines[body_start], re.I):
+                body_start += 1
+            if body_start < len(lines) and re.fullmatch(r"\s*-{3,}\s*", lines[body_start]):
+                body_start += 1
+    return source, "\n".join(lines[body_start:]).strip()
+
+
 def read_pages(path: Path) -> list[str]:
-    """逐页抽取文本。返回 [第1页文本, 第2页文本, ...]。"""
+    """逐页抽取文本。PDF 返回逐页文本；TXT/MD 视为一页分析师材料。"""
+    if path.suffix.lower() in {".txt", ".md"}:
+        _, body = _read_pasted_text(path)
+        return [body]
     try:
         from pypdf import PdfReader
     except ImportError:  # 老环境回退
@@ -220,6 +247,10 @@ def parse_filename(path: Path) -> tuple[str, str]:
 
 
 def source_label(path: Path) -> str:
+    if path.suffix.lower() in {".txt", ".md"}:
+        source, _ = _read_pasted_text(path)
+        if source:
+            return source
     return parse_filename(path)[0]
 
 
@@ -549,6 +580,7 @@ def extract(path: Path, client: DeepSeekClient | None = None,
     不过滤会让候选清单混入大量噪声，全靠分析师人工排除。
     """
     label, doc_date = parse_filename(path)
+    label = source_label(path)
     out = DocExtract(文件=path.name, 来源=label, 文档日期=doc_date,
                      时效=freshness(doc_date))
     pages = read_pages(path)
@@ -685,10 +717,14 @@ def _attach_charts(out: DocExtract, text: str, pages: list[str],
 def extract_all(directory: Path | None = None,
                 client: DeepSeekClient | None = None,
                 topic: str = "") -> list[DocExtract]:
-    """抽取 sources/ 下全部 PDF（含子目录）。"""
+    """抽取 sources/ 下全部 PDF 与文字材料（含子目录）。"""
     d = directory or SOURCES_DIR
     client = client or DeepSeekClient()
-    return [extract(p, client, topic) for p in sorted(d.rglob("*.pdf"))]
+    files = sorted(
+        [*d.rglob("*.pdf"), *d.rglob("*.txt"), *d.rglob("*.md")],
+        key=lambda path: str(path).lower(),
+    )
+    return [extract(p, client, topic) for p in files]
 
 
 def render(results: list[DocExtract]) -> str:

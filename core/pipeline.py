@@ -88,6 +88,9 @@ class MarketAnalysis:
     板块理由: str = ""
     # 三个对象必须分开留痕：研究主题决定报告回答什么；研究篮子决定整体法数据
     # 算谁；挂钩 ETF 仅是将结论转成可报价工具。不能再由 ETF 反向覆盖前两者。
+    # 报告标题是面向读者的完整问题表述，可比研究主题更具体；它不参与取数、
+    # 规划或行情映射，避免“汽车电子”这类取数口径被迫承载完整叙事。
+    报告标题: str = ""
     研究主题: str = ""
     研究篮子口径: str = ""
     研究篮子: list[str] = dfield(default_factory=list)
@@ -989,7 +992,11 @@ def _explicit_etf_from_brief(b) -> str:
 
     confirmed = str(getattr(b, "确认挂钩标的", "") or "").strip()
     confirmed_type = str(getattr(b, "确认挂钩标的类型", "") or "")
-    if confirmed and "ETF" in confirmed_type.upper():
+    confirmation = getattr(b, "市场确认", None) or {}
+    # 在标准行业/人工主题篮子路径中，确认 ETF 只是后续报价工具，不能成为研究
+    # 取数对象；只有分析师明确选择“主题 ETF 路径”时才使用它的真实成分研究。
+    if (confirmed and "ETF" in confirmed_type.upper()
+            and str(confirmation.get("research_mode") or "") == "theme_etf"):
         return confirmed
     raw = str(getattr(b, "原始需求", "") or "").upper()
     # 受控目录里的 ETF 代码是已经人工/iFinD 核验过的静态事实；即使当次
@@ -1017,11 +1024,15 @@ def _theme_basket_from_brief(b):
     """
     from . import universe
 
+    confirmation = getattr(b, "市场确认", None) or {}
+    mode = str(confirmation.get("research_mode") or "").strip()
     theme = str(getattr(b, "研究主题", "") or "").strip()
     scope = str(getattr(b, "研究篮子口径", "") or "").strip()
-    # “证券→证券”这类普通行业仍走行业整体法；只有“光模块→通信设备”这类细分
-    # 主题才启用分析师确认的主题公司篮子。
-    if not theme or theme == scope:
+    # 新确认页只允许显式的人工主题篮子路径使用这些公司；兼容旧运行记录时，
+    # 才沿用“主题与口径不同”的历史判断。
+    if mode and mode != "theme_basket":
+        return []
+    if not mode and (not theme or theme == scope):
         return []
     raw = list(getattr(b, "主题篮子候选", []) or [])
     items = [item for item in raw if getattr(item, "可用", False)
@@ -1032,7 +1043,11 @@ def _theme_basket_from_brief(b):
 
 
 def _theme_basket_required(b) -> bool:
-    """细分主题即使暂未选公司，也必须阻断宽行业/ETF 成分的静默替代。"""
+    """人工主题篮子路径即使未选够公司，也阻断宽行业/ETF 的静默替代。"""
+    confirmation = getattr(b, "市场确认", None) or {}
+    mode = str(confirmation.get("research_mode") or "").strip()
+    if mode:
+        return mode == "theme_basket"
     theme = str(getattr(b, "研究主题", "") or "").strip()
     scope = str(getattr(b, "研究篮子口径", "") or "").strip()
     return bool(theme and scope and theme != scope)
@@ -1152,6 +1167,7 @@ def run_from_brief(
     event_evidence.attach_to_analysis(ma, b, evidence)
     ma.rep_name = target.名称          # 正文首次提及要写名称，只有代码读者认不出
     ma.板块理由 = getattr(b, "板块理由", "")
+    ma.报告标题 = str(getattr(b, "主题", "") or research_topic).strip()
     ma.研究主题 = research_topic
     ma.研究篮子口径 = getattr(b, "研究篮子口径", "")
     ma.研究篮子 = [
