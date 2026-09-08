@@ -154,9 +154,10 @@ _SYSTEM = """你是场外衍生品投资策略研报的"撰稿器"。根据论�
    关联，就不要硬套一句"SK海力士区间涨跌幅-12.62%……"作为开场白——
    这种为了提而提、跟后面论证接不上的写法比不提更差。
    这个字段没给（多数板块类需求没有触发实体）时，不必强行编一个事件角度。
-3.5.1 **有“已核验事件传导证据”时，事件本体与本次 A 股行业/ETF 的因果连接只能按
-该证据写。** 不得把“同属科技/半导体”等概念相近自行扩写为供应链、竞争或受益关系；
-每次提到传导，须清楚区分“事件事实”“传导依据”“A 股市场响应”三层。
+3.5.1 **有“已核验事件证据链”时，事件本体与本次 A 股行业/ETF 的因果连接只能按
+该证据链写。** 不得把“同属科技/半导体”等概念相近自行扩写为供应链、竞争或受益关系；
+每次提到传导，须清楚区分“事件事实”“产业机制”“A股对象暴露依据”“受控组合结论”与“A股市场响应”。
+组合结论不是新的事实来源，只能按其列出的证据ID和边界表述；直接传导证据仍可作为兼容路径。
 4. 图表规格只描述"画什么"（图型、要展示的数据点、标题），不要自己画图或输出图片。
 4.0 **`图表规格列表` 给 1~2 项。判断标准是"这条论述用到了几组不同性质的数据"，
    而不是"至少给一张就够了"。** 论述里每摆出一组读者需要看见的数据，就该配一张图。
@@ -197,6 +198,20 @@ _SYSTEM = """你是场外衍生品投资策略研报的"撰稿器"。根据论�
      不是任意一组公司指标的通用替代品。每点 {标签, 值}，单位必须一致。
    - `histogram`：同一字段的足够长历史样本（至少 30 个观测值），用于展示分布与当前位置；
      不得把 2~4 个孤立指标伪装成“分布”。
+   - `lollipop`：同单位、至少 3 个对象的横向排名，每点 `{标签, 值}`；仅当“排序/高低差异”
+     是结论本身时使用，不能把它当作柱状图的装饰替换。
+   - `dumbbell`：同一对象在**两个明确可比时点或情景**的变化，每点 `{标签, 值, 值2}`，
+     且必须写 `可比时点:true`、`值名`、`值2名`；不得用于 ROE 与净利率等异质指标。
+   - `waterfall`：可加总的增减项拆解，每点 `{标签, 值}`，且必须写 `可加总:true`；
+     不可加总的同比、分位和估值不得使用。
+   - `interval_band`：同口径的低值、高值和当前位置，每点 `{标签, 低, 高, 值}`，且必须写
+     `可比区间:true`；适用于历史区间、一致预期范围等。
+   - `heatmap`：同一篮子内、按**同一规则标准化为 0–100**的多指标扫描；写 `标准化:true`，
+     `数据点`给标签、`系列`给各指标数组。原始 PB、ROE、增速不能混用同一色阶。
+   - `treemap`：同一口径的权重/市值等构成，面积只编码 `{标签, 值}`；可另给 `颜色值`表示
+     经验证的涨跌方向，面积不能被解释为贡献。
+   - `bubble`：同一样本的三变量关系，每点 `{标签, x, y, 大小}`；x/y 是两个连续变量，
+     `大小`只能是非负规模，必须提供 `x轴`、`y轴`、`大小轴`。
    - `evidence_flow`：事件型研究中已核验的“事件事实 → 传导依据 → A股主题影响”链，
      每点 {标签, 说明}，只可写已给出的传导证据；它不是数值趋势图。
 4.1.1 **标题必须是一句可核对的结论，而非“XX走势/XX分析”这类栏目名。** 同时为每张图给
@@ -318,6 +333,9 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
     subs = None
     trigger_data: dict[str, str] = {}
     transmission_data: dict[str, str] = {}
+    mechanism_data: dict[str, str] = {}
+    exposure_data: dict[str, str] = {}
+    chain_data: dict[str, str] = {}
     panorama: dict[str, str] = {}
     for name, fv in (ma.field_values or {}).items():
         if not isinstance(name, str) or name.startswith("__"):
@@ -338,6 +356,15 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
             continue
         if name.startswith("事件传导证据"):
             transmission_data[name.removeprefix("事件传导证据")] = fv.display or str(fv.value)
+            continue
+        if name.startswith("事件产业机制"):
+            mechanism_data[name.removeprefix("事件产业机制")] = fv.display or str(fv.value)
+            continue
+        if name.startswith("A股暴露依据"):
+            exposure_data[name.removeprefix("A股暴露依据")] = fv.display or str(fv.value)
+            continue
+        if name.startswith("事件组合传导链"):
+            chain_data[name.removeprefix("事件组合传导链")] = fv.display or str(fv.value)
             continue
         panorama[name] = fv.display or str(fv.value)
 
@@ -363,6 +390,10 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
            if trigger_code else {}),
         **({"已核验事件传导证据_只可按此写因果": transmission_data}
            if transmission_data else {}),
+        **({"已核验产业机制原文": mechanism_data} if mechanism_data else {}),
+        **({"已核验A股对象暴露原文": exposure_data} if exposure_data else {}),
+        **({"分析师确认的组合传导链_只可引用其证据ID和边界": chain_data}
+           if chain_data else {}),
         # #73：波动率/涨跌幅分位/换手率/成交额分位这四个字段，只要这里给了 etf_code，
         # 就是这只 ETF 自己的真实价格数据，不是板块聚合出来的——写正文时必须归属给它
         # （"消费ETF近3年波动率处82%分位"），不能笼统写成"板块波动率"，见铁律 3.1.3。
@@ -576,7 +607,9 @@ def write(ma: MarketAnalysis, client: DeepSeekClient | None = None) -> ReportCon
 
         def _attach(lc, key) -> bool:
             spec = auto.get(key)
-            if not spec or key in 用过 or len(lc.图表规格列表) >= 3:
+            # 一页通实际只展示前两张；第三张即使挂上也会被版面层舍弃，不能让
+            # 自动结构图“看似生成、实际永远不可见”。
+            if not spec or key in 用过 or len(lc.图表规格列表) >= 2:
                 return False
             if spec.get("标题") in {(s or {}).get("标题") for s in lc.图表规格列表}:
                 return False
@@ -593,7 +626,7 @@ def write(ma: MarketAnalysis, client: DeepSeekClient | None = None) -> ReportCon
         # ② 板块结构类的图（成分股散点、子行业分组柱）**不属于任何单条逻辑的字段**，
         #    按①永远挂不上。它们描述的是整个板块的横截面，对哪条逻辑都成立，
         #    故挂给当前配图最少的那条，每份报告各出现一次，不重复也不遗漏。
-        for key in ("子行业明细", "成分股明细"):
+        for key in ("子行业明细", "成分股明细", "成分股气泡", "主题篮子热力", "成分股权重"):
             if key not in auto or key in 用过 or not 可挂:
                 continue
             _attach(min(可挂, key=lambda x: len(x.图表规格列表)), key)

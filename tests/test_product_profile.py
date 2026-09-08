@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from core.product_profile import build_from_series, render_for_prompt
+from core.product_profile_worker import RESULT_PREFIX, extract_result
 
 
 class ProductProfileTests(unittest.TestCase):
@@ -35,6 +36,22 @@ class ProductProfileTests(unittest.TestCase):
         self.assertFalse(profile["ok"])
         self.assertIn("未取得标的收盘价序列", profile["gaps"])
         self.assertIn("取数缺口", render_for_prompt(profile))
+
+    def test_worker_result_ignores_ifind_stdout_noise(self) -> None:
+        output = "C:\\Users\\analyst\\iFinDPy.pth\n" + RESULT_PREFIX + (
+            '{"ok": true, "profile": {"code": "561160.SH", "return_20d": -6.93}}\n'
+        )
+
+        payload = extract_result(output)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["profile"]["code"], "561160.SH")
+        self.assertEqual(payload["profile"]["return_20d"], -6.93)
+
+    def test_worker_result_accepts_legacy_bare_json_after_noise(self) -> None:
+        output = 'iFinD startup message\n{"ok": false, "message": "failed"}\n'
+
+        self.assertEqual(extract_result(output)["message"], "failed")
 
 
 if __name__ == "__main__":

@@ -291,6 +291,10 @@ def _rendered_logics(ma, rc) -> list:
 
 def _underlying_px(ma, rc, oh=None) -> float:
     """挂钩标的卡片本次会不会渲染、渲染多高——与 render.layout._underlying_block 同一套判断条件。"""
+    # 初始研究报告不再渲染内部研究 ETF；只有正式报价完成后，GUI 才会写入
+    # 分析师实际确认的挂钩标的卡片。
+    if oh is None or not getattr(oh, "ok", False):
+        return 0.0
     try:
         from core import viewpoint as vp
 
@@ -436,11 +440,10 @@ def _trace_table(ma, vr) -> list[str]:
 
 
 def _selection_section(ma) -> list[str]:
-    """ETF 分析与挂钩选择过程（仅内部底稿）。
+    """研究阶段的 ETF 取数目标与待报价候选（仅内部底稿）。
 
-    无论 ETF 是用户点名、板块映射并通过流动性闸门，还是候选池择优得到，
-    都明确留下“怎么选、用 ETF 自身哪些数据分析”的证据。候选择优路径额外
-    展开完整候选池，避免只看到最终入选项而无法复核比较是否合理。
+    这里不代表分析师已经选择正式挂钩标的，也不代表内容已发送给
+    OptionHelper；真正的逐标的输入由第二章②记录。
     """
     p = getattr(ma, "挂钩择优", None)
     etf_code = str(ma.field_values.get("__etf__") or "").strip()
@@ -448,21 +451,21 @@ def _selection_section(ma) -> list[str]:
     if not etf_code and p is None:
         return []
 
-    out = ["", "**ETF 分析与挂钩标的选择（分析师核对，不发送给 OptionHelper）**", ""]
+    out = ["", "**ETF 研究取数与待报价候选复核（不发送给 OptionHelper）**", ""]
     if etf_code:
         from core import instruments as ins
 
         item = ins.get(etf_code)
         label = f"{item.简称}（{etf_code}）" if item else etf_code
-        out.append(f"- **最终挂钩标的**：{label}")
+        out.append(f"- **研究阶段 ETF 目标**：{label}")
         if item and item.官方名:
             out.append(f"- **产品与跟踪口径**：{item.官方名}" +
                        (f"；跟踪{item.跟踪指数}" if item.跟踪指数 else ""))
-        if etf_note == "用户需求指定的挂钩 ETF":
-            out.append("- **选择路径**：用户在原始需求中明确点名，系统完成代码校验后直接采用；"
-                       "不把需求解析器临时提出的候选误当成客户指定。")
+        if etf_note in {"用户需求指定的挂钩 ETF", "分析师确认的主题 ETF 研究取数目标"}:
+            out.append("- **研究取数路径**：该 ETF 经需求解析或分析师确认，用于主题 ETF 行情/成分取数；"
+                       "它不会因此自动成为正式挂钩标的。")
         else:
-            out.append("- **选择路径**：板块→ETF 映射表指定，并经取数阶段流动性闸门复核。"
+            out.append("- **研究取数路径**：系统发现或映射该 ETF，并经取数阶段基础校验。"
                        + (f"复核结果：{etf_note}" if etf_note else ""))
 
         own_fields = ("年化波动率", "波动率历史分位", "区间涨跌幅分位",
@@ -484,16 +487,16 @@ def _selection_section(ma) -> list[str]:
             out += ["> ⚠ 未取得可确认属于该 ETF 自身的行情指标；不可将板块聚合数据替代。", ""]
 
     if p is None:
-        out += ["> 本次为明确 ETF 映射/用户指定路径，未在同类候选之间进行二次择优；"
-                "上述映射、流动性复核与 ETF 自身行情即为本次选择依据。", ""]
+        out += ["> 本节只说明研究阶段为何使用或发现该 ETF。正式报价标的需在研究完成后由分析师另行确认；"
+                "实际送入 OptionHelper 的标的及产品画像见第二章②。", ""]
         return out
     if not getattr(p, "ok", False):
-        return out + [f"> ⚠ 挂钩标的候选择优失败：{getattr(p, 'error', '')}"
+        return out + [f"> ⚠ 待报价候选发现失败：{getattr(p, 'error', '')}"
                       "——需分析师人工指定。", ""]
     if not p.picks:
         return out + [f"> ⚠ 候选池 {p.候选数} 个中未选出合适标的：{p.说明 or '（未说明）'}", ""]
 
-    out += [f"**候选池择优**（候选池 {p.候选数} 个"
+    out += [f"**待报价候选池复核**（尚未由分析师确认；候选池 {p.候选数} 个"
             + (f"；维度：{'、'.join(p.择优维度)}" if p.择优维度 else "") + "）", "",
             "| 选中 | 标的 | 实测指标 | 适合 | 理由 |", "|---|---|---|---|---|"]
     for i, k in enumerate(p.picks):
@@ -513,8 +516,8 @@ def _selection_section(ma) -> list[str]:
         out.append("")
     if p.说明:
         out += [f"> 择优结论：{p.说明}", ""]
-    out += ["> 挂钩标的与分析对象**不是同一个**时（产业趋势/事件驱动类，其分析对象"
-            "本身不可交易），请复核理由是否由实测指标支撑，以及候选池里是否有更合适的标的。", ""]
+    out += ["> 本节中的研究 ETF 与系统候选均不是“实际发送给 OptionHelper 的标的”。"
+            "研究完成后，只有分析师确认的标的才会连同自身产品画像写入第二章②。", ""]
     return out
 
 
@@ -718,15 +721,20 @@ def _viewpoint_section(ma, rc) -> list[str]:
     try:
         from core import viewpoint as vp
 
-        pkg = vp.build(ma, rc)
+        # 研究生成阶段只冻结可由所有报价候选共用的市场观点。此时尚未发生
+        # 报价标的确认，不能让内部研究 ETF/数据锚点冒充“实际发送标的”。
+        pkg = vp.build(ma, rc, include_underlying=False)
     except Exception as e:                       # 观点包失败不该拖垮整份底稿
         return [f"（观点包生成失败：{type(e).__name__}: {e}）", ""]
     if not pkg.ok:
         return [f"（观点包不可用：{pkg.error}）", ""]
 
-    # ① 实际发送给 OptionHelper 的原文。它仅由已验证市场事实组成，不含 writer
-    #    结论、产品建议、结构、期限或执行价；照原样贴出来便于逐字核对。
-    out = ["**① 实际发送给 OptionHelper 的内容**（自然语言原文，逐字如下）：", ""]
+    # ① 这是研究完成时冻结的共同部分，不是某只标的已经实际发送的完整请求。
+    #    GUI 在研究后确认标的并取得产品画像，才会把逐标的实际输入写入②。
+    out = [
+        "**① 研究完成时冻结的共同市场观点**（尚未绑定报价标的）：", "",
+        "> 下面只是一份可复用的研究快照，**不代表 OptionHelper 已被调用**，也不包含后来选择的挂钩标的及其产品画像。", "",
+    ]
     try:
         from core import optionhelper_bridge as _ohb
 
@@ -739,19 +747,27 @@ def _viewpoint_section(ma, rc) -> list[str]:
     if band is not None and getattr(band, "ok", False):
         from core.scenario_band import render_compact
 
-        out += ["**历史相似状态收益带（已发送；非预测、非产品建议）**", "",
+        out += ["**历史相似状态收益带（共同观点快照；非预测、非产品建议）**", "",
                 f"- 当前状态：{band.return_state}；{band.volatility_state}",
                 f"- 样本规则：{band.sample_rule}；样本数：{band.sample_count}",
                 f"- 后续收益分布：{render_compact(band)}", ""]
 
-    # ② 以下全部是分析师核对用、不发送给 OptionHelper 的内部信息：挂钩标的口径、
+    out += [
+        "**② 报价阶段逐标的实际输入记录**", "",
+        "> 研究完成后，分析师确认的标的、该标的产品画像、客户约束和实际发送文本会在这里逐只写入。", "",
+        "<!-- RH_OPTIONHELPER_INPUTS_START -->",
+        "（尚未选择待报价标的，未向 OptionHelper 发送逐标的请求。）",
+        "<!-- RH_OPTIONHELPER_INPUTS_END -->",
+        "",
+    ]
+
+    # ③ 以下全部是分析师核对用、不发送给 OptionHelper 的内部信息：研究数据口径、
     #    数据锚点、择优过程、每条逻辑对应的论点库代号与特征。
-    out += ["**② 分析师核对与独立交接信息**", ""]
+    out += ["**③ 分析师核对与独立交接信息**", ""]
     intent = getattr(ma, "客户产品诉求", "")
     if intent:
         out.append(f"- **客户产品诉求（独立交接，不属于市场研究）**：{intent}")
-    out.append(f"- **挂钩标的**：{pkg.标的名称}（{pkg.标的代码}）" if pkg.标的代码
-               else f"- **挂钩标的**：未定 —— {pkg.标的口径}")
+    out.append("- **正式挂钩标的**：研究生成阶段未定；见上方②的报价阶段实际输入记录。")
     if pkg.板块:
         out.append(f"- **板块**：{pkg.板块}")
     if pkg.标的代码:
@@ -816,7 +832,8 @@ def _optionhelper_section(oh) -> list[str]:
         ]
     constraints = getattr(oh, "client_constraints", {}) or {}
     if not getattr(oh, "ok", False):
-        out = [f"- **状态**：失败（{oh.stage or '未知阶段'}）", f"- **原因**：{oh.error or '（无详细信息）'}"]
+        out = [f"- **正式参考报价**：失败/未完成（{oh.stage or '未知阶段'}）",
+               f"- **原因**：{oh.error or '（无详细信息）'}"]
         if constraints:
             out.append("- **本次客户约束**：" + "；".join(f"{key}={value}" for key, value in constraints.items()))
         action = getattr(oh, "recovery_action", "")
@@ -828,6 +845,7 @@ def _optionhelper_section(oh) -> list[str]:
         out.append("")
         return out
     out = [
+        "- **结构推荐**：已由分析师确认。",
         f"- **推荐结构**：{oh.product_name}" + (f"（{oh.product_id}）" if oh.product_id else ""),
         f"- **理由**：{oh.reason or '（无）'}",
     ]
@@ -835,7 +853,8 @@ def _optionhelper_section(oh) -> list[str]:
         out.append("- **本次客户约束**：" + "；".join(f"{key}={value}" for key, value in constraints.items()))
     if oh.main_risks:
         out.append("- **主要风险**：" + "；".join(oh.main_risks))
-    out.append(f"- **交付状态**：{oh.status}（{'完整' if oh.coverage_status == 'complete' else oh.coverage_status or '—'}）")
+    out.append(f"- **正式参考报价**：已完成；交付状态 {oh.status}"
+               f"（{'完整' if oh.coverage_status == 'complete' else oh.coverage_status or '—'}）")
     if oh.module_failures:
         out.append("- **未完成模块**：" + "；".join(f"{k}：{v}" for k, v in oh.module_failures.items()))
     if oh.report_path:
@@ -855,6 +874,86 @@ def _optionhelper_section(oh) -> list[str]:
     return out
 
 
+_OPTIONHELPER_INPUTS_START = "<!-- RH_OPTIONHELPER_INPUTS_START -->"
+_OPTIONHELPER_INPUTS_END = "<!-- RH_OPTIONHELPER_INPUTS_END -->"
+_OPTIONHELPER_SECTION_PATTERN = (
+    r"## 三、(?:OptionHelper 正式参考报价调用结果|OptionHelper 产品流程与正式报价结果)\n"
+    r".*?(?=\n---\n)"
+)
+
+
+def _actual_optionhelper_input_block(record: dict) -> str:
+    """把某只标的真正送入 Recommender/正式报价的输入按原样落盘。"""
+    import re
+
+    underlying = str(record.get("underlying") or "未记录标的").strip().upper()
+    profile = record.get("product_profile") if isinstance(record.get("product_profile"), dict) else {}
+    name = str(profile.get("name") or record.get("underlying_name") or "").strip()
+    label = f"{name}（{underlying}）" if name else underlying
+    prompt = str(record.get("market_prompt") or "").strip()
+    constraints = record.get("constraints") if isinstance(record.get("constraints"), dict) else {}
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", underlying) or "unknown"
+    lines = [
+        f"<!-- RH_OPTIONHELPER_INPUT:{safe}:START -->",
+        f"#### {label}",
+        "",
+        f"- **本轮状态**：{record.get('status') or '已发起结构推荐'}",
+        "- **客户约束（独立字段发送）**：" + (
+            "；".join(f"{key}={value}" for key, value in constraints.items()) if constraints else "未记录"
+        ),
+        "- **实际发送的市场观点、标的与产品画像**：",
+        "",
+        "```text",
+        prompt or "（本次运行未记录实际发送文本）",
+        "```",
+        "",
+        f"<!-- RH_OPTIONHELPER_INPUT:{safe}:END -->",
+    ]
+    return "\n".join(lines)
+
+
+def _upsert_optionhelper_input(text: str, record: dict) -> str:
+    """在底稿②中按标的新增或替换实际输入；兼容修复前生成的旧底稿。"""
+    import re
+
+    # 旧底稿把研究阶段内部 ETF 标为“实际发送”。保留历史文本，但先改正其身份，
+    # 再新增本轮真正发送的逐标的记录。
+    text = text.replace(
+        "**① 实际发送给 OptionHelper 的内容**（自然语言原文，逐字如下）：",
+        "**① 研究生成时冻结的旧版共同观点快照**（不代表本轮实际发送；其中旧标的字段仅供历史追溯）：",
+    )
+    block = _actual_optionhelper_input_block(record)
+    underlying = str(record.get("underlying") or "未记录标的").strip().upper()
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", underlying) or "unknown"
+    item_pattern = (
+        rf"<!-- RH_OPTIONHELPER_INPUT:{re.escape(safe)}:START -->.*?"
+        rf"<!-- RH_OPTIONHELPER_INPUT:{re.escape(safe)}:END -->"
+    )
+    if _OPTIONHELPER_INPUTS_START in text and _OPTIONHELPER_INPUTS_END in text:
+        area_pattern = (
+            re.escape(_OPTIONHELPER_INPUTS_START) + r".*?" + re.escape(_OPTIONHELPER_INPUTS_END)
+        )
+        area = re.search(area_pattern, text, flags=re.DOTALL)
+        body = area.group(0) if area else ""
+        if re.search(item_pattern, body, flags=re.DOTALL):
+            body = re.sub(item_pattern, block, body, count=1, flags=re.DOTALL)
+        else:
+            body = body.replace(
+                _OPTIONHELPER_INPUTS_END,
+                block + "\n" + _OPTIONHELPER_INPUTS_END,
+            ).replace("（尚未选择待报价标的，未向 OptionHelper 发送逐标的请求。）\n", "")
+        return re.sub(area_pattern, lambda _match: body, text, count=1, flags=re.DOTALL)
+
+    # 兼容旧底稿：在第二、三章之间插入新的审计子节。
+    anchor = "\n---\n\n## 三、"
+    addition = (
+        "\n\n**② 报价阶段逐标的实际输入记录**\n\n"
+        + _OPTIONHELPER_INPUTS_START + "\n" + block + "\n" + _OPTIONHELPER_INPUTS_END + "\n"
+    )
+    at = text.find(anchor)
+    return text[:at] + addition + text[at:] if at >= 0 else text.rstrip() + addition
+
+
 def refresh_optionhelper_recommender_result(gap_path: str | Path, record: dict) -> bool:
     """把 GUI 异步完成的 OptionHelper 结构推荐同步写入内部底稿。
 
@@ -871,11 +970,14 @@ def refresh_optionhelper_recommender_result(gap_path: str | Path, record: dict) 
     status = str(record.get("status") or "failed")
     message = str(record.get("message") or "（无详细信息）")
     candidates = [item for item in (record.get("candidates") or []) if isinstance(item, dict)]
-    lines = ["## 三、OptionHelper 正式参考报价调用结果", ""]
+    text = _upsert_optionhelper_input(text, record)
+    underlying = str(record.get("underlying") or "—")
+    lines = ["## 三、OptionHelper 产品流程与正式报价结果", "",
+             f"- **当前标的**：{underlying}"]
     if candidates:
         lines += [
             f"- **结构推荐**：已完成（{len(candidates)} 个候选，等待分析师确认）。",
-            "- **正式参考报价**：尚未发起（原因：必须先由分析师确认 OptionHelper 候选；未确认前不创建一次性 selection）。",
+            "- **正式参考报价**：尚未发起。结构候选不等于正式报价；必须先由分析师确认，未确认前不创建一次性 selection。",
             "- **推荐诊断**：" + (message or "结构推荐已完成。"),
             "- **候选摘要**：",
         ]
@@ -894,9 +996,8 @@ def refresh_optionhelper_recommender_result(gap_path: str | Path, record: dict) 
             lines.append("- **进程诊断**：" + stderr[-1000:])
     lines.append("")
     section = "\n".join(lines)
-    pattern = r"## 三、OptionHelper 正式参考报价调用结果\n.*?(?=\n---\n)"
-    if re.search(pattern, text, flags=re.DOTALL):
-        text = re.sub(pattern, section.rstrip(), text, count=1, flags=re.DOTALL)
+    if re.search(_OPTIONHELPER_SECTION_PATTERN, text, flags=re.DOTALL):
+        text = re.sub(_OPTIONHELPER_SECTION_PATTERN, section.rstrip(), text, count=1, flags=re.DOTALL)
     else:
         text = text.rstrip() + "\n\n---\n\n" + section
     try:
@@ -908,7 +1009,7 @@ def refresh_optionhelper_recommender_result(gap_path: str | Path, record: dict) 
 
 def refresh_optionhelper_result(gap_path: str | Path, oh, *, html_path: str = "",
                                 pdf_path: str = "", pdf_pages: int | None = None,
-                                pdf_error: str = "") -> bool:
+                                pdf_error: str = "", input_record: dict | None = None) -> bool:
     """在正式报价完成后，把内部底稿同步为本次**最终**状态。
 
     GUI 的研究阶段会先生成 HTML/底稿，正式报价则在另一条异步进程中完成。
@@ -923,10 +1024,20 @@ def refresh_optionhelper_result(gap_path: str | Path, oh, *, html_path: str = ""
     except OSError:
         return False
 
-    quote = "## 三、OptionHelper 正式参考报价调用结果\n\n" + "\n".join(_optionhelper_section(oh))
-    pattern = r"## 三、OptionHelper 正式参考报价调用结果\n.*?(?=\n---\n)"
-    if re.search(pattern, text, flags=re.DOTALL):
-        text = re.sub(pattern, quote.rstrip(), text, count=1, flags=re.DOTALL)
+    if input_record:
+        text = _upsert_optionhelper_input(text, input_record)
+    target_lines = []
+    if input_record:
+        underlying = str(input_record.get("underlying") or "—")
+        profile = input_record.get("product_profile") if isinstance(input_record.get("product_profile"), dict) else {}
+        name = str(profile.get("name") or input_record.get("underlying_name") or "").strip()
+        target_lines = [f"- **本次正式报价标的**：{name + '（' if name else ''}{underlying}{'）' if name else ''}", ""]
+    quote = (
+        "## 三、OptionHelper 产品流程与正式报价结果\n\n"
+        + "\n".join(target_lines + _optionhelper_section(oh))
+    )
+    if re.search(_OPTIONHELPER_SECTION_PATTERN, text, flags=re.DOTALL):
+        text = re.sub(_OPTIONHELPER_SECTION_PATTERN, quote.rstrip(), text, count=1, flags=re.DOTALL)
     else:
         text += "\n\n---\n\n" + quote
 
@@ -971,7 +1082,7 @@ def refresh_optionhelper_multi_result(gap_path: str | Path, entries: list[dict],
     except OSError:
         return False
     valid = [entry for entry in entries if isinstance(entry, dict)]
-    lines = ["## 三、OptionHelper 正式参考报价调用结果", "",
+    lines = ["## 三、OptionHelper 产品流程与正式报价结果", "",
              f"- **状态**：多标的正式报价已完成；分析师选择 {len(valid)} 份写入一页通。",
              "- **说明**：各项均为 OptionHelper 独立冻结报价；本系统未计算、推断或按胜率排序。",
              "- **已纳入一页通的报价**："]
@@ -992,9 +1103,8 @@ def refresh_optionhelper_multi_result(gap_path: str | Path, entries: list[dict],
     lines += ["", "> 合同、取数、收益结构、定价与冻结交付由 OptionHelper 完成；"
               "Research Helper 仅按分析师勾选写入已有的表格，不改写任何报价数值。", ""]
     quote = "\n".join(lines)
-    pattern = r"## 三、OptionHelper 正式参考报价调用结果\n.*?(?=\n---\n)"
-    if re.search(pattern, text, flags=re.DOTALL):
-        text = re.sub(pattern, quote.rstrip(), text, count=1, flags=re.DOTALL)
+    if re.search(_OPTIONHELPER_SECTION_PATTERN, text, flags=re.DOTALL):
+        text = re.sub(_OPTIONHELPER_SECTION_PATTERN, quote.rstrip(), text, count=1, flags=re.DOTALL)
     else:
         text += "\n\n---\n\n" + quote
 
@@ -1026,7 +1136,7 @@ def _event_evidence_section(ma) -> list[str]:
     evidence = dict(getattr(ma, "事件证据", {}) or {})
     if not evidence:
         return []
-    lines = ["### 事件证据链（分析师提供，已进入正文可引用范围）", ""]
+    lines = ["### 事件证据链（分析师确认，已进入正文可引用范围）", ""]
     entity = str(evidence.get("事件主体") or "事件主体")
     lines.append(f"- **事件主体**：{entity}")
     for item in evidence.get("事件事实") or []:
@@ -1060,7 +1170,7 @@ def build_markdown(ma, rc, vr, *, title: str, html_path: str, oh_result=None) ->
     lines += _source_table(ma)
     lines += ["---", "", "## 二、给 OptionHelper 的观点包", ""]
     lines += _viewpoint_section(ma, rc)
-    lines += ["---", "", "## 三、OptionHelper 正式参考报价调用结果", ""]
+    lines += ["---", "", "## 三、OptionHelper 产品流程与正式报价结果", ""]
     lines += _optionhelper_section(oh_result)
     lines += ["---", "", "## 四、需要人工补充的数据", ""]
 

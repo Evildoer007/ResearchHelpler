@@ -2,17 +2,17 @@
 
 DESIGN §10 定义的观点包结构：{ 标的, 方向, 期限倾向, 波动率看法, 风险偏好 }。
 
-产出写进**内部底稿**（`render/gaps.py` 第二节），不直接喂给 OptionHelper：
-方向、期限、波动率看法都会影响报价，必须有人过一眼再用；落盘也留痕，
-事后能查当时是按什么观点定的结构。
+研究阶段产出的是不预选标的的只读共同观点快照。分析师在研究完成后确认待报价
+标的时，GUI 才把当前标的产品画像追加到该轮 OptionHelper 输入；落盘用于追溯
+当时按什么研究观点与标的事实选择结构。
 
 只读取 `MarketAnalysis`/`ReportContent` 已有的数据重新整理，**不产生任何新数字、
 不调用 LLM**——观点包里出现的每个数字，源头都能追回摸底取数或论点库特征列，
 与全项目"数字必须可溯源"这条主线一致。
 
 两条边界（#71）：
-1. **挂钩标的是板块 ETF，不是数据阶段的代表个股。** 报告分析的是整个板块，
-   把观点绑到贵州茅台身上，做出来的结构承担的是茅台的个股风险而非板块风险。
+1. **研究取数对象不是正式挂钩标的。** 标准行业、人工篮子或主题 ETF 先形成
+   共同研究结论；客户代码和系统候选必须等研究完成后再由分析师确认。
    代表个股仍在 `数据代表标的` 里留一份，供追溯，但明确标注不是挂钩对象。
 2. **只描述市场状态，不给产品建议。** 挂什么结构、什么期限、买方还是卖方，
    是 OptionHelper 依据实时波动率曲面与报价决定的事。本系统既没有曲面也没有报价，
@@ -130,7 +130,7 @@ def _resolve_direction(ma: MarketAnalysis, rc: ReportContent) -> tuple[str, str]
     return "", ""
 
 
-def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
+def build(ma: MarketAnalysis, rc: ReportContent, *, include_underlying: bool = True) -> ViewPackage:
     """把已生成的报告组装成观点包。纯读取已有数据，不产生新数字、不调用 LLM。"""
     if not ma.ok or not rc.ok:
         return ViewPackage(标的代码=getattr(ma, "rep_code", ""), ok=False,
@@ -153,7 +153,9 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
     # 历史 pickle）才退回当场重新解析，且那次解析不含流动性校验，仅作兜底。
     confirmed_code = str(getattr(ma, "确认挂钩标的", "") or "")
     etf_code = ma.field_values.get("__etf__")
-    if getattr(ma, "仅研究", False):
+    if not include_underlying:
+        inst, note = None, "挂钩标的待研究完成后由分析师确认"
+    elif getattr(ma, "仅研究", False):
         inst, note = None, "分析师选择仅研究；ETF 如有，仅作为行情/成分取数代理，不形成挂钩建议"
     elif confirmed_code:
         inst, note = ins.get(confirmed_code), "分析师本次确认并经数据源校验的挂钩工具"
@@ -169,7 +171,7 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
     # 否则观点包给下游的就是一个"未定"，A1 那节永远空白。
     择优 = getattr(ma, "挂钩择优", None)
     择优理由 = ""
-    if inst is None and 择优 is not None and getattr(择优, "picks", None):
+    if include_underlying and inst is None and 择优 is not None and getattr(择优, "picks", None):
         top = 择优.picks[0]
         inst = ins.get(top.代码)
         择优理由 = top.理由
@@ -191,6 +193,8 @@ def build(ma: MarketAnalysis, rc: ReportContent) -> ViewPackage:
         整体方向=direction,
         方向来源=direction_source,
     )
+    if not include_underlying:
+        vp.标的选择说明 = note
 
     # 观点包只选已取到的、可追溯的市场数据；不读取 writer 的结论，避免把
     # LLM 对产品或条款的表述反向传给 OptionHelper。字段顺序同时决定下游摘要顺序。

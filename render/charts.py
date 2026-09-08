@@ -1,7 +1,7 @@
 """图表绘制：把 writer 的"图表规格 + 真实数据"画成图。
 
-每个函数对应一种图型（number_cards / bar / line / bar_line /
-bubble / timeline / table），输入规格与数据点，输出 matplotlib Figure。
+每个函数对应一种图型（数据卡、比较/趋势、散点/气泡、构成/区间/热力等），输入规格与
+数据点，输出 matplotlib Figure。图型能否使用由 render.layout 的数据关系校验决定。
 风格统一走 render.style。renderer 再把这些图排进一页通。
 """
 
@@ -37,25 +37,26 @@ def _fmt(v: float) -> str:
     return f"{v:,.0f}" if a >= 100 else (f"{v:,.1f}" if a >= 10 else f"{v:,.2f}")
 
 
-def number_cards(cards: list[dict], *, title: str | None = None, height: float = 1.9):
+def number_cards(cards: list[dict], *, title: str | None = None, height: float = 1.55):
     """大数字卡片组。cards=[{label, value, sub?, color?}]。
 
     value 已是格式化好的可读串（如 "1.46倍"/"54.60%"），照排即可。
     """
     S.apply_style()
     n = max(1, len(cards))
-    # 卡片宽度随**最长的值**伸缩。定宽（1.7 英寸）时，"净流入42.74亿元" 这类长值
-    # 会溢出卡片边框、与相邻卡片的字叠在一起——实测成品上出现过：
-    # 框没框住字、两张卡的数字重叠成一团。宽度与字号都得跟着内容走。
+    # 画布只由卡片数量决定，不能再随值/标签长度伸缩。此前单卡可能只有约 1.3 英寸宽，
+    # 进入“正文 + 右图”布局后又被 CSS 放大到约 345px，标题和数值跟着放大近三倍；
+    # 长文本则会产生另一套画布，导致同一种图在不同报告里视觉尺寸不稳定。
+    # 内容过长只缩字号，不改变画布。1~4 张分别使用固定、可预测的交付尺寸。
     vmax = max((len(str(c.get("value", ""))) for c in cards), default=4)
     lmax = max((len(str(c.get("label", ""))) for c in cards), default=6)
-    per = max(1.5, min(2.6, 0.16 * max(vmax, lmax * 0.8) + 0.9))
-    fig, axes = plt.subplots(1, n, figsize=(min(5.4, per * n * 0.85), height * 0.70))
+    fixed_width = {1: 3.2, 2: 4.4, 3: 5.0, 4: 5.4}.get(n, 5.4)
+    fig, axes = plt.subplots(1, n, figsize=(fixed_width, height))
     if n == 1:
         axes = [axes]
 
     # 值的字号按最长值缩，保证再长也留在框内（下限 11pt，不小于正文观感）
-    vsize = 21 if vmax <= 6 else (17 if vmax <= 9 else (14 if vmax <= 12 else 11))
+    vsize = 17 if vmax <= 6 else (15 if vmax <= 9 else (12.5 if vmax <= 12 else 10.5))
 
     for ax, c in zip(axes, cards):
         ax.axis("off")
@@ -65,19 +66,19 @@ def number_cards(cards: list[dict], *, title: str | None = None, height: float =
         ax.add_patch(FancyBboxPatch(
             (0.04, 0.06), 0.92, 0.88,
             boxstyle="round,pad=0,rounding_size=0.06",
-            facecolor=S.CARD, edgecolor=S.GRID, linewidth=1.0,
+            facecolor=S.DATA_CARD_BG, edgecolor=S.DATA_CARD_BORDER, linewidth=0.9,
         ))
         color = c.get("color", S.PRIMARY)
         ax.text(0.5, 0.60, str(c.get("value", "")), ha="center", va="center",
                 fontsize=vsize, fontweight="bold", color=color)
         ax.text(0.5, 0.28, str(c.get("label", "")), ha="center", va="center",
-                fontsize=9, color=S.INK)
+                fontsize=8.2 if lmax <= 12 else 7.3, color=S.MUTED)
         if c.get("sub"):
             ax.text(0.5, 0.14, str(c["sub"]), ha="center", va="center",
                     fontsize=7.5, color=S.MUTED)
 
     if title:
-        fig.suptitle(title, fontsize=13, fontweight="bold", color=S.INK, y=1.02)
+        fig.suptitle(title, fontsize=10.5, fontweight="bold", color=S.INK, y=0.98)
     fig.tight_layout()
     return fig
 
@@ -421,7 +422,9 @@ def grouped_bar(labels: list[str], series: list[dict], *, title: str | None = No
     n, m = len(labels), max(1, len(series))
     fig, ax = plt.subplots(figsize=(min(6.4, max(4.8, 0.95 * n)), 2.15))
     width = 0.8 / m
-    palette = [S.PRIMARY, S.PRIMARY_D, S.MUTED]
+    # 同一图最多三组核心系列：红＝核心，蓝＝对照，绿＝验证/改善。
+    # 三色保持相近明度，图例与直接标数值仍是首要识别方式。
+    palette = [S.PRIMARY, S.BLUE, S.GREEN]
     for i, s in enumerate(series[:3]):
         xs = [j - 0.4 + width * (i + 0.5) for j in range(n)]
         vals = s.get("值") or []
@@ -486,6 +489,33 @@ def histogram(values: list[float], *, current: float | None = None,
     return fig
 
 
+def bubble(points: list[dict], *, title: str | None = None, xlabel: str = "", ylabel: str = "",
+           size_label: str = "", highlight: str = ""):
+    """气泡散点：x/y 为同一样本的两变量，面积只编码第三个非负规模变量。"""
+    S.apply_style()
+    xs, ys = [p["x"] for p in points], [p["y"] for p in points]
+    raw_sizes = [max(float(p.get("size") or 0), 0.0) for p in points]
+    maximum = max(raw_sizes) or 1.0
+    sizes = [28 + 250 * (value / maximum) ** .55 for value in raw_sizes]
+    fig, ax = plt.subplots(figsize=(5.4, 2.30))
+    colors = [S.PRIMARY_D if p.get("标签") == highlight else S.PRIMARY for p in points]
+    ax.scatter(xs, ys, s=sizes, color=colors, alpha=.48, edgecolors="white", linewidths=.8, zorder=3)
+    for p in points:
+        if p.get("标签") == highlight:
+            ax.annotate(highlight, (p["x"], p["y"]), textcoords="offset points", xytext=(0, 8),
+                        ha="center", fontsize=8, fontweight="bold", color=S.PRIMARY_D)
+    if xlabel:
+        ax.set_xlabel(xlabel, fontsize=8)
+    if ylabel:
+        ax.set_ylabel(ylabel, fontsize=8)
+    if size_label:
+        ax.text(1, 1.02, f"气泡面积：{size_label}", transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=7.5, color=S.MUTED)
+    if title:
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=12)
+    fig.tight_layout(); return fig
+
+
 def contribution_bar(labels: list[str], values: list[float], *, title: str | None = None,
                      ylabel: str | None = None):
     """排序贡献条：展示主题篮子中谁在拉动、谁在拖累。
@@ -500,3 +530,147 @@ def contribution_bar(labels: list[str], values: list[float], *, title: str | Non
     ordered_labels, ordered_values = zip(*pairs)
     return bar(list(ordered_labels), list(ordered_values), title=title,
                ylabel=ylabel, signed=True)
+
+
+def lollipop(labels: list[str], values: list[float], *, title: str | None = None,
+             ylabel: str | None = None):
+    """棒棒糖图：同口径横向排名的轻量替代，避免柱体占据过多版面。"""
+    S.apply_style()
+    pairs = sorted(zip(labels, values), key=lambda item: item[1])
+    labels, values = zip(*pairs) if pairs else ([], [])
+    fig, ax = plt.subplots(figsize=(min(5.3, max(3.8, 0.62 * len(labels))), 1.72))
+    xs = list(range(len(labels)))
+    colors = [S.signed_color(value) for value in values]
+    ax.vlines(xs, 0, values, color=colors, linewidth=2.0, alpha=0.72, zorder=2)
+    ax.scatter(xs, values, s=42, color=colors, edgecolors="white", linewidths=0.7, zorder=3)
+    for x, value in zip(xs, values):
+        ax.annotate(_fmt(value), (x, value), textcoords="offset points", xytext=(0, 6 if value >= 0 else -10),
+                    ha="center", fontsize=7.5, color=S.INK)
+    ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=8)
+    ax.axhline(0, color=S.GRID, linewidth=1)
+    _pad_axis(ax, list(values), include_zero=True)
+    if ylabel:
+        _ylabel_top(ax, ylabel)
+    if title:
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=13)
+    ax.grid(axis="x", visible=False)
+    fig.tight_layout()
+    return fig
+
+
+def dumbbell(labels: list[str], first: list[float], second: list[float], *,
+             title: str | None = None, first_label: str = "前值", second_label: str = "后值",
+             ylabel: str | None = None):
+    """哑铃图：同一对象的两个明确可比时点/情景，不用于异质指标拼接。"""
+    S.apply_style()
+    fig, ax = plt.subplots(figsize=(min(5.5, max(4.0, 0.70 * len(labels))), 1.82))
+    xs = list(range(len(labels)))
+    for x, left, right in zip(xs, first, second):
+        ax.plot([x, x], [left, right], color=S.GRID, linewidth=3.3, zorder=1)
+        ax.scatter([x], [left], s=33, color=S.BLUE, edgecolors="white", linewidths=0.7, zorder=2)
+        ax.scatter([x], [right], s=38, color=S.PRIMARY, edgecolors="white", linewidths=0.7, zorder=3)
+    ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=8)
+    ax.plot([], [], marker="o", color=S.BLUE, label=first_label)
+    ax.plot([], [], marker="o", color=S.PRIMARY, label=second_label)
+    ax.legend(frameon=False, fontsize=7.5, ncol=2, loc="upper right")
+    _pad_axis(ax, [*first, *second])
+    if ylabel:
+        _ylabel_top(ax, ylabel)
+    if title:
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=13)
+    ax.grid(axis="x", visible=False)
+    fig.tight_layout()
+    return fig
+
+
+def waterfall(labels: list[str], values: list[float], *, title: str | None = None,
+              ylabel: str | None = None):
+    """瀑布图：必须输入可加总的增减项，展示从起点到净变化的拆解。"""
+    S.apply_style()
+    starts, total = [], 0.0
+    for value in values:
+        starts.append(total)
+        total += value
+    fig, ax = plt.subplots(figsize=(min(5.5, max(4.0, 0.62 * (len(labels) + 1))), 1.86))
+    colors = [S.UP if value >= 0 else S.DOWN for value in values]
+    for index, (start, value, color) in enumerate(zip(starts, values, colors)):
+        bottom = min(start, start + value)
+        rect = ax.bar(index, abs(value), bottom=bottom, color=color, width=0.62, zorder=2)[0]
+        ax.text(rect.get_x() + rect.get_width() / 2, start + value, _fmt(value), ha="center",
+                va="bottom" if value >= 0 else "top", fontsize=7.5, color=S.INK)
+        if index < len(values) - 1:
+            ax.plot([index + .31, index + .69], [start + value, start + value], color=S.CHART_GRAY,
+                    linewidth=.8, linestyle=":", zorder=1)
+    ax.bar(len(labels), total, color=S.PRIMARY_D, width=.62, zorder=2)
+    ax.text(len(labels), total, f"净变化 {_fmt(total)}", ha="center", va="bottom" if total >= 0 else "top",
+            fontsize=7.5, color=S.INK, fontweight="bold")
+    ax.set_xticks(range(len(labels) + 1)); ax.set_xticklabels([*labels, "净变化"], fontsize=8)
+    ax.axhline(0, color=S.GRID, linewidth=1); _pad_axis(ax, [0, total, *[s + v for s, v in zip(starts, values)]])
+    if ylabel:
+        _ylabel_top(ax, ylabel)
+    if title:
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=13)
+    ax.grid(axis="x", visible=False); fig.tight_layout()
+    return fig
+
+
+def heatmap(labels: list[str], series: list[dict], *, title: str | None = None):
+    """热力图：仅接受同一规则标准化后的评分矩阵（0–100），不混放原始量纲。"""
+    from matplotlib.colors import LinearSegmentedColormap
+
+    S.apply_style()
+    matrix = [item.get("值") or [] for item in series]
+    fig, ax = plt.subplots(figsize=(min(5.7, max(4.0, .48 * len(labels) + 1.2)), max(1.65, .38 * len(series) + .55)))
+    cmap = LinearSegmentedColormap.from_list("rh", [S.BLUE_L, S.SURFACE, S.PRIMARY_L])
+    image = ax.imshow(matrix, aspect="auto", cmap=cmap, vmin=0, vmax=100)
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, fontsize=7.5, rotation=25, ha="right")
+    ax.set_yticks(range(len(series))); ax.set_yticklabels([str(item.get("名称") or "") for item in series], fontsize=8)
+    for row, values in enumerate(matrix):
+        for col, value in enumerate(values):
+            ax.text(col, row, _fmt(value), ha="center", va="center", fontsize=6.8,
+                    color=S.INK if 20 < value < 82 else "white")
+    colorbar = fig.colorbar(image, ax=ax, fraction=.04, pad=.03)
+    colorbar.ax.tick_params(labelsize=7); colorbar.set_label("标准化评分", fontsize=7.5)
+    if title:
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=11)
+    fig.tight_layout(); return fig
+
+
+def interval_band(labels: list[str], low: list[float], high: list[float], current: list[float], *,
+                  title: str | None = None, ylabel: str | None = None):
+    """区间带：同一口径的低/高区间与当前位置，例如历史区间或一致预期范围。"""
+    S.apply_style()
+    fig, ax = plt.subplots(figsize=(min(5.5, max(4.0, .65 * len(labels))), 1.82))
+    xs = list(range(len(labels)))
+    for x, lo, hi, now in zip(xs, low, high, current):
+        ax.vlines(x, lo, hi, color=S.RISK_GOLD, linewidth=6, alpha=.85, zorder=1)
+        ax.vlines(x, lo, hi, color=S.PRIMARY_D, linewidth=.8, zorder=2)
+        ax.scatter([x], [now], marker="D", s=30, color=S.PRIMARY, edgecolors="white", linewidths=.6, zorder=3)
+    ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=8)
+    _pad_axis(ax, [*low, *high, *current])
+    if ylabel:
+        _ylabel_top(ax, ylabel)
+    if title:
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=13)
+    ax.grid(axis="x", visible=False); fig.tight_layout(); return fig
+
+
+def treemap(items: list[dict], *, title: str | None = None):
+    """轻量矩形树图；面积只表示同一口径权重/市值，颜色可表示已验证涨跌方向。"""
+    S.apply_style()
+    values = [max(0.0, float(item.get("value") or 0)) for item in items]
+    total = sum(values) or 1.0
+    fig, ax = plt.subplots(figsize=(5.2, 2.0)); ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
+    cursor = 0.0
+    for index, (item, value) in enumerate(zip(items, values)):
+        width = value / total
+        color = item.get("color") or S.series_color(index)
+        ax.add_patch(FancyBboxPatch((cursor + .003, .02), max(width - .006, .01), .88,
+                     boxstyle="round,pad=0,rounding_size=.02", facecolor=color, edgecolor=S.SURFACE, linewidth=1))
+        if width > .08:
+            ax.text(cursor + width / 2, .51, str(item.get("label") or ""), ha="center", va="center",
+                    color="white", fontsize=7.5, fontweight="bold", wrap=True)
+        cursor += width
+    if title:
+        ax.set_title(title, fontweight="bold", color=S.INK, pad=7)
+    fig.tight_layout(); return fig

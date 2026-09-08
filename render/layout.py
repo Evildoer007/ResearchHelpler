@@ -53,20 +53,25 @@ def _chart_meta_html(spec: dict) -> str:
 
     图的标题负责说结论，图下这一行负责交代读者如何理解该结论。它不应靠
     正文或页尾来源让读者猜样本、单位和截止日；但字号保持很小，避免把一页
-    通重新撑成两页。缺少的字段如实写“见底稿”，不伪造日期或样本口径。
+    通重新撑成两页。客户拿不到内部底稿，所以缺失项直接不展示；有真实值的项仍保留，
+    不用“见底稿/见坐标轴”等内部占位符污染正式交付。
     """
-    as_of = str(spec.get("数据截至") or "见底稿")
-    unit = str(spec.get("单位") or "见坐标轴/数据卡")
-    scope = str(spec.get("样本口径") or "见底稿")
-    return (f'<div class="chart-meta">截至：{_esc(as_of)}｜单位：{_esc(unit)}'
-            f'｜样本：{_esc(scope)}</div>')
+    placeholders = {"", "见底稿", "见坐标轴/数据卡", "—", "未知"}
+    values = [
+        ("截至", str(spec.get("数据截至") or "").strip()),
+        ("单位", str(spec.get("单位") or "").strip()),
+        ("样本", str(spec.get("样本口径") or "").strip()),
+    ]
+    visible = [f"{label}：{_esc(value)}" for label, value in values if value not in placeholders]
+    return f'<div class="chart-meta">{"｜".join(visible)}</div>' if visible else ""
 
 
 def _img_html(fig, spec: dict | None = None) -> str:
     """把 figure 转成按 CSS_DPI 定宽的 <img>——宽度写死才能让字号与正文对齐。"""
     w = int(round(fig.get_figwidth() * CSS_DPI))
     meta = _chart_meta_html(spec or {})
-    return f'<div class="chart"><img src="{_fig_to_datauri(fig)}" width="{w}">{meta}</div>'
+    modifier = " chart--number-cards" if (spec or {}).get("类型") == "number_cards" else ""
+    return f'<div class="chart{modifier}"><img src="{_fig_to_datauri(fig)}" width="{w}">{meta}</div>'
 
 
 def _units(pts: list) -> set[str]:
@@ -83,6 +88,11 @@ def _units(pts: list) -> set[str]:
         m = _re.search(r"(万亿元|亿元|万元|万亿|亿|元|倍|%|个百分点|pct|bp)\s*$", s)
         out.add(m.group(1) if m else "")
     return out
+
+
+def _units_for(pts: list, key: str) -> set[str]:
+    """多列图按指定字段分别验证量纲，禁止把不同单位伪装成前后可比。"""
+    return _units([{"值": (point or {}).get(key, "")} for point in pts])
 
 
 def _ordered_time_labels(labels: list[str]) -> bool:
@@ -291,16 +301,19 @@ def _interactive_config(spec: dict) -> dict | None:
     title = str(spec.get("标题") or "")
     ylabel = str(spec.get("y轴") or "")
 
-    if typ == "scatter":
+    if typ in {"scatter", "bubble"}:
         rows = [
-            {"name": str(p.get("标签") or ""), "x": _num(p.get("x")), "y": _num(p.get("y"))}
+            {"name": str(p.get("标签") or ""), "x": _num(p.get("x")), "y": _num(p.get("y")),
+             "size": _num(p.get("大小")) if typ == "bubble" else None}
             for p in pts
         ]
-        rows = [r for r in rows if r["name"] and r["x"] is not None and r["y"] is not None]
+        rows = [r for r in rows if r["name"] and r["x"] is not None and r["y"] is not None
+                and (typ != "bubble" or r["size"] is not None and r["size"] >= 0)]
         if len(rows) < 5:
             return None
-        return {"kind": "scatter", "title": title, "xlabel": str(spec.get("x轴") or ""),
-                "ylabel": ylabel, "points": rows, "highlight": str(spec.get("高亮") or "")}
+        return {"kind": typ, "title": title, "xlabel": str(spec.get("x轴") or ""),
+                "ylabel": ylabel, "points": rows, "highlight": str(spec.get("高亮") or ""),
+                "size_label": str(spec.get("大小轴") or "规模")}
 
     if typ == "grouped_bar":
         labels = [str(p.get("标签") or "") for p in pts]
@@ -344,6 +357,13 @@ def _interactive_config(spec: dict) -> dict | None:
                 "labels": [label for label, _, _ in rows],
                 "bars": [first for _, first, _ in rows], "lines": [second for _, _, second in rows],
                 "bar_name": str(spec.get("柱标签") or ""), "line_name": str(spec.get("线标签") or "")}
+    if typ == "lollipop":
+        value_pts = [point for point in pts if _num(point.get("值")) is not None]
+        if len(value_pts) < 3 or len(_units(value_pts)) != 1:
+            return None
+        return {"kind": "lollipop", "title": title, "ylabel": ylabel,
+                "labels": [str(point.get("标签") or "") for point in value_pts],
+                "values": [_num(point.get("值")) for point in value_pts]}
     return None
 
 
@@ -392,6 +412,38 @@ def _one_chart(spec: dict, logic_id: str) -> str:
     return _interactive_chart_wrapper(spec, static_html)
 
 
+def _compact_side_chart(spec: dict) -> bool:
+    """判断单张图是否适合与论述并排，而不是机械占满一整行。
+
+    这里依据的是已验证的“图形语义 + 标签密度”，不是 LLM 的主观版式指令。
+    横向时间序列、证据链、表格和多系列图需要完整横轴/图例，仍使用整行；只有
+    在半页宽内仍能看清坐标、标签和审计口径的紧凑横截面图才进入左右布局。
+    """
+    typ = str(spec.get("类型") or "")
+    pts = list(spec.get("数据点") or [])
+    n = len(pts)
+    if typ == "number_cards":
+        return 1 <= n <= 2
+    if typ in {"gauge", "two_col", "card_compare"}:
+        return True
+    if typ in {"scatter", "bubble", "histogram", "treemap"}:
+        return True
+    if typ in {"bar", "contribution_bar", "lollipop", "dumbbell", "interval_band"}:
+        return 2 <= n <= 6
+    if typ == "heatmap":
+        return 3 <= n <= 7 and 2 <= len(spec.get("系列") or []) <= 3
+    # line / hist_band / bar_line / grouped_bar / waterfall / table / evidence_flow：
+    # 需要更宽的时间轴、拆解标签、图例或传导链，半宽会降低可读性。
+    return False
+
+
+def _chart_layout_mode(specs: list[dict]) -> str:
+    """按实际图表规格选择 ``side`` 或 ``full``，供正文排版共用。"""
+    if len(specs) == 1 and _compact_side_chart(specs[0] or {}):
+        return "side"
+    return "full"
+
+
 def _chart_block(lc) -> str:
     """产出该逻辑全部图表的 HTML（1~2 张并排），无图则空串。
 
@@ -408,7 +460,10 @@ def _chart_block(lc) -> str:
     if not blocks:
         return ""
     if len(blocks) == 1:
-        return blocks[0]
+        # 外层保留布局语义，build_html 才能把“论述 + 小方图”组合为左右结构；
+        # 不从 base64 图片或像素猜尺寸，避免浏览器/PDF 渲染差异改变研究版式。
+        mode = _chart_layout_mode(specs)
+        return f'<div class="chart-block chart-block--{mode}">{blocks[0]}</div>'
     return f'<div class="chart-row">{"".join(blocks)}</div>'
 
 
@@ -449,6 +504,15 @@ def _chart_for(lc) -> str | None:
             return _img_html(C.scatter(ps, title=spec.get("标题"),
                                        xlabel=spec.get("x轴", ""), ylabel=spec.get("y轴", ""),
                                        highlight=spec.get("高亮", "")), spec)
+        if typ == "bubble":
+            ps = [{"标签": str(p.get("标签", "")), "x": _num(p.get("x")), "y": _num(p.get("y")),
+                   "size": _num(p.get("大小"))} for p in pts]
+            ps = [p for p in ps if p["x"] is not None and p["y"] is not None and p["size"] is not None and p["size"] >= 0]
+            if len(ps) < 5:
+                return None
+            return _img_html(C.bubble(ps, title=spec.get("标题"), xlabel=spec.get("x轴", ""),
+                                      ylabel=spec.get("y轴", ""), size_label=spec.get("大小轴", "规模"),
+                                      highlight=spec.get("高亮", "")), spec)
         if typ == "grouped_bar":
             series = []
             for s in spec.get("系列") or []:
@@ -480,6 +544,59 @@ def _chart_for(lc) -> str | None:
                 [r[0] for r in rows], [r[1] for r in rows],
                 title=spec.get("标题"), ylabel=spec.get("y轴"),
                 current=_num(spec.get("当前值")), pctl=_num(spec.get("分位"))), spec)
+        if typ == "lollipop":
+            rows = [(str(p.get("标签", "")), _num(p.get("值"))) for p in pts]
+            rows = [row for row in rows if row[1] is not None]
+            value_pts = [p for p in pts if _num(p.get("值")) is not None]
+            if len(rows) < 3 or len(_units(value_pts)) != 1:
+                return None
+            return _img_html(C.lollipop([row[0] for row in rows], [row[1] for row in rows],
+                                        title=spec.get("标题"), ylabel=spec.get("y轴")), spec)
+        if typ == "dumbbell":
+            rows = [(str(p.get("标签", "")), _num(p.get("值")), _num(p.get("值2"))) for p in pts]
+            rows = [row for row in rows if row[1] is not None and row[2] is not None]
+            if (not spec.get("可比时点") or len(rows) < 2
+                    or len(_units_for(pts, "值")) != 1 or len(_units_for(pts, "值2")) != 1
+                    or _units_for(pts, "值") != _units_for(pts, "值2")):
+                return None
+            return _img_html(C.dumbbell(
+                [row[0] for row in rows], [row[1] for row in rows], [row[2] for row in rows],
+                title=spec.get("标题"), first_label=spec.get("值名") or "前值",
+                second_label=spec.get("值2名") or "后值", ylabel=spec.get("y轴")), spec)
+        if typ == "waterfall":
+            rows = [(str(p.get("标签", "")), _num(p.get("值"))) for p in pts]
+            rows = [row for row in rows if row[1] is not None]
+            value_pts = [p for p in pts if _num(p.get("值")) is not None]
+            if not spec.get("可加总") or len(rows) < 2 or len(_units(value_pts)) != 1:
+                return None
+            return _img_html(C.waterfall([row[0] for row in rows], [row[1] for row in rows],
+                                         title=spec.get("标题"), ylabel=spec.get("y轴")), spec)
+        if typ == "heatmap":
+            labels = [str(p.get("标签") or "") for p in pts]
+            series = []
+            for item in spec.get("系列") or []:
+                values = [_num(value) for value in (item.get("值") or [])]
+                if len(values) == len(labels) and all(value is not None and 0 <= value <= 100 for value in values):
+                    series.append({"名称": str(item.get("名称") or ""), "值": values})
+            if not spec.get("标准化") or len(labels) < 3 or len(series) < 2:
+                return None
+            return _img_html(C.heatmap(labels, series[:4], title=spec.get("标题")), spec)
+        if typ == "interval_band":
+            rows = [(str(p.get("标签", "")), _num(p.get("低")), _num(p.get("高")), _num(p.get("值"))) for p in pts]
+            rows = [row for row in rows if None not in row[1:] and row[1] <= row[3] <= row[2]]
+            if not spec.get("可比区间") or len(rows) < 2 or len(_units_for(pts, "值")) != 1:
+                return None
+            return _img_html(C.interval_band(
+                [row[0] for row in rows], [row[1] for row in rows], [row[2] for row in rows], [row[3] for row in rows],
+                title=spec.get("标题"), ylabel=spec.get("y轴")), spec)
+        if typ == "treemap":
+            rows = [(str(p.get("标签", "")), _num(p.get("值")), _num(p.get("颜色值"))) for p in pts]
+            rows = [row for row in rows if row[1] is not None and row[1] > 0]
+            if len(rows) < 3 or len(_units_for(pts, "值")) != 1:
+                return None
+            items = [{"label": label, "value": value, "color": S.UP if color is None or color >= 0 else S.DOWN}
+                     for label, value, color in rows]
+            return _img_html(C.treemap(items, title=spec.get("标题")), spec)
         if typ in ("bar", "contribution_bar", "line", "bar_line"):
             # 解析不出数值的点**整点丢弃**，绝不用 0 顶替（见 _num 的说明）
             rows = [(p.get("标签", ""), _num(p.get("值")), _num(p.get("值2")))
@@ -498,7 +615,8 @@ def _chart_for(lc) -> str | None:
                     cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
                               "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
                              for p in pts]
-                    return _img_html(C.number_cards(cards, title=spec.get("标题")), spec)
+                    return _img_html(C.number_cards(cards, title=spec.get("标题")),
+                                     dict(spec, 类型="number_cards"))
                 return _img_html(C.line(labels, vals, title=spec.get("标题"),
                                         ylabel=spec.get("y轴")), spec)
             if typ == "bar_line" and not spec.get("自动生成"):
@@ -508,7 +626,8 @@ def _chart_for(lc) -> str | None:
                 cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
                           "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
                          for p in pts]
-                return _img_html(C.number_cards(cards, title=spec.get("标题")), spec)
+                return _img_html(C.number_cards(cards, title=spec.get("标题")),
+                                 dict(spec, 类型="number_cards"))
             if typ == "bar_line" and all(r[2] is not None for r in rows):
                 return _img_html(C.bar_line(
                     labels, vals, [r[2] for r in rows], title=spec.get("标题"),
@@ -522,7 +641,8 @@ def _chart_for(lc) -> str | None:
                 cards = [{"label": p.get("标签", ""), "value": p.get("值", ""),
                           "color": S.DOWN if str(p.get("值", "")).startswith("-") else S.PRIMARY}
                          for p in pts]
-                return _img_html(C.number_cards(cards, title=spec.get("标题")), spec)
+                return _img_html(C.number_cards(cards, title=spec.get("标题")),
+                                 dict(spec, 类型="number_cards"))
             if typ == "contribution_bar":
                 return _img_html(C.contribution_bar(labels, vals, title=spec.get("标题"),
                                                     ylabel=spec.get("y轴")), spec)
@@ -545,26 +665,31 @@ _CSS = """
    正确做法是按真实家族名引用，并把基础家族列在后面兜底：
    命中专用家族时其自带字重生效，命中不到时由 font-weight 数值作用于基础家族。 */
 :root {
-  /* 与 OptionHelper Designer 的 design_tokens.py 对齐；以下是唯一的页面色板。 */
-  --oh-brand-red: #C8102E;
-  --oh-brand-red-deep: #890D26;
-  --oh-brand-red-soft: #FBF1F3;
+  /* 报告唯一色板：红＝核心，蓝＝对照，绿＝验证；三组保持相同明度阶梯。 */
+  --oh-brand-red: #BF3131;
+  --oh-brand-red-deep: #7D0A0A;
+  --oh-brand-red-light: #D96B6B;
+  --oh-brand-red-soft: #F0D1D1;
   --oh-paper: #FFFDFB;
-  --oh-ground: #F5F1F0;
+  --oh-ground: #EEEEEE;
   --oh-surface: #FFFFFF;
-  --oh-ink: #241D20;
-  --oh-ink-soft: #44383C;
-  --oh-muted: #6E5F63;
-  --oh-muted-soft: #75666A;
-  --oh-blue-gray: #49647D;
-  --oh-blue-gray-soft: #F3F6F8;
-  --oh-risk-gold-soft: #FBF7EE;
-  --oh-rule: #E9DADC;
-  --oh-paper-border: #E7D8DB;
-  --oh-red-border-soft: #E5C5CC;
-  --oh-red-surface: #FFFAFA;
-  --oh-table-border: #DDBCC3;
-  --oh-table-head-ink: #59353D;
+  --oh-ink: #2D2525;
+  --oh-ink-soft: #4B4141;
+  --oh-muted: #6F6464;
+  --oh-muted-soft: #837878;
+  --oh-blue-gray: #316FBF;
+  --oh-blue-gray-deep: #0A377D;
+  --oh-blue-gray-soft: #D1E0F0;
+  --oh-green: #31BF73;
+  --oh-green-soft: #D1F0E0;
+  --oh-risk-gold: #EAD196;
+  --oh-risk-gold-soft: #FBF4DF;
+  --oh-rule: #EEEEEE;
+  --oh-paper-border: #E6DCDC;
+  --oh-red-border-soft: #F0D1D1;
+  --oh-red-surface: #FFF9F9;
+  --oh-table-border: #E2C4C4;
+  --oh-table-head-ink: #5C3030;
   --f-fallback: "Noto Sans CJK SC","HarmonyOS Sans SC","Alibaba PuHuiTi","DengXian","等线",sans-serif;
   --f-reg: "Source Han Sans SC", var(--f-fallback);
   --f-med: "Source Han Sans SC Medium","Source Han Sans SC", var(--f-fallback);
@@ -616,6 +741,19 @@ h1 .accent { color:var(--oh-brand-red); }
 .body { font-size:10.5px; line-height:1.52; color:var(--oh-ink-soft); margin:4px 0;
         font-family:var(--f-med); font-weight:500; }
 .body b { font-family:var(--f-heavy); font-weight:700; color:var(--oh-brand-red); }
+/* 单张紧凑图不再在正文下方留下大片空白：正文和图各占约半页，图上仍保留标题、
+   数据来源与打印回退。宽趋势图、多系列图、表格和传导链保持整行，避免压缩横轴。 */
+.logic-split { display:flex; align-items:center; gap:12px; margin-top:4px; }
+.logic-split .body { flex:1 1 0; min-width:0; margin:0; }
+.logic-side-chart { flex:0 1 46%; min-width:0; max-width:345px; }
+.logic-side-chart .chart-block { margin:0; }
+.logic-side-chart .chart, .logic-side-chart .chart-switch { margin:0; }
+.logic-side-chart .chart img { width:100%; height:auto; }
+/* 数据卡 PNG 已按卡片数量给出固定逻辑宽度，禁止把单卡原图拉伸到整列；否则即使
+   matplotlib 字号固定，浏览器仍会把标题和数字一起放大。 */
+.logic-side-chart .chart--number-cards img { width:auto; max-width:100%; }
+.logic-side-chart .interactive-canvas { height:158px; }
+.logic-side-chart .chart-meta { white-space:normal; }
 .chart { text-align:center; margin:7px 0; }
 /* 宽度由 <img width> 按 CSS_DPI 定死，这里只兜底防溢出 */
 .chart img { max-width:100%; height:auto; }
@@ -639,6 +777,10 @@ h1 .accent { color:var(--oh-brand-red); }
   .interactive-screen { display:none !important; }
   .chart-print { display:block !important; }
   .chart-switch.rh-echarts-item-ready .chart-print { display:block !important; }
+}
+@media screen and (max-width:820px) {
+  .logic-split { display:block; }
+  .logic-side-chart { max-width:none; margin-top:7px; }
 }
 /* 图题说结论，这一行只说审计口径；7.5px 是在一页预算内仍可辨认的下限。 */
 .chart-meta { margin-top:1px; font-size:7.5px; line-height:1.25; color:var(--oh-muted);
@@ -763,10 +905,11 @@ def _echarts_assets() -> str:
 <script>
 (() => {
   if (!window.echarts) return;
-  const red = '#C8102E', blue = '#49647D', muted = '#6E5F63', grid = '#E9DADC';
+  const red = '#BF3131', redDeep = '#7D0A0A', blue = '#316FBF', green = '#31BF73',
+    muted = '#6F6464', grid = '#EEEEEE', ink = '#2D2525';
   const rendered = [];
   const title = (text) => ({ text: text || '', left: 'center', top: 2,
-    textStyle: { color: '#241D20', fontSize: 10, fontWeight: 700,
+    textStyle: { color: ink, fontSize: 10, fontWeight: 700,
       width: 310, overflow: 'truncate', ellipsis: '…' } });
   const common = (config) => ({
     title: title(config.title),
@@ -783,7 +926,7 @@ def _echarts_assets() -> str:
       axisLabel: { color: muted, fontSize: 8 }, splitLine: { lineStyle: { color: grid } } };
     option.series = [{ type: 'line', name: config.ylabel || '数值', data: config.values,
       showSymbol: false, smooth: false, lineStyle: { color: red, width: 2 },
-      areaStyle: { color: 'rgba(200,16,46,.10)' } }];
+      areaStyle: { color: 'rgba(191,49,49,.12)' } }];
     if (config.labels.length > 18) option.dataZoom = [{ type: 'inside', start: 72, end: 100 },
       { type: 'slider', height: 12, bottom: 2, start: 72, end: 100 }];
     return option;
@@ -809,7 +952,7 @@ def _echarts_assets() -> str:
     option.yAxis = { type: 'value', name: config.ylabel || '', axisLabel: { color: muted, fontSize: 8 },
       splitLine: { lineStyle: { color: grid } } };
     option.series = config.series.map((series, index) => ({ type: 'bar', name: series.name || `系列${index + 1}`,
-      data: series.values, barMaxWidth: 24, itemStyle: { color: [red, blue, '#855E22'][index] } }));
+      data: series.values, barMaxWidth: 24, itemStyle: { color: [red, blue, green][index] } }));
     return option;
   };
   const scatterOption = (config) => {
@@ -821,8 +964,26 @@ def _echarts_assets() -> str:
     option.tooltip = { trigger: 'item', confine: true, formatter: item => `${item.data.name}<br/>${config.xlabel || 'x'}：${item.value[0]}<br/>${config.ylabel || 'y'}：${item.value[1]}` };
     option.series = [{ type: 'scatter', data: config.points.map(point => ({ name: point.name, value: [point.x, point.y],
       symbolSize: point.name === config.highlight ? 13 : 8,
-      itemStyle: { color: point.name === config.highlight ? '#890D26' : red, opacity: .72 } })),
+      itemStyle: { color: point.name === config.highlight ? redDeep : red, opacity: .72 } })),
       label: { show: false } }];
+    return option;
+  };
+  const bubbleOption = (config) => {
+    const option = scatterOption(config);
+    const maximum = Math.max(...config.points.map(point => Number(point.size) || 0), 1);
+    option.tooltip = { trigger: 'item', confine: true, formatter: item => `${item.data.name}<br/>${config.xlabel || 'x'}：${item.value[0]}<br/>${config.ylabel || 'y'}：${item.value[1]}<br/>${config.size_label || '规模'}：${item.data.size}` };
+    option.series[0].data = config.points.map(point => ({ name: point.name, size: point.size, value: [point.x, point.y],
+      symbolSize: 7 + 24 * Math.sqrt(Math.max(0, point.size) / maximum),
+      itemStyle: { color: point.name === config.highlight ? redDeep : red, opacity: .55 } }));
+    return option;
+  };
+  const lollipopOption = (config) => {
+    const option = barOption(config);
+    option.series = [
+      { type: 'bar', data: config.values.map(value => ({ value, itemStyle: { color: value < 0 ? blue : red, opacity: .34 } })), barWidth: 3, silent: true },
+      { type: 'scatter', data: config.values.map(value => ({ value, itemStyle: { color: value < 0 ? blue : red } })), symbolSize: 10,
+        label: { show: true, position: 'top', color: ink, fontSize: 8, formatter: item => String(item.value) } }
+    ];
     return option;
   };
   const barLineOption = (config) => {
@@ -831,8 +992,8 @@ def _echarts_assets() -> str:
     option.grid.top = 48;
     option.series[0].name = config.bar_name || '柱状指标';
     option.series.push({ type: 'line', name: config.line_name || '线状指标', data: config.lines,
-      yAxisIndex: 1, showSymbol: true, symbolSize: 5, lineStyle: { color: '#241D20', width: 1.8 },
-      itemStyle: { color: '#241D20' } });
+      yAxisIndex: 1, showSymbol: true, symbolSize: 5, lineStyle: { color: green, width: 1.8 },
+      itemStyle: { color: green } });
     option.yAxis = [option.yAxis, { type: 'value', axisLabel: { color: muted, fontSize: 8 },
       splitLine: { show: false } }];
     return option;
@@ -847,7 +1008,7 @@ def _echarts_assets() -> str:
         const canvas = holder.querySelector('.interactive-canvas');
         if (!canvas) continue;
         const options = { line: lineOption, bar: barOption, grouped_bar: groupedOption,
-          scatter: scatterOption, bar_line: barLineOption };
+          scatter: scatterOption, bubble: bubbleOption, lollipop: lollipopOption, bar_line: barLineOption };
         if (!options[config.kind]) continue;
         const chart = echarts.init(canvas, null, { renderer: 'canvas' });
         chart.setOption(options[config.kind](config), true);
@@ -916,11 +1077,15 @@ def build_html(ma, rc, *, org: str = DEFAULT_ORG, date: str = "", oh_result=None
         # （正文已写"高毛利红利期或正走向终结"，加粗句再说一遍"红利期或退却"），
         # 读者读到的是同一句话说两遍。但它本身不删——改作**交给 OptionHelper 的输入**，
         # 由它把每条逻辑的落点汇成观点包（见 §10）。
+        if 'chart-block--side' in chart_html:
+            content_html = f'<div class="logic-split"><div class="body">{_rich(lc.论述)}</div>' \
+                           f'<div class="logic-side-chart">{chart_html}</div></div>'
+        else:
+            content_html = f'<div class="body">{_rich(lc.论述)}</div>{chart_html}'
         sections.append(f"""
         <div class="logic">
           <span class="tag">策略逻辑{_CN_NUM[i]}</span><span class="ltitle">{_esc(t)}</span>
-          <div class="body">{_rich(lc.论述)}</div>
-          {chart_html}
+          {content_html}
         </div>""")
 
     # 「补充观察」已按要求删除（#82）：它把可选池逻辑的 `结论` 压成一行印在版面上，
@@ -976,6 +1141,10 @@ def _underlying_block(ma, rc, oh=None) -> str:
     development_only 的外部依赖，它掉线不该拖累主流程。只有明确拿到结构才越过
     §10 那道线：本系统自己既无波动率曲面也无报价，不能替 OptionHelper 断言结构。
     """
+    # 研究报告完成时，自动发现的 ETF 只是待审核候选，不是已确认挂钩标的。
+    # 只有 OptionHelper 已按分析师选择完成正式报价时，才能把确定性卡片写入客户版。
+    if oh is None or not getattr(oh, "ok", False):
+        return ""
     try:
         from core import viewpoint as vp
 
@@ -998,6 +1167,35 @@ def _underlying_block(ma, rc, oh=None) -> str:
 
     return (f'<div class="under"><div class="u-line"><span class="lbl">挂钩标的</span>'
             f'<span class="u-main">{head}</span></div>{body}</div>')
+
+
+def confirmed_underlying_block(code: str, *, name: str = "", reason: str = "",
+                               product_profile: dict | None = None) -> str:
+    """仅为研究完成后已由分析师确认、且已完成正式报价的标的生成卡片。"""
+    code = str(code or "").strip().upper()
+    if not code:
+        return ""
+    profile = product_profile if isinstance(product_profile, dict) else {}
+    display_name = str(name or profile.get("name") or "").strip()
+    identity = (f'<b>{_esc(display_name)}</b>（{_esc(code)}）'
+                if display_name else f'<b>{_esc(code)}</b>')
+    rows = [identity]
+    try:
+        volatility = float(profile.get("realized_volatility_20d"))
+        text = f"20日实现波动率 {volatility:.1f}%"
+        if profile.get("volatility_percentile_3y") is not None:
+            text += f"，处近3年 {float(profile['volatility_percentile_3y']):.1f}%分位"
+        rows.append(text)
+    except (TypeError, ValueError):
+        pass
+    head = "　｜　".join(rows)
+    why = (str(reason or "").strip()
+           or "由分析师在研究完成后确认，并已通过 OptionHelper 正式报价流程。")
+    return (
+        '<div class="under"><div class="u-line"><span class="lbl">挂钩标的</span>'
+        f'<span class="u-main">{head}</span></div>'
+        f'<div class="u-why"><b>与研究主题的关联及选取原因</b>：{_esc(why)}</div></div>'
+    )
 
 
 def _recommendation_block(oh) -> str:

@@ -99,7 +99,17 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
         print(f"  · 已采用人工填写的外部事实 {len(ma.外部事实已填)} 条")
 
     if tracker:
-        tracker.add_metadata("分析标的", ma.field_values.get("__etf__") or ma.rep_code)
+        research_mode = str((getattr(ma, "市场确认", None) or {}).get("research_mode") or "")
+        basket = list(getattr(ma, "研究篮子", None) or [])
+        if research_mode == "theme_etf" and ma.field_values.get("__etf__"):
+            research_target = f"主题 ETF：{ma.field_values.get('__etf__')} 的真实跟踪指数成分"
+        elif research_mode == "theme_basket" or basket:
+            research_target = f"人工主题篮子（{len(basket)}只）"
+        else:
+            research_target = f"标准行业：{ma.field_values.get('__sector__') or getattr(ma, 'sector', '') or '—'}"
+        tracker.add_metadata("研究取数目标", research_target)
+        # 兼容旧运行摘要读取器；值与“研究取数目标”一致，不再写成自动发现 ETF。
+        tracker.add_metadata("分析标的", research_target)
         dates = sorted({getattr(value, "as_of", "") for value in ma.field_values.values()
                         if getattr(value, "ok", False) and getattr(value, "as_of", "")})
         if dates:
@@ -143,7 +153,10 @@ def _finish(ma, title: str, *, tracker: RunTracker | None = None,
         try:
             from core import optionhelper_bridge as snapshot_ohb, viewpoint as snapshot_vpmod
 
-            snapshot_vp = snapshot_vpmod.build(ma, rc)
+            # 研究阶段的交接包只固化共同市场观点，不预选挂钩标的。
+            # 标准行业/人工篮子/主题 ETF 都是研究取数路径；真正待报价
+            # 标的必须在研究完成后由分析师从客户点名/系统候选中确认。
+            snapshot_vp = snapshot_vpmod.build(ma, rc, include_underlying=False)
             if snapshot_vp.ok:
                 snapshot_path = tracker.directory / f"{tracker.run_id}.optionhelper-handoff.json"
                 snapshot_path.write_text(json.dumps({
@@ -482,7 +495,7 @@ def generate_from_brief(text: str, *, pick: bool = False,
 
     if market_confirmation.needs_confirmation(b):
         if not confirm_market:
-            print("  ✗ 该需求需要分析师确认市场、研究口径和挂钩工具；GUI 会自动弹出确认页。")
+            print("  ✗ 该需求需要分析师确认研究市场与取数目标；GUI 会自动弹出确认页。")
             print("    命令行请加 --confirm-market，并在提示后输入一行确认 JSON。")
             return None
         provider = get_provider()
@@ -503,7 +516,7 @@ def generate_from_brief(text: str, *, pick: bool = False,
                 return None
             value = market_confirmation.from_dict(raw_confirmation)
             if tracker:
-                with tracker.stage("market_confirmation", "校验分析师确认的市场、研究口径与挂钩标的") as stage:
+                with tracker.stage("market_confirmation", "校验分析师确认的研究市场与取数目标") as stage:
                     checked = market_confirmation.verify(value, b, provider=provider)
                     if not checked.ok:
                         tracker.fail_stage(stage, "；".join(checked.errors))
@@ -511,6 +524,8 @@ def generate_from_brief(text: str, *, pick: bool = False,
                 checked = market_confirmation.verify(value, b, provider=provider)
             if not checked.ok:
                 payload["errors"] = checked.errors
+                if checked.exposure is not None:
+                    payload["etf_exposure"] = asdict(checked.exposure)
                 # 重新弹窗时保留分析师刚才的选择；代码采用后端规范化后的值，
                 # 例如 516520.SS 会显示为 iFinD 使用的 516520.SH。
                 payload["previous_confirmation"] = asdict(value)
@@ -525,7 +540,8 @@ def generate_from_brief(text: str, *, pick: bool = False,
                 # 报价审核选择；不能只因分析师暂不把 ETF 用作研究数据源就丢掉它们。
                 suggested = [
                     {key: item.get(key) for key in ("code", "name", "type", "note", "origin",
-                                                     "average_daily_amount")}
+                                                     "average_daily_amount", "exposure", "exposure_level",
+                                                     "tracking_index")}
                     for item in (payload.get("suggested_instruments") or [])
                     if isinstance(item, dict) and str(item.get("code") or "").strip()
                 ]
@@ -533,14 +549,71 @@ def generate_from_brief(text: str, *, pick: bool = False,
                     tracker.add_metadata("系统建议挂钩工具", json.dumps(suggested, ensure_ascii=False))
             for warning in checked.warnings:
                 print(f"  ⚠ {warning}")
-            print(f"  ✓ 已确认：{value.market}｜{value.research_scope}｜"
-                  f"{'仅研究' if value.research_only else value.underlying_code}")
+            if checked.exposure is not None:
+                print(f"  · ETF 主题暴露：{checked.exposure.label}｜{checked.exposure.reason}")
+                if checked.exposure.tracking_index:
+                    print(f"    跟踪指数：{checked.exposure.tracking_index}")
+                if checked.exposure.major_constituents:
+                    print(f"    主要成分：{'、'.join(checked.exposure.major_constituents[:5])}")
+            target_label = (
+                f"主题ETF {value.underlying_code}" if value.research_mode == "theme_etf"
+                else (f"人工主题篮子 {len(value.theme_basket_codes)}只"
+                      if value.research_mode == "theme_basket" else f"标准行业 {value.research_scope}")
+            )
+            print(f"  ✓ 已确认研究取数目标：{value.market}｜{target_label}"
+                  + ("｜仅研究不报价" if value.research_only else ""))
             break
 
-    # 事件本体的真实情况、它与本次行业/ETF的传导关系，不能由模型从“海力士发业绩”
-    # 这句话里补全。证据不足时在任何行情/LLM调用之前终止，明确告诉分析师不会生成报告。
+    # 事件本体不能由模型常识补全；A股暴露又必须等研究取数对象确认后才能精确检索。
+    # 因此这里在行情研究开始前完成第二阶段证据审核，证据链不完整就停止生成报告。
     evidence = getattr(o, "事件证据", None) or event_evidence.parse(None)
     gate = event_evidence.assess(b, evidence)
+    if gate.required and not gate.ready and confirm_market:
+        confirmed = getattr(b, "市场确认", None) or {}
+        exposure = confirmed.get("etf_exposure") if isinstance(confirmed.get("etf_exposure"), dict) else {}
+        basket = [
+            {"code": str(getattr(item, "代码", "") or ""),
+             "name": str(getattr(item, "名称", "") or "")}
+            for item in (getattr(b, "主题篮子候选", None) or [])
+        ]
+        research_context = {
+            "market": str(getattr(b, "市场范围", "") or ""),
+            "research_theme": str(getattr(b, "研究主题", "") or getattr(b, "主题", "") or ""),
+            "research_mode": str(confirmed.get("research_mode") or "industry"),
+            "research_scope": str(
+                confirmed.get("research_scope")
+                or getattr(b, "研究篮子口径", "")
+                or "、".join(getattr(b, "涉及板块", None) or [])
+            ),
+            "theme_basket": basket,
+            "underlying_code": str(confirmed.get("underlying_code") or ""),
+            "underlying_name": str(exposure.get("official_name") or ""),
+            "tracking_index": str(exposure.get("tracking_index") or ""),
+            "major_constituents": list(exposure.get("major_constituents") or []),
+        }
+        print("EVENT_EVIDENCE_CONTEXT_REQUIRED=" + json.dumps({
+            "message": "研究取数对象已确认，现可针对该对象查找A股暴露并组合传导链。",
+            "missing": list(gate.missing),
+            "research_context": research_context,
+            "existing_evidence": event_evidence.to_dict(evidence),
+        }, ensure_ascii=False), flush=True)
+        line = sys.stdin.readline()
+        if not line:
+            print("  ✗ 未收到事件证据确认，已停止。")
+            return None
+        try:
+            raw_evidence = json.loads(line)
+        except json.JSONDecodeError as error:
+            print(f"  ✗ 事件证据确认 JSON 无效：{error}")
+            return None
+        if raw_evidence.get("cancelled"):
+            print("  ✗ 分析师取消事件证据确认，已停止。")
+            return None
+        evidence = event_evidence.parse(raw_evidence.get("event_evidence") or raw_evidence)
+        gate = event_evidence.assess(b, evidence)
+        if tracker and not evidence.errors:
+            tracker.add_metadata("分析师确认事件证据", json.dumps(
+                event_evidence.to_dict(evidence), ensure_ascii=False))
     if gate.required and not gate.ready:
         entity = getattr(getattr(b, "触发实体", None), "名称", "该事件主体")
         message = gate.message(entity)
@@ -565,8 +638,8 @@ def generate_from_brief(text: str, *, pick: bool = False,
 
     research_only = bool((getattr(b, "市场确认", None) or {}).get("research_only"))
     t = b.代表标的
-    # 只有“主题 ETF 路径”中的 ETF 同时是研究对象与挂钩标的；标准行业和人工
-    # 主题篮子路径里的 ETF 仅供报价，不能取代各自的研究篮子。
+    # 只有“主题 ETF 路径”中的 ETF 是研究取数目标；它会在研究完成后作为报价
+    # 候选再次展示，但此处不能提前把它认定为正式挂钩标的。
     confirmed_code = str(getattr(b, "确认挂钩标的", "") or "").strip()
     confirmed_type = str(getattr(b, "确认挂钩标的类型", "") or "")
     confirmed = getattr(b, "市场确认", None) or {}

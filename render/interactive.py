@@ -17,7 +17,8 @@ from pathlib import Path
 
 
 _LOCAL_ECHARTS_HOST = "../assets/vendor/"
-_PALETTE = ("#C8102E", "#49647D", "#855E22", "#7E8A99")
+# 与客户版 HTML / PDF 静态图同一色板：红＝核心，蓝＝对照，绿＝验证。
+_PALETTE = ("#BF3131", "#316FBF", "#31BF73", "#D96B6B", "#6B9FD9", "#6BD99F")
 
 
 def _number(value) -> float | None:
@@ -229,14 +230,14 @@ def render_internal_review(ma, rc, out_path: str | Path) -> str:
     page = target.read_text(encoding="utf-8")
     styles = """
     <style>
-      body { margin:0; background:#F5F1F0; color:#241D20; font-family:"Source Han Sans SC","Noto Sans CJK SC",sans-serif; }
-      header, .overview { max-width:1180px; margin:18px auto 0; background:#FFFDFB; border:1px solid #E7D8DB; padding:18px 24px; }
-      .eyebrow { color:#C8102E; font-size:12px; font-weight:700; letter-spacing:1.2px; }
-      h1 { font-size:24px; margin:6px 0; } h2 { font-size:16px; margin:0 0 10px; color:#890D26; }
-      p { color:#6E5F63; margin:5px 0; line-height:1.55; }
+      body { margin:0; background:#EEEEEE; color:#2D2525; font-family:"Source Han Sans SC","Noto Sans CJK SC",sans-serif; }
+      header, .overview { max-width:1180px; margin:18px auto 0; background:#FFFDFB; border:1px solid #E6DCDC; padding:18px 24px; }
+      .eyebrow { color:#BF3131; font-size:12px; font-weight:700; letter-spacing:1.2px; }
+      h1 { font-size:24px; margin:6px 0; } h2 { font-size:16px; margin:0 0 10px; color:#7D0A0A; }
+      p { color:#6F6464; margin:5px 0; line-height:1.55; }
       .metrics { display:grid; grid-template-columns:repeat(6,minmax(120px,1fr)); gap:8px; }
-      .metric { background:#FBF1F3; border-left:3px solid #C8102E; padding:8px 10px; min-height:58px; }
-      .metric span { display:block; color:#6E5F63; font-size:12px; } .metric b { display:block; margin-top:5px; font-size:15px; }
+      .metric { background:#F0D1D1; border-left:3px solid #BF3131; padding:8px 10px; min-height:58px; }
+      .metric span { display:block; color:#6F6464; font-size:12px; } .metric b { display:block; margin-top:5px; font-size:15px; }
       .scope { margin-top:13px; font-size:13px; } .tab { max-width:1230px; margin:18px auto; background:#FFFDFB; }
       @media (max-width:900px) { .metrics { grid-template-columns:repeat(2,minmax(120px,1fr)); } }
     </style>

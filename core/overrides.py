@@ -64,6 +64,9 @@ class Overrides:
         evidence = self.事件证据
         return (not self.字段覆盖 and not self.外部事实
                 and not getattr(evidence, "event_facts", [])
+                and not getattr(evidence, "industry_mechanisms", [])
+                and not getattr(evidence, "ashare_exposures", [])
+                and not getattr(evidence, "inference_chains", [])
                 and not getattr(evidence, "transmission_links", []))
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -10,7 +11,7 @@ from unittest.mock import patch
 from core import instruments
 from core.brief import Brief, TargetRef
 from core.market_confirmation import (
-    Confirmation, apply_to_brief, needs_confirmation, proposal, verify,
+    Confirmation, apply_to_brief, assess_exposure, needs_confirmation, proposal, verify,
 )
 from core.provider import FetchResult
 
@@ -89,6 +90,12 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertEqual(b.候选标的[0].代码, "512000.SH")
         self.assertEqual(b.候选标的[0].名称, "券商ETF")
         b.候选标的[0].校验 = check
+        # 客户点名的 ETF 会保留在研究完成后的报价池，但不能在分析师未确认
+        # “主题 ETF 路径”时悄悄覆盖标准行业/人工篮子的研究取数对象。
+        self.assertEqual(pipeline._explicit_etf_from_brief(b), "")
+        b.确认挂钩标的 = "512000.SH"
+        b.确认挂钩标的类型 = "行业ETF"
+        b.市场确认 = {"research_mode": "theme_etf"}
         self.assertEqual(pipeline._explicit_etf_from_brief(b), "512000.SH")
 
     def test_generic_etf_theme_name_accepts_verified_fund_full_name(self) -> None:
@@ -103,12 +110,12 @@ class MarketConfirmationTests(unittest.TestCase):
         unrelated = topics._verify_code("515250.SH", "新能源车ETF", self.provider)
         self.assertTrue(unrelated.startswith("名称不符:"), unrelated)
 
-    def test_catalogued_explicit_etf_skips_confirmation_even_without_llm_candidate(self) -> None:
-        """用户点名已知 ETF 时，不应再要求选择同一只工具或主题公司篮子。"""
+    def test_catalogued_explicit_etf_still_confirms_research_data_path(self) -> None:
+        """用户点名 ETF 仍需确认研究取数路径；产品候选不能自动决定研究篮子。"""
         # 自然语言里代码后通常直接接“的”，不能依赖 ASCII 的单词边界。
         b = brief("根据目前酒ETF 512690.SH的市场情况推荐产品", "A股", ["白酒"])
         b.候选标的 = []  # 模拟解析器遗漏候选；判断必须只看用户原文和受控目录。
-        self.assertFalse(needs_confirmation(b))
+        self.assertTrue(needs_confirmation(b))
 
     def test_explicit_stocks_keep_theme_basket_when_request_also_names_etf(self) -> None:
         """ETF 是产品工具，不能吞掉客户点名的产业链公司研究篮子。"""
@@ -301,6 +308,23 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertIn("通信设备", pkg.标的选择说明)
         self.assertIn("可交易行业表达", pkg.标的选择说明)
 
+    def test_research_handoff_does_not_preselect_underlying(self) -> None:
+        """研究完成前冻结的观点包只含共同观点，系统候选不能冒充已确认标的。"""
+        from core import viewpoint
+        from core.writer import ReportContent
+
+        ma = SimpleNamespace(
+            ok=True, rep_code="300308.SZ", rep_name="中际旭创",
+            field_values={"__sector__": "光模块", "__etf__": "515050.SH"},
+            确认挂钩标的="515050.SH", 仅研究=False, 挂钩择优=None,
+            研究主题="光模块", 研究篮子口径="主题公司篮子", 研究篮子=[],
+            板块理由="", plan=SimpleNamespace(整体方向="看涨"), logics=[],
+        )
+        rc = ReportContent(主题="光模块", 类型="产业趋势", 推荐方向="看涨", ok=True)
+        pkg = viewpoint.build(ma, rc, include_underlying=False)
+        self.assertEqual(pkg.标的代码, "")
+        self.assertIn("待研究完成后", pkg.标的选择说明)
+
     def test_analyst_selected_theme_basket_is_frozen_for_this_run(self) -> None:
         b = brief("光模块需求上修", "A股", ["通信设备"])
         pool = [TargetRef(f"候选{i}", f"300{i:03d}.SZ", "ok:主题候选") for i in range(6)]
@@ -348,6 +372,45 @@ class MarketConfirmationTests(unittest.TestCase):
         rows = _discovery_rows(codes, names, b)
         self.assertEqual(len(rows), _DISCOVERY_SCAN_LIMIT)
         self.assertEqual(rows[0][1], "光通信主题ETF")
+
+    def test_dynamic_etf_discovery_can_rank_verified_rows_without_nameerror(self) -> None:
+        """主题暴露改为分级后，动态候选排序仍须使用已构造的官方证据文本。"""
+        from core import market_confirmation
+        from core.provider import iFinDProvider
+
+        class DiscoveryProvider(iFinDProvider):
+            def __init__(self):
+                self.total_data_vol = 0
+
+            def available(self):
+                return True
+
+            def _ensure_login(self):
+                return None
+
+            def get_basic(self, codes, indicators, params=""):
+                data = {}
+                for code in codes:
+                    if code == "516520.SH":
+                        values = {"ths_stock_short_name_stock": "华泰柏瑞智能驾驶ETF",
+                                  "ths_tracking_index_code_fund": "930721.CSI"}
+                    elif code == "930721.CSI":
+                        values = {"ths_stock_short_name_stock": "中证智能汽车主题指数"}
+                    else:
+                        values = {}
+                    data[code] = {indicator: values.get(indicator, "") for indicator in indicators}
+                return FetchResult(True, "fake", data=data)
+
+        response = {"errorcode": 0, "dataVol": 1, "tables": [{"table": {
+            "基金代码": ["516520.SH"], "基金简称": ["智能驾驶ETF"],
+        }}]}
+        fake_ifind = SimpleNamespace(THS_iwencai=lambda *_args, **_kwargs: response)
+        b = brief("汽车电子智能化投资机会", "A股", ["汽车电子"])
+        b.ETF检索词 = ["汽车电子", "智能驾驶"]
+        with patch.dict(sys.modules, {"iFinDPy": fake_ifind}):
+            rows = market_confirmation.discover_etfs(b, provider=DiscoveryProvider())
+        self.assertEqual(rows[0]["code"], "516520.SH")
+        self.assertEqual(rows[0]["exposure_level"], "direct")
 
     def test_dynamic_discovery_only_fills_remaining_suggestion_slots(self) -> None:
         from core import market_confirmation
@@ -426,7 +489,8 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertFalse(event_evidence.assess(b, incomplete).ready)
 
         evidence = event_evidence.parse({
-            "事件事实": [{"内容": "公司披露本季 HBM 出货增长", "来源": "SK hynix 季报 p4"}],
+            "事件事实": [{"内容": "公司披露本季 HBM 出货增长", "来源": "SK hynix 季报 p4",
+                       "取得方式": "自动检索后经分析师确认"}],
             "传导关系": [{"关系": "供应链", "内容": "该变化影响 A 股存储产业链预期",
                        "来源": "产业链研报 p8"}],
         })
@@ -435,7 +499,24 @@ class MarketConfirmationTests(unittest.TestCase):
         event_evidence.attach_to_analysis(ma, b, evidence)
         self.assertIn("触发标的_事件事实1", ma.field_values)
         self.assertIn("事件传导证据1", ma.field_values)
+        self.assertIn("自动检索", ma.field_values["触发标的_事件事实1"].note)
         self.assertEqual(ma.事件证据["事件主体"], "SK海力士 000660.KS")
+
+    def test_event_evidence_accepts_reviewed_three_part_chain(self) -> None:
+        from core import event_evidence
+        from core.genres import TYPE_EVENT
+
+        b = Brief(原始需求="海外厂商业绩对A股产业链影响", 主导类型=TYPE_EVENT,
+                  触发实体=TargetRef("海外厂商", "TEST.US", "ok"), ok=True)
+        evidence = event_evidence.parse({
+            "事件事实": [{"证据ID": "F1", "内容": "公司公告确认产品进入量产。", "来源": "公司公告"}],
+            "产业机制": [{"证据ID": "M1", "内容": "量产会增加相关器件采购需求。", "来源": "产业报告"}],
+            "A股暴露": [{"证据ID": "E1", "内容": "公司主营业务包含相关器件。", "来源": "公司年报"}],
+            "组合传导链": [{"事实证据ID": ["F1"], "机制证据ID": ["M1"],
+                           "暴露证据ID": ["E1"], "结论": "该事件可能经器件需求影响本次A股研究对象。",
+                           "方向": "正向", "置信度": "中"}],
+        })
+        self.assertTrue(event_evidence.assess(b, evidence).ready, evidence.errors)
 
     def test_hk_internet_accepts_only_explicit_cross_border_tool(self) -> None:
         b = brief("基于港股互联网板块的投资机会", "港股", ["传媒"])
@@ -493,6 +574,66 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertEqual(b.确认挂钩标的, "516520.SH")
         self.assertEqual(b.主题篮子候选, [])
 
+    def test_exposure_assessment_distinguishes_direct_partial_and_unrelated(self) -> None:
+        direct = assess_exposure(
+            "汽车电子", instruments.Instrument("516520.SH", "智能驾驶ETF", "华泰柏瑞智能驾驶ETF",
+                                                  "行业ETF"),
+            official_name="华泰柏瑞智能驾驶ETF", tracking_index="中证智能汽车主题指数",
+        )
+        partial = assess_exposure(
+            "光模块", instruments.Instrument("515050.SH", "通信ETF", "华夏中证5G通信主题ETF", "行业ETF"),
+            official_name="华夏中证5G通信主题ETF", tracking_index="中证5G通信主题指数",
+        )
+        unrelated = assess_exposure(
+            "汽车电子", instruments.Instrument("512690.SH", "酒ETF", "鹏华中证酒ETF", "行业ETF"),
+            official_name="鹏华中证酒ETF", tracking_index="中证酒指数",
+        )
+        self.assertEqual(direct.level, "direct")
+        self.assertEqual(partial.level, "partial")
+        self.assertEqual(unrelated.level, "unrelated")
+
+    def test_partial_theme_etf_requires_reason_and_analyst_confirmation(self) -> None:
+        b = brief("光模块产业链投资机会", "A股", ["通信设备"])
+        rejected = verify(Confirmation(
+            "A股", "光模块", "515050.SH", research_theme="光模块", research_mode="theme_etf",
+        ), b, provider=self.provider)
+        self.assertFalse(rejected.ok)
+        self.assertEqual(rejected.exposure.level, "partial")
+        self.assertTrue(any("部分暴露" in error for error in rejected.errors))
+
+        accepted = verify(Confirmation(
+            "A股", "光模块", "515050.SH", research_theme="光模块", research_mode="theme_etf",
+            partial_exposure_confirmed=True, reason="该 ETF 跟踪通信主题指数，覆盖光模块所属的通信设备产业链。",
+        ), b, provider=self.provider)
+        self.assertTrue(accepted.ok, accepted.errors)
+        self.assertEqual(accepted.exposure.level, "partial")
+        self.assertTrue(any("已按分析师确认继续" in warning for warning in accepted.warnings))
+
+    def test_theme_etf_unrelated_exposure_cannot_be_manually_overridden(self) -> None:
+        b = brief("汽车电子智能化投资机会", "A股", ["汽车电子"])
+        checked = verify(Confirmation(
+            "A股", "汽车电子", "515050.SH", research_theme="汽车电子", research_mode="theme_etf",
+            partial_exposure_confirmed=True, reason="人为填写不能覆盖不相关标的。",
+        ), b, provider=self.provider)
+        self.assertFalse(checked.ok)
+        self.assertEqual(checked.exposure.level, "unrelated")
+        self.assertTrue(any("不相关" in error for error in checked.errors))
+
+    def test_research_only_theme_etf_still_validates_research_target(self) -> None:
+        """仅研究只关闭报价；主题 ETF 作为取数目标仍必须真实可用。"""
+        b = brief("汽车电子智能化投资机会", "A股", ["汽车电子"])
+        valid = verify(Confirmation(
+            "A股", "汽车电子", "516520.SH", research_only=True,
+            research_theme="汽车电子", research_mode="theme_etf",
+        ), b, provider=self.provider)
+        self.assertTrue(valid.ok, valid.errors)
+        invalid = verify(Confirmation(
+            "A股", "汽车电子", "123456.SH", research_only=True,
+            research_theme="汽车电子", research_mode="theme_etf",
+        ), b, provider=self.provider)
+        self.assertFalse(invalid.ok)
+        self.assertTrue(any("无法从数据源验证" in error for error in invalid.errors))
+
     def test_common_ss_suffix_is_normalized_for_ifind(self) -> None:
         from core.market_confirmation import from_dict
 
@@ -513,9 +654,19 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertTrue(checked.ok, checked.errors)
         self.assertTrue(any("优选门槛" in warning for warning in checked.warnings))
 
+    def test_theme_etf_above_point_one_yi_hard_floor_is_accepted(self) -> None:
+        b = brief("汽车电子智能化投资机会", "A股", ["汽车电子"])
+        with patch("core.history.series", return_value=[1.1e7] * 20):
+            checked = verify(Confirmation(
+                "A股", "汽车电子", "516520.SH",
+                research_theme="汽车电子", research_mode="theme_etf",
+            ), b, provider=self.provider)
+        self.assertTrue(checked.ok, checked.errors)
+        self.assertTrue(any("0.1 亿元最低门槛" in warning for warning in checked.warnings))
+
     def test_theme_etf_below_minimum_liquidity_is_rejected(self) -> None:
         b = brief("汽车电子智能化投资机会", "A股", ["汽车电子"])
-        with patch("core.history.series", return_value=[2.0e7] * 20):
+        with patch("core.history.series", return_value=[5.0e6] * 20):
             checked = verify(Confirmation(
                 "A股", "汽车电子", "516520.SH",
                 research_theme="汽车电子", research_mode="theme_etf",
@@ -555,7 +706,7 @@ class MarketConfirmationTests(unittest.TestCase):
 
     def test_illiquid_etf_is_rejected(self) -> None:
         b = brief("AI算力产业链景气变化", "A股", ["半导体", "通信设备"])
-        with patch("core.history.series", return_value=[2.0e7] * 20):
+        with patch("core.history.series", return_value=[5.0e6] * 20):
             checked = verify(Confirmation("A股", "半导体、通信设备", "515980.SH"), b,
                              provider=self.provider)
         self.assertFalse(checked.ok)
@@ -622,6 +773,16 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.data, {"ok": True})
         self.assertFalse(mocked.call_args_list[-1].kwargs["json_mode"])
+
+    def test_chat_json_injects_explicit_json_instruction_when_caller_omits_it(self) -> None:
+        from llm.client import ChatResult, DeepSeekClient
+
+        client = DeepSeekClient()
+        with patch.object(client, "chat", return_value=ChatResult(True, data={})) as mocked:
+            result = client.chat_json("返回结构化对象。", "请生成结果。", retries=0)
+        self.assertTrue(result.ok)
+        messages = mocked.call_args.args[0]
+        self.assertIn("json", "\n".join(item["content"] for item in messages).lower())
 
     def test_llm_requests_disable_thinking_for_machine_readable_output(self) -> None:
         from unittest.mock import Mock

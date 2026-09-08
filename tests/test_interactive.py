@@ -40,3 +40,7 @@ class InternalInteractiveReviewTests(unittest.TestCase):
             self.assertNotIn("https://assets.pyecharts.org", text)
             self.assertIn("内部交互复核", text)
 
+    def test_internal_review_uses_the_shared_report_palette(self) -> None:
+        from render.interactive import _PALETTE
+
+        self.assertEqual(_PALETTE[:3], ("#BF3131", "#316FBF", "#31BF73"))

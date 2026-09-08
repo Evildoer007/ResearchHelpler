@@ -339,7 +339,9 @@ def underlying_for(sector: str) -> tuple[Instrument | None, str]:
 # 实测机器人ETF同类两只，华夏562500日均7.4亿、天弘159770只有1.8亿，
 # 成交越薄，净值波动里混进的折溢价/流动性噪声占比越高，这时候把它自己的
 # 波动率读数当成"板块的真实波动率"会失真，不是板块在动，是这只ETF不活跃。
-_MIN_ETF_DAILY_AMT = 1e8   # 1亿元/日均（近20日）
+# 0.1亿元/日均（近20日）是可纳入本次 ETF 研究/报价候选的最低门槛；1亿元
+# 仍在确认页标为优选流动性，而不是把客户点名 ETF 一律拒绝的硬线。
+_MIN_ETF_DAILY_AMT = 1e7
 
 
 def resolve_analysis_etf(
@@ -372,7 +374,7 @@ def resolve_analysis_etf(
     avg = sum(s[d] for d in days) / len(days)
     if avg < min_daily_amt:
         return None, (f"{inst.简称}（{inst.代码}）近20日日均成交额仅{avg / 1e8:.2f}亿，"
-                      f"低于{min_daily_amt / 1e8:.0f}亿门槛，成交太薄不采信其自身价格序列")
+                      f"低于{min_daily_amt / 1e8:.1f}亿门槛，成交太薄不采信其自身价格序列")
     return inst, f"{note}（近20日日均成交{avg / 1e8:.1f}亿）"
 
 

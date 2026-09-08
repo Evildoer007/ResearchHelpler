@@ -209,6 +209,12 @@ class DeepSeekClient:
         截断位置都在 char 3300 附近）。故改用 `finish_reason` 区分，
         不靠错误字符串猜。
         """
+        # DeepSeek 的 JSON Output 协议要求提示词中显式出现 ``json``；否则即使
+        # ``response_format`` 已正确设置为 ``json_object``，服务端仍会返回 HTTP 400。
+        # 调用方通常会自行写明，但这里是所有结构化请求的共同边界，必须统一兜底，
+        # 避免某个新增环节因漏写一个英文单词而整段不可用。
+        if "json" not in f"{system}\n{user}".lower():
+            system = system.rstrip() + "\n请只返回一个合法的 JSON 对象，不要附加解释文字。"
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         last = ChatResult(False, error="未执行")
         for attempt in range(retries + 1):

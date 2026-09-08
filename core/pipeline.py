@@ -162,18 +162,16 @@ def fetch_profile(
     if sector and not commodity_etf and not theme_basket_required:
         sector = universe.resolve_sector(sector, rep_code=rep_code, provider=provider)
 
-    # 分析 ETF：显式指定优先；否则按板块名反推（#85）。它一旦确定，本次所有板块级
-    # 聚合（PB/波动率/分位/PE/ROE/净利同比 + 板块快照）都改用这只 ETF **真实跟踪
-    # 指数的成分股**，而不是 iwencai 按行业名模糊匹配的近似篮子——"分析的东西"与
-    # "挂钩的东西"从此是同一个篮子。取不到真实成分就退回原行为（iwencai 行业篮子）。
+    # 研究取数目标由分析师确认的三条路径唯一决定：
+    #   · 标准行业：不传 analysis_etf，使用数据源行业成分；
+    #   · 人工主题篮子：不传 analysis_etf，只使用分析师勾选公司；
+    #   · 主题 ETF：显式传入 analysis_etf，使用其真实跟踪指数成分。
+    # 不再根据行业名自动反推 ETF。自动发现的 ETF 是研究完成后的报价候选，
+    # 不能在研究阶段偷换行情、波动率或成分口径。
     etf_code = (analysis_etf or "").strip()
     etf_note = ""
     if etf_code:
-        etf_note = "用户需求指定的挂钩 ETF"
-    elif sector:
-        _i, _note = _inst.resolve_analysis_etf(sector, provider=provider)
-        etf_code = _i.代码 if _i else ""
-        etf_note = _note
+        etf_note = "分析师确认的主题 ETF 研究取数目标"
     theme_basket_ready = len(theme_basket) >= _THEME_BASKET_MIN
     # 少于 5 只只能称为“核心样本”，不能用它输出行业整体 PB/ROE/盈利等聚合结论；
     # 更不能退回通信设备等宽行业替代。行情类 ETF 字段仍可照常取，研究报告会如实
@@ -222,6 +220,9 @@ def fetch_profile(
     profile["__etf__"] = etf_code
     profile["__etf_note__"] = etf_note
     profile["__etf_成分数__"] = len(basket)
+    # 保存本轮实际研究篮子，供报告阶段重建只读结构图。不能在报告阶段重新按主题名
+    # 查询宽行业，否则“光模块/锂电池”等细分主题又会被悄悄扩成通信设备/电力设备。
+    profile["__research_basket__"] = list(basket)
     profile["__etf_basket_status__"] = (
         ("未选择主题公司篮子；不生成行业整体指标" if theme_basket_required and not theme_basket else
          f"主题核心样本（{len(theme_basket)}只；少于{_THEME_BASKET_MIN}只，"
@@ -457,7 +458,7 @@ def _auto_series_charts(sector: str, fields: dict,
 
 
 def _structure_charts(sector: str, rep_code: str,
-                      provider: DataProvider | None = None) -> dict[str, dict]:
+                      provider: DataProvider | None = None, *, basket=None) -> dict[str, dict]:
     """板块结构类自动配图：成分股散点 + 子行业分组柱 + 波动率分布。
 
     这三张都从**已经取到的结构化数据**里直接生成，不经过 LLM——
@@ -474,10 +475,13 @@ def _structure_charts(sector: str, rep_code: str,
         return out
 
     # ① 成分股散点：PB × 净利同比。文字只能举三五只，散点能显示整批的形态与离群者。
-    try:
-        agg = ag.sector_aggregate(sector, provider=provider)
-    except Exception:
-        agg = None
+    # `fetch_profile` 已在这个覆盖上下文中取得主题篮子的整体法字段。结构图重建时也
+    # 必须复用**同一批公司**，而不是让 aggregate 回退成名称相近的标准行业。
+    with universe.analysis_basket(sector, list(basket or [])):
+        try:
+            agg = ag.sector_aggregate(sector, provider=provider)
+        except Exception:
+            agg = None
     if agg is not None and agg.ok and agg.明细:
         pts = [{"标签": r.get("简称") or "", "x": r.get("PB"), "y": r.get("净利同比")}
                for r in agg.明细
@@ -492,6 +496,49 @@ def _structure_charts(sector: str, rep_code: str,
                 "图表结论": f"{sector}板块成分股：估值与盈利存在分化",
                 "x轴": "PB(倍)", "y轴": "净利同比(%)", "高亮": rep_name or "",
                 "数据点": pts,
+            }
+        # 面积仅表示同口径市值/权重，颜色才表示盈利变化方向，不能把二者混为“贡献”。
+        cap_rows = [r for r in agg.明细 if r.get("市值") and r.get("简称")][:12]
+        if len(cap_rows) >= 5:
+            out["成分股权重"] = {
+                "类型": "treemap", "标题": f"{sector}板块前列成分：市值权重结构",
+                "图表结论": f"{sector}板块权重集中度可见，面积仅代表市值",
+                "单位": "亿元", "自动生成": True,
+                "数据点": [{"标签": r.get("简称"), "值": (r.get("市值") or 0) / 1e8,
+                            "颜色值": r.get("净利同比")} for r in cap_rows],
+            }
+        bubble_pts = [{"标签": r.get("简称") or "", "x": r.get("PB"), "y": r.get("净利同比"),
+                       "大小": (r.get("市值") or 0) / 1e8} for r in agg.明细
+                      if r.get("PB") and r.get("净利同比") is not None and r.get("市值")]
+        if len(bubble_pts) >= 8:
+            out["成分股气泡"] = {
+                "类型": "bubble", "标题": f"{sector}板块：估值、盈利与市值结构",
+                "图表结论": f"{sector}板块估值与盈利分化，气泡面积代表市值",
+                "x轴": "PB(倍)", "y轴": "净利同比(%)", "大小轴": "总市值(亿元)",
+                "高亮": rep_name or "", "数据点": bubble_pts,
+            }
+        # 色阶仅使用同一篮子内的相对分位（0–100），避免把 PB、ROE、增速原值混在一条色轴。
+        heat_rows = [r for r in agg.明细 if r.get("简称") and r.get("PB") is not None
+                     and r.get("ROE") is not None and r.get("净利同比") is not None][:10]
+        if len(heat_rows) >= 5:
+            def _rank(values, *, reverse=False):
+                ordered = sorted(set(values), reverse=reverse)
+                den = max(1, len(ordered) - 1)
+                return {value: round(100 * index / den, 1) for index, value in enumerate(ordered)}
+            pb_rank = _rank([r["PB"] for r in heat_rows])
+            roe_rank = _rank([r["ROE"] for r in heat_rows], reverse=True)
+            yoy_rank = _rank([r["净利同比"] for r in heat_rows], reverse=True)
+            labels = [r["简称"] for r in heat_rows]
+            out["主题篮子热力"] = {
+                "类型": "heatmap", "标题": f"{sector}主题篮子：估值与盈利相对分位扫描",
+                "图表结论": f"{sector}主题篮子内部的估值与盈利分化可见",
+                "标准化": True, "单位": "篮子内相对分位（0–100）", "自动生成": True,
+                "数据点": [{"标签": label} for label in labels],
+                "系列": [
+                    {"名称": "PB相对分位（高=较贵）", "值": [pb_rank[r["PB"]] for r in heat_rows]},
+                    {"名称": "ROE相对分位（高=较优）", "值": [roe_rank[r["ROE"]] for r in heat_rows]},
+                    {"名称": "净利增速相对分位（高=较快）", "值": [yoy_rank[r["净利同比"]] for r in heat_rows]},
+                ],
             }
 
     # ② 子行业分组柱：宽口径板块专有，直接回答"哪个子行业强、哪个拖后腿"。
@@ -944,14 +991,14 @@ def run(
         doc_charts={c.id: c.图表 for c in doc_chosen if c.图表},
         doc_cats={c.id: c.类别 for c in doc_chosen if c.类别},
         doc_claims=list(doc_chosen),
-        # 细分主题篮子尚没有同口径的长历史序列与全量成分分布时，不画“通信设备”等
-        # 宽行业的替代图。宁可不配图，也不能用看似精美但答非所问的行业图。
-        auto_charts=({} if profile.get("__theme_basket__") else {
-            **_auto_series_charts(profile.get("__sector__") or sector or "",
-                                  fv_map, provider),
-            **_structure_charts(profile.get("__sector__") or sector or "",
-                                rep_code, provider),
-        }),
+        # 细分主题篮子没有可靠的行业历史序列，不能拿“通信设备”等宽行业替代；但其
+        # 同一篮子内的横截面结构（PB—盈利—市值、权重、相对分位）仍可安全作图。
+        auto_charts={
+            **({} if profile.get("__theme_basket__") else _auto_series_charts(
+                profile.get("__sector__") or sector or "", fv_map, provider)),
+            **_structure_charts(profile.get("__sector__") or sector or "", rep_code, provider,
+                                basket=profile.get("__research_basket__") or []),
+        },
         tokens=client.total_tokens, data_vol=getattr(provider, "total_data_vol", 0),
         ok=True,
     )
@@ -982,13 +1029,11 @@ def _pick_underlying(ma, topic, topic_type, context, plan, client, provider):
 
 
 def _explicit_etf_from_brief(b) -> str:
-    """仅当用户原文**实际点名**时，返回可交易 ETF 作为显式分析标的。
+    """只返回分析师明确确认的“主题 ETF 取数目标”。
 
-    `候选标的`由需求解析器提出，不能反过来被当成用户指令。否则用户只说“消费板块”
-    时，模型若把酒ETF放进候选池，就会错误覆盖“消费 → 消费ETF”的既有映射。名称或
-    代码必须出现在原始需求中，才可优先于板块映射；代表标的仍优先选个股供基本面取数。
+    客户点名和系统发现的 ETF 都先进入研究完成后的报价候选池。它们只有在分析师
+    选择“主题 ETF”研究路径后，才可用真实跟踪指数成分改变研究数据对象。
     """
-    from . import instruments, universe
 
     confirmed = str(getattr(b, "确认挂钩标的", "") or "").strip()
     confirmed_type = str(getattr(b, "确认挂钩标的类型", "") or "")
@@ -998,21 +1043,8 @@ def _explicit_etf_from_brief(b) -> str:
     if (confirmed and "ETF" in confirmed_type.upper()
             and str(confirmation.get("research_mode") or "") == "theme_etf"):
         return confirmed
-    raw = str(getattr(b, "原始需求", "") or "").upper()
-    # 受控目录里的 ETF 代码是已经人工/iFinD 核验过的静态事实；即使当次
-    # iFinD 基础资料请求临时失败，也不能把用户明确写出的 512690.SH 忘掉，
-    # 再悄悄换成另一只行业 ETF 或要求重选。行情取数仍会如实报告数据源失败。
-    # 同市场确认层：代码后常直接跟“的/、/，”，不能用 ``\b`` 漏识别中文边界。
-    for code in re.findall(r"(?<![0-9A-Za-z])\d{6}\.(?:SH|SZ)(?![0-9A-Za-z])", raw):
-        item = instruments.get(code)
-        if item is not None and "ETF" in item.类型.upper():
-            return code
-    for t in getattr(b, "候选标的", []) or []:
-        code = str(getattr(t, "代码", "") or "").upper()
-        name = str(getattr(t, "名称", "") or "").strip()
-        explicitly_named = (code and code in raw) or (name and name.upper() in raw)
-        if getattr(t, "可用", False) and explicitly_named and universe._is_fund(code):
-            return t.代码
+    # 客户在原始需求中点名的 ETF/个股属于“待报价池”，不自动改变研究取数对象。
+    # 只有分析师明确选择“主题 ETF 路径”时，ETF 才是研究目标。
     return ""
 
 

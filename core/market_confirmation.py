@@ -25,7 +25,10 @@ _DISCOVERY_SCAN_LIMIT = 120
 _DISCOVERY_BATCH_SIZE = 50
 _DISCOVERY_TERM_LIMIT = 5
 _PREFERRED_DAILY_AMOUNT = 1e8
-_THEME_ETF_MIN_DAILY_AMOUNT = 3e7
+# ETF 研究/报价候选的硬性流动性下限为 0.1 亿元（1,000 万元）。1 亿元仅代表
+# 优选档，不能再把客户明确指定但日均成交较低的 ETF 直接排除。
+_ETF_HARD_MIN_DAILY_AMOUNT = 1e7
+_THEME_ETF_MIN_DAILY_AMOUNT = _ETF_HARD_MIN_DAILY_AMOUNT
 _THEME_BASKET_MIN = 5
 _THEME_BASKET_MAX = 20
 
@@ -58,6 +61,9 @@ class Confirmation:
     research_theme: str = ""         # 细分研究主题；放在末尾以兼容旧位置参数
     theme_basket_codes: list[str] = field(default_factory=list)  # 分析师确认的本次主题公司篮子
     theme_basket_confirmed: bool = False
+    # 仅当 ETF 的官方事实显示为“部分暴露”时使用：分析师必须同时勾选确认并
+    # 写明映射理由，不能把这类工具当作自动通过的直接主题工具。
+    partial_exposure_confirmed: bool = False
     # industry=按数据源标准行业成分研究；theme_basket=按分析师确认的主题公司篮子
     # 研究；theme_etf=按已核验主题 ETF 的真实成分研究。三者不能混用。
     research_mode: str = "industry"
@@ -80,6 +86,37 @@ class ValidationResult:
     warnings: list[str] = field(default_factory=list)
     instrument: instruments.Instrument | None = None
     average_daily_amount: float | None = None
+    exposure: "ExposureAssessment | None" = None
+
+
+@dataclass
+class ExposureAssessment:
+    """一只 ETF/指数相对本次主题的统一暴露判定。
+
+    候选排序和提交后的最终核验都调用同一套规则。``direct`` 可以自动通过；
+    ``partial`` 必须由分析师确认映射理由；``unrelated`` 一律拒绝。证券、
+    跟踪指数和流动性的真实性仍由 ``verify`` 的独立硬校验负责，不能人工绕过。
+    """
+    level: str
+    scope: str
+    reason: str
+    official_name: str = ""
+    tracking_index: str = ""
+    major_constituents: list[str] = field(default_factory=list)
+    matched_terms: list[str] = field(default_factory=list)
+
+    @property
+    def label(self) -> str:
+        return {"direct": "直接暴露", "partial": "部分暴露", "unrelated": "不相关"}.get(
+            self.level, "未判定")
+
+    def display(self) -> str:
+        facts = [f"主题暴露：{self.label}"]
+        if self.tracking_index:
+            facts.append(f"跟踪指数：{self.tracking_index}")
+        if self.major_constituents:
+            facts.append("主要成分：" + "、".join(self.major_constituents[:5]))
+        return "；".join(facts + [self.reason])
 
 
 def from_dict(raw: dict) -> Confirmation:
@@ -94,6 +131,7 @@ def from_dict(raw: dict) -> Confirmation:
         theme_basket_codes=[_normalize_code(x) for x in (raw.get("theme_basket_codes") or [])
                             if _normalize_code(x)],
         theme_basket_confirmed="theme_basket_codes" in raw,
+        partial_exposure_confirmed=bool(raw.get("partial_exposure_confirmed", False)),
         research_mode=str(raw.get("research_mode") or "industry").strip(),
     )
 
@@ -123,16 +161,12 @@ def needs_confirmation(brief) -> bool:
     """高风险主题及未点明代码的 ETF 研究必须由分析师确认研究对象。"""
     if getattr(brief, "市场范围", "A股") != "A股":
         return True
-    # 用户已在原始需求中点名、且位于受控目录的 ETF 时，研究对象和挂钩工具
-    # 已经明确；后续会以该 ETF 的行情及真实跟踪指数成分取数。此时再弹出
-    # “选 ETF + 主题公司篮子”的确认页没有新增决策价值，反而可能把报告标题
-    # 当成问财概念股检索词，混进无关公司。
-    # 白名单外代码仍须走确认页和数据源核验，绝不因“像 ETF 代码”而放行。
-    # 客户若只点名 ETF，ETF 已经同时限定研究对象和潜在挂钩工具，确认页没有
-    # 新的研究决策价值；但“ETF + 若干个股”是两条并行输入：ETF 不能吞掉
-    # 客户明确要求研究的公司篮子，仍须展示给分析师确认。
+    # 客户点名 ETF 只说明它至少应进入研究完成后的报价候选，并不自动回答
+    # “研究用标准行业、人工公司篮子还是 ETF 真实成分”。因此即使 ETF 已在
+    # 受控目录，也要展示研究确认页；若分析师选择主题 ETF 路径，它才成为
+    # 本轮研究取数目标。这样不会把产品意图偷偷改成研究口径。
     if _explicit_catalogued_etf(brief) and not _explicit_stock_codes(brief):
-        return False
+        return True
     # 客户点名个股时，必须展示并确认研究篮子；不能由系统静默决定哪些公司
     # 参与整体法聚合，即使该需求本身不是传统的“高风险主题”。
     if _explicit_stock_codes(brief):
@@ -391,8 +425,11 @@ def discover_etfs(brief, *, provider: DataProvider | None = None, limit: int = 8
         item = instruments.Instrument(code, actual_name, actual_name,
                                       "商品ETF" if commodity else "行业ETF",
                                       [], "本次动态发现", tracking_code)
-        evidence_text = " ".join([actual_name, tracking_name, tracking_code])
-        if not _exposure_matches(exposure_scope, item, evidence_text):
+        assessment = assess_exposure(
+            exposure_scope, item, official_name=actual_name,
+            tracking_index=tracking_name or tracking_code,
+        )
+        if assessment.level == "unrelated":
             continue
         try:
             values = history.series(code, "ths_amt_stock", years=1, provider=provider,
@@ -405,9 +442,10 @@ def discover_etfs(brief, *, provider: DataProvider | None = None, limit: int = 8
         amount = sum(recent) / len(recent)
         if amount < _THEME_ETF_MIN_DAILY_AMOUNT:
             continue
-        matched = [term for term in search_terms if term.lower() in evidence_text.lower()]
-        exposure_note = (f"官方跟踪指数：{tracking_name or tracking_code}" if tracking_code
-                         else "官方简称与检索主题匹配")
+        evidence_text = " ".join([actual_name, tracking_name, tracking_code])
+        matched = [term for term in search_terms
+                   if term.lower() in evidence_text.lower()]
+        exposure_note = assessment.display()
         liquidity_label = ("优选" if amount >= _PREFERRED_DAILY_AMOUNT else
                            "可选但低于1亿元优选门槛")
         direct_rank = next((rank for rank, term in enumerate(search_terms)
@@ -416,6 +454,7 @@ def discover_etfs(brief, *, provider: DataProvider | None = None, limit: int = 8
                     "note": (f"iFinD 动态发现；检索命中“{'、'.join(matched) or search_terms[0]}”；"
                              f"{exposure_note}；近20日日均成交额 {amount / 1e8:.2f} 亿元（{liquidity_label}）"),
                     "origin": "动态发现", "average_daily_amount": amount,
+                    "exposure": asdict(assessment), "exposure_level": assessment.level,
                     "_direct_rank": direct_rank})
     # 主题直接命中优先；同等主题相关度下选择流动性更好的工具。内部排序字段不传给 UI。
     out.sort(key=lambda value: (value.get("_direct_rank", 999),
@@ -445,12 +484,22 @@ def _suggestions(brief, *, provider: DataProvider | None = None) -> list[dict]:
         code = str(getattr(target, "代码", "") or "").upper()
         if code and getattr(target, "可用", False) and instruments.get(code):
             codes.append(code)
+    exposure_scope = _proposed_theme(brief) or str(getattr(brief, "主题", "") or "")
     out = []
     for code in dict.fromkeys(codes):
         item = instruments.get(code)
         if item:
+            assessment = assess_exposure(
+                exposure_scope, item, official_name=item.官方名,
+                tracking_index=item.跟踪指数,
+            )
+            # 常用池只是发现入口；不能把已知不相关 ETF 呈现为可选主题工具。
+            if assessment.level == "unrelated":
+                continue
             out.append({"code": item.代码, "name": item.简称, "type": item.类型,
-                        "note": item.说明, "origin": "常用池"})
+                        "note": item.说明 + "；" + assessment.display(), "origin": "常用池",
+                        "exposure": asdict(assessment), "exposure_level": assessment.level,
+                        "tracking_index": assessment.tracking_index})
     known = {item["code"] for item in out}
     # 常用池只作起点，候选不足时再从 iFinD 动态扩展；不再每次无差别扫描全量基金。
     remaining = max(0, 8 - len(out))
@@ -672,41 +721,115 @@ def _is_cross_border(item: instruments.Instrument | None, name: str) -> bool:
     return any(x in name.upper() for x in ("QDII", "恒生", "港股", "中概", "H股"))
 
 
+_EXPOSURE_RULES: dict[str, dict[str, tuple[str, ...]]] = {
+    # ``direct`` 是基金官方名称、跟踪指数或主要成分直接说明了本主题；``partial``
+    # 是较宽行业/相邻产业链。二者不能再混为一个“主题匹配”的布尔值。
+    "锂电池与固态电池": {
+        "direct": ("锂电池", "固态电池", "新能源电池"),
+        "partial": ("电池", "新能源车", "新能源汽车", "新能源", "电力设备", "锂"),
+    },
+    "固态电池": {
+        "direct": ("固态电池",),
+        "partial": ("锂电池", "新能源电池", "电池", "新能源车", "新能源汽车", "新能源", "电力设备"),
+    },
+    "锂电池": {
+        "direct": ("锂电池", "新能源电池"),
+        "partial": ("电池", "新能源车", "新能源汽车", "新能源", "电力设备", "锂"),
+    },
+    "汽车电子": {
+        "direct": ("汽车电子", "智能驾驶", "智能汽车", "车联网", "汽车智能化", "智能车"),
+        "partial": ("汽车", "电子", "新能源车", "新能源汽车"),
+    },
+    "智能驾驶": {
+        "direct": ("智能驾驶", "智能汽车", "汽车电子", "车联网", "汽车智能化", "智能车"),
+        "partial": ("汽车", "新能源车", "新能源汽车"),
+    },
+    "智能汽车": {
+        "direct": ("智能汽车", "智能驾驶", "汽车电子", "车联网", "汽车智能化", "智能车"),
+        "partial": ("汽车", "新能源车", "新能源汽车"),
+    },
+    "光模块": {
+        "direct": ("光模块", "光通信", "光器件"),
+        "partial": ("通信设备", "通信", "5g"),
+    },
+    "光通信": {
+        "direct": ("光通信", "光模块", "光器件"),
+        "partial": ("通信设备", "通信", "5g"),
+    },
+    "消费电子": {
+        "direct": ("消费电子", "智能终端"),
+        "partial": ("电子", "智能硬件"),
+    },
+    "互联网": {"direct": ("互联网", "中概互联"), "partial": ("恒生科技", "科技")},
+    "创新药": {"direct": ("创新药",), "partial": ("医药", "医疗")},
+    "医药": {"direct": ("医药", "医疗"), "partial": ("创新药",)},
+    "ai": {"direct": ("人工智能", "ai", "算力"), "partial": ("半导体", "通信", "科技")},
+    "算力": {"direct": ("算力", "人工智能", "ai"), "partial": ("半导体", "通信", "科技")},
+    "半导体": {"direct": ("半导体", "芯片"), "partial": ("人工智能", "算力")},
+    "通信": {"direct": ("通信", "5g"), "partial": ("光通信", "通信设备")},
+    "消费": {"direct": ("消费", "食品", "酒", "家电"), "partial": ()},
+    "黄金": {"direct": ("黄金", "上海金", "贵金属"), "partial": ("商品",)},
+    "贵金属": {"direct": ("黄金", "白银", "贵金属"), "partial": ("商品",)},
+    "原油": {"direct": ("原油",), "partial": ("能源", "商品")},
+}
+
+
+def assess_exposure(scope: str, item: instruments.Instrument, *, official_name: str = "",
+                    tracking_index: str = "", major_constituents: list[str] | None = None) -> ExposureAssessment:
+    """按官方基金/指数事实和同一套主题规则，判定直接、部分或不相关暴露。"""
+    scope = str(scope or "").strip()
+    facts = [official_name, item.官方名, item.简称, tracking_index, *item.标签, item.说明]
+    facts.extend(major_constituents or [])
+    text = " ".join(str(value or "") for value in facts).lower()
+    matched_key = max((key for key in _EXPOSURE_RULES if key in scope.lower()), key=len, default="")
+    if matched_key:
+        rule = _EXPOSURE_RULES[matched_key]
+        direct = [term for term in rule["direct"] if term.lower() in text]
+        partial = [term for term in rule["partial"] if term.lower() in text]
+        if direct:
+            return ExposureAssessment(
+                "direct", scope, f"官方名称、跟踪指数或主要成分直接命中“{matched_key}”主题规则",
+                official_name, tracking_index, list(major_constituents or []), direct,
+            )
+        if partial:
+            return ExposureAssessment(
+                "partial", scope, f"仅命中“{matched_key}”的较宽行业或相邻产业链，需分析师确认映射理由",
+                official_name, tracking_index, list(major_constituents or []), partial,
+            )
+        return ExposureAssessment(
+            "unrelated", scope, f"官方名称、跟踪指数及已取得主要成分均未命中“{matched_key}”主题规则",
+            official_name, tracking_index, list(major_constituents or []), [],
+        )
+
+    tokens = [token for token in re.split(r"[\s、,，产业链板块主题]+", scope.lower()) if len(token) >= 2]
+    matched = [token for token in tokens if token in text]
+    if matched:
+        return ExposureAssessment(
+            "direct", scope, "官方名称、跟踪指数或主要成分命中研究主题关键词",
+            official_name, tracking_index, list(major_constituents or []), matched,
+        )
+    return ExposureAssessment(
+        "unrelated", scope, "官方名称、跟踪指数及已取得主要成分未显示主题关联",
+        official_name, tracking_index, list(major_constituents or []), [],
+    )
+
+
 def _exposure_matches(scope: str, item: instruments.Instrument, actual_name: str) -> bool:
-    """保守的主题暴露校验；不确定就拒绝并让分析师换标的。"""
-    text = " ".join([item.简称, item.官方名, *item.标签, item.说明, actual_name]).lower()
-    aliases = {
-        "互联网": ("互联网", "恒生科技", "中概", "科技"),
-        "创新药": ("创新药", "医药", "医疗"),
-        "医药": ("医药", "医疗", "创新药"),
-        "ai": ("人工智能", "ai", "算力", "半导体", "通信", "科技"),
-        "算力": ("人工智能", "ai", "算力", "半导体", "通信", "科技"),
-        "汽车电子": ("汽车电子", "智能驾驶", "智能汽车", "车联网", "汽车智能化", "智能车"),
-        "智能驾驶": ("智能驾驶", "智能汽车", "汽车电子", "车联网", "智能车"),
-        "智能汽车": ("智能汽车", "智能驾驶", "汽车电子", "车联网", "智能车"),
-        "光模块": ("光模块", "光通信", "通信设备", "通信", "5g"),
-        "光通信": ("光通信", "光模块", "通信设备", "通信", "5g"),
-        "半导体": ("半导体", "芯片"),
-        "通信": ("通信", "5g"),
-        "消费电子": ("消费电子", "智能终端", "电子"),
-        "消费": ("消费", "食品", "酒", "家电"),
-        "黄金": ("黄金", "上海金", "贵金属", "商品"),
-        "贵金属": ("黄金", "白银", "贵金属", "上海金", "商品"),
-        "原油": ("原油", "能源", "商品"),
-    }
-    scope_lower = scope.lower()
-    # 只使用命中的最长主题规则。“消费电子”若继续落到更宽的“消费”规则，白酒、
-    # 酒店 ETF 也会被误判为有直接暴露，正是主题被截短时的同类错误。
-    matched_keys = [key for key in aliases if key in scope_lower]
-    if matched_keys:
-        key = max(matched_keys, key=len)
-        return any(word.lower() in text for word in aliases[key])
-    tokens = [x for x in re.split(r"[\s、,，产业链板块主题]+", scope_lower) if len(x) >= 2]
-    return any(token in text for token in tokens)
+    """兼容旧调用方：候选筛选保留直接和部分暴露，拒绝不相关标的。"""
+    return assess_exposure(scope, item, official_name=actual_name).level != "unrelated"
+
+
+def _official_major_constituents(code: str, provider: DataProvider) -> list[str]:
+    """取跟踪指数前五大成分作暴露审计；权限/网络不足只形成可见缺口。"""
+    try:
+        rows = universe.etf_constituents(code, provider=provider)
+    except Exception:
+        return []
+    return [str(row.简称 or "").strip() for row in rows[:5] if str(row.简称 or "").strip()]
 
 
 def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = None,
-           min_daily_amount: float = 1e8) -> ValidationResult:
+           min_daily_amount: float = _ETF_HARD_MIN_DAILY_AMOUNT) -> ValidationResult:
     """执行行业与标的的完整校验，成功时临时注册非白名单工具。"""
     result = ValidationResult(confirmation=value, errors=validate(value))
     if result.errors:
@@ -742,7 +865,9 @@ def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = N
 
     if value.reason == "":
         result.warnings.append("未填写映射理由（选填）")
-    if value.research_only:
+    # “仅研究”只关闭后续产品报价，不得跳过主题 ETF 研究对象本身的真实性、
+    # 跟踪指数、主题暴露和流动性校验。
+    if value.research_only and value.research_mode != "theme_etf":
         result.ok = not result.errors
         return result
 
@@ -793,20 +918,45 @@ def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = N
     )
     if value.market == "港股" and not (code.endswith(".HK") or _is_cross_border(item, actual_name)):
         result.errors.append("港股研究只能选择港股工具或明确的跨境 ETF，不能静默换成普通 A 股 ETF")
-    exposure_text = " ".join([actual_name, tracking, tracking_name])
-    scope_match = _exposure_matches(value.research_scope, item, exposure_text)
-    theme_match = _exposure_matches(value.theme, item, exposure_text)
-    original_match = bool(brief is not None and _exposure_matches(
-        str(getattr(brief, "原始需求", "") or ""), item, exposure_text))
-    # 单一 A 股行业映射必须与工具本身对口；只有多行业产业链或原市场研究，
-    # 才可用原始主题补足“AI→半导体/通信”等跨行业词汇差异。
-    exposure_ok = ((theme_match or original_match) if value.research_mode in {"theme_basket", "theme_etf"}
-                   else (scope_match or (len(industries) > 1 and original_match)
-                         or (value.market != "A股" and original_match)))
-    if not exposure_ok:
-        target_scope = value.theme if value.research_mode in {"theme_basket", "theme_etf"} else value.research_scope
-        result.errors.append(
-            f"无法通过 ETF 官方名称或跟踪指数验证 {item.简称} 与研究主题「{target_scope}」具有直接暴露")
+    major_constituents = _official_major_constituents(code, provider) if "ETF" in item.类型.upper() else []
+    target_scope = value.theme if value.research_mode in {"theme_basket", "theme_etf"} else value.research_scope
+    primary_exposure = assess_exposure(
+        target_scope, item, official_name=actual_name,
+        tracking_index=tracking_name or tracking, major_constituents=major_constituents,
+    )
+    original_exposure = (assess_exposure(
+        str(getattr(brief, "原始需求", "") or ""), item, official_name=actual_name,
+        tracking_index=tracking_name or tracking, major_constituents=major_constituents,
+    ) if brief is not None else None)
+    # 多行业产业链和主题路径可由客户原始主题补足行业词差异；单一标准行业仍要
+    # 与自身口径直接对齐，避免把较宽 ETF 偷换成行业研究对象。
+    original_allowed = (value.research_mode in {"theme_basket", "theme_etf"}
+                        or len(industries) > 1 or value.market != "A股")
+    assessment = primary_exposure
+    if original_allowed and original_exposure is not None:
+        rank = {"unrelated": 0, "partial": 1, "direct": 2}
+        if rank[original_exposure.level] > rank[assessment.level]:
+            assessment = original_exposure
+    result.exposure = assessment
+    if not major_constituents and "ETF" in item.类型.upper():
+        result.warnings.append(
+            f"{code} 未取得可展示的官方主要成分；主题分级暂以官方基金简称和跟踪指数为依据，"
+            "研究取数阶段仍会再次读取真实指数成分。")
+    # 只有主题 ETF 路径会把该 ETF 的真实成分作为研究对象，因而需要在此对
+    # 主题暴露做硬门。标准行业/人工篮子路径中的 ETF 不应在研究前被当成取数
+    # 对象；旧运行若遗留该字段，只记录分级供后续报价审核，不反向阻断研究。
+    if value.research_mode == "theme_etf":
+        if assessment.level == "unrelated":
+            result.errors.append(
+                f"{item.简称} 与研究主题「{target_scope}」不相关：{assessment.reason}")
+        elif assessment.level == "partial":
+            if not value.partial_exposure_confirmed or not value.reason.strip():
+                result.errors.append(
+                    f"{item.简称} 仅为研究主题「{target_scope}」的部分暴露：{assessment.reason}。"
+                    "请勾选“确认部分暴露”并填写映射理由，或改选直接暴露 ETF。")
+            else:
+                result.warnings.append(
+                    f"{item.简称} 为部分暴露，已按分析师确认继续：{value.reason.strip()}")
 
     if "ETF" in item.类型.upper():
         from . import history
@@ -823,11 +973,10 @@ def verify(value: Confirmation, brief=None, *, provider: DataProvider | None = N
                 result.errors.append(
                     f"{code} 近20日日均成交额 {result.average_daily_amount / 1e8:.2f} 亿元，"
                     f"低于 {hard_floor / 1e8:.1f} 亿元最低门槛")
-            elif (value.research_mode == "theme_etf"
-                  and result.average_daily_amount < min_daily_amount):
+            elif result.average_daily_amount < _PREFERRED_DAILY_AMOUNT:
                 result.warnings.append(
                     f"{code} 近20日日均成交额 {result.average_daily_amount / 1e8:.2f} 亿元，"
-                    f"低于 {min_daily_amount / 1e8:.0f} 亿元优选门槛；已按主题 ETF 谨慎档通过，"
+                    f"低于 {_PREFERRED_DAILY_AMOUNT / 1e8:.0f} 亿元优选门槛；已按 0.1 亿元最低门槛通过，"
                     "正式询价前需结合名义本金复核冲击成本")
 
     if not result.errors:
@@ -856,17 +1005,25 @@ def apply_to_brief(result: ValidationResult, brief, *, provider: DataProvider | 
     brief.市场范围 = value.market
     brief.市场确认 = asdict(value)
     brief.市场确认["research_mode"] = effective_mode
+    if result.exposure is not None:
+        brief.市场确认["etf_exposure"] = asdict(result.exposure)
     brief.研究主题 = value.theme
     # 三条取数路径互斥：标准行业使用行业成分，人工主题篮子使用分析师勾选公司，
     # 主题 ETF 使用 ETF 真实成分。挂钩工具只是报价对象，不能反过来改写研究篮子。
     brief.研究篮子口径 = (value.research_scope if effective_mode == "industry"
                           else value.theme)
+    # 兼容旧字段名：这里只记录主题 ETF 研究取数目标，绝不表示正式报价标的已确认。
     brief.确认挂钩标的 = value.underlying_code if result.instrument else ""
     brief.确认挂钩标的类型 = result.instrument.类型 if result.instrument else ""
     brief.研究资产类型 = result.instrument.类型 if result.instrument else ""
     if result.instrument:
-        rationale = (f"分析师确认挂钩 {result.instrument.简称}（{result.instrument.代码}）："
+        rationale = (f"分析师确认主题 ETF 取数目标 {result.instrument.简称}（{result.instrument.代码}）："
+                     f"{result.exposure.label if result.exposure else '已核验'}，"
                      f"已核验与研究主题“{value.theme}”的暴露及近20日流动性")
+        if result.exposure and result.exposure.tracking_index:
+            rationale += f"（跟踪指数 {result.exposure.tracking_index}）"
+        if result.exposure and result.exposure.major_constituents:
+            rationale += f"（主要成分 {'、'.join(result.exposure.major_constituents[:5])}）"
         if result.average_daily_amount is not None:
             rationale += f"（日均成交额 {result.average_daily_amount / 1e8:.2f} 亿元）"
         # 分析师自行填写的理由优先保留，并补上系统实际核验过的事实。

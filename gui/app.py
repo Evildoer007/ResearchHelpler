@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow,
     QMessageBox, QPushButton, QPlainTextEdit, QProgressBar, QSplitter, QTabWidget,
-    QScrollArea, QTextBrowser, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 try:  # 预览是增强功能；少数精简 PySide6 安装不带 WebEngine 时仍可启动应用。
@@ -36,6 +36,195 @@ except ImportError:  # pragma: no cover - 取决于终端用户安装的 Qt 组�
 ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "output" / "runs"
 LOCAL_CONFIG = ROOT / "config.local.json"
+
+
+# 使用接近 Codex 桌面端的中性浅色界面：灰白画布、轻边框、深色主操作、
+# 低饱和蓝色焦点。报告的酒红色板独立保留在 render/，不反向染色操作界面。
+APPLE_STYLE = """
+QMainWindow, QDialog {
+    background: #f7f7f8;
+}
+QWidget {
+    color: #202124;
+    font-family: "Segoe UI Variable", "Segoe UI", "SF Pro Text", "Microsoft YaHei UI";
+    font-size: 13px;
+}
+QFrame#card {
+    background: #ffffff;
+    border: 1px solid #e4e4e7;
+    border-radius: 12px;
+}
+QLabel[kind="section"] {
+    color: #202124;
+    font-size: 15px;
+    font-weight: 700;
+    padding: 2px 0;
+}
+QLabel[kind="field-title"] {
+    color: #303136;
+    font-weight: 600;
+}
+QLabel[kind="caption"] {
+    color: #6b7280;
+    font-size: 12px;
+}
+QLabel[kind="callout"] {
+    color: #374151;
+    background: #f8fafc;
+    border: 1px solid #e5e7eb;
+    border-radius: 9px;
+    padding: 7px 10px;
+}
+QLineEdit, QPlainTextEdit, QTextBrowser, QListWidget, QComboBox {
+    background: #ffffff;
+    border: 1px solid #d7d9de;
+    border-radius: 8px;
+    padding: 5px 8px;
+    selection-background-color: #2563eb;
+    selection-color: #ffffff;
+}
+QLineEdit:focus, QPlainTextEdit:focus, QTextBrowser:focus, QListWidget:focus, QComboBox:focus {
+    border: 2px solid #4f8cff;
+    padding: 4px 7px;
+}
+QLineEdit:disabled, QPlainTextEdit:disabled, QListWidget:disabled, QComboBox:disabled {
+    color: #9ca3af;
+    background: #f5f5f6;
+    border-color: #e5e7eb;
+}
+QComboBox {
+    min-height: 20px;
+    padding-right: 24px;
+}
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    border: 1px solid #d7d9de;
+    border-radius: 8px;
+    padding: 3px;
+    selection-background-color: #e8f0ff;
+    selection-color: #1d4ed8;
+}
+QPushButton {
+    min-height: 20px;
+    max-height: 28px;
+    background: #ffffff;
+    border: 1px solid #d7d9de;
+    border-radius: 8px;
+    padding: 2px 9px;
+    font-weight: 600;
+}
+QPushButton:hover {
+    background: #f4f4f5;
+    border-color: #bfc3ca;
+}
+QPushButton:pressed {
+    background: #e9eaec;
+}
+QPushButton:disabled {
+    color: #a1a1aa;
+    background: #f5f5f6;
+    border-color: #e5e7eb;
+}
+QPushButton[role="primary"] {
+    color: #ffffff;
+    background: #2d2f33;
+    border-color: #2d2f33;
+}
+QPushButton[role="primary"]:hover {
+    background: #17181a;
+    border-color: #17181a;
+}
+QPushButton[role="danger"] {
+    color: #b42318;
+    background: #fff8f7;
+    border-color: #fecaca;
+}
+QPushButton[role="danger"]:hover {
+    color: #991b1b;
+    background: #fef2f2;
+    border-color: #fca5a5;
+}
+QCheckBox {
+    spacing: 6px;
+}
+QTabWidget::pane {
+    background: #ffffff;
+    border: 1px solid #e4e4e7;
+    border-radius: 10px;
+    top: -1px;
+}
+QTabBar::tab {
+    color: #6b7280;
+    background: transparent;
+    border: none;
+    padding: 6px 12px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    color: #202124;
+    background: #ececef;
+    border-radius: 7px;
+    font-weight: 600;
+}
+QProgressBar {
+    height: 6px;
+    background: #e5e7eb;
+    border: none;
+    border-radius: 3px;
+    text-align: center;
+}
+QProgressBar::chunk {
+    background: #4b5563;
+    border-radius: 3px;
+}
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 2px;
+}
+QScrollBar::handle:vertical {
+    background: #c7c9ce;
+    border-radius: 4px;
+    min-height: 22px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0;
+}
+QToolTip {
+    color: #ffffff;
+    background: #26272b;
+    border: none;
+    border-radius: 6px;
+    padding: 5px;
+}
+"""
+
+
+def _section_label(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setProperty("kind", "section")
+    return label
+
+
+def _purpose_label(title: str, purpose: str) -> QWidget:
+    """确认页左栏同时解释字段含义和它影响的流程。"""
+    box = QWidget()
+    layout = QVBoxLayout(box)
+    layout.setContentsMargins(0, 2, 12, 2)
+    layout.setSpacing(2)
+    heading = QLabel(title)
+    heading.setProperty("kind", "field-title")
+    caption = QLabel(purpose)
+    caption.setProperty("kind", "caption")
+    caption.setWordWrap(True)
+    layout.addWidget(heading)
+    layout.addWidget(caption)
+    box.setMinimumWidth(225)
+    return box
 
 # 直接运行 ``gui/app.py`` 时，Python 会把 gui/ 而不是项目根目录放到 sys.path 首位；
 # GUI 内的补数表单随后 import core.* 会因此失败。无论从 VS Code、启动器还是命令行启动，
@@ -67,6 +256,8 @@ class QuoteJob:
     selection_payload: dict
     overrides: dict
     export_pdf: bool
+    underlying_name: str = ""
+    underlying_note: str = ""
     source_run_id: str = ""
     # 多标的比较时，每只标的都产生独立的 OptionHelper 报价；不能让后一份报价
     # 覆盖主题研究报告中的前一份报价表。
@@ -87,7 +278,8 @@ class JsonEditor(QDialog):
         self.path = Path(initial_path) if initial_path else None
         self.editor = QPlainTextEdit()
         template = {"字段覆盖": {}, "外部事实": {},
-                    "事件证据": {"事件事实": [], "传导关系": []}}
+                    "事件证据": {"事件事实": [], "产业机制": [], "A股暴露": [],
+                               "组合传导链": [], "传导关系": []}}
         if self.path and self.path.is_file():
             try:
                 self.editor.setPlainText(self.path.read_text(encoding="utf-8"))
@@ -95,7 +287,7 @@ class JsonEditor(QDialog):
                 self.editor.setPlainText(json.dumps(template, ensure_ascii=False, indent=2))
         else:
             self.editor.setPlainText(json.dumps(template, ensure_ascii=False, indent=2))
-        hint = QLabel("字段覆盖必须含“值”和“来源”；判定字段不可人工覆盖。事件驱动报告还须填写事件事实和传导关系，且每条都要有来源。")
+        hint = QLabel("字段覆盖必须含“值”和“来源”；判定字段不可人工覆盖。事件驱动报告需填写“事件事实＋产业机制＋A股暴露＋组合传导链”，或提供一条可直接证明传导的原文。")
         hint.setWordWrap(True)
         save = QPushButton("保存…")
         add_field = QPushButton("添加字段覆盖…")
@@ -127,7 +319,8 @@ class JsonEditor(QDialog):
             value = json.loads(self.editor.toPlainText())
             return value if isinstance(value, dict) else {
                 "字段覆盖": {}, "外部事实": {},
-                "事件证据": {"事件事实": [], "传导关系": []},
+                "事件证据": {"事件事实": [], "产业机制": [], "A股暴露": [],
+                           "组合传导链": [], "传导关系": []},
             }
         except json.JSONDecodeError:
             QMessageBox.warning(self, "JSON 无效", "请先修正 JSON 后再使用表单添加。")
@@ -147,6 +340,12 @@ class JsonEditor(QDialog):
             value["事件证据"] = evidence
         if not isinstance(evidence.get("事件事实"), list):
             evidence["事件事实"] = []
+        if not isinstance(evidence.get("产业机制"), list):
+            evidence["产业机制"] = []
+        if not isinstance(evidence.get("A股暴露"), list):
+            evidence["A股暴露"] = []
+        if not isinstance(evidence.get("组合传导链"), list):
+            evidence["组合传导链"] = []
         if not isinstance(evidence.get("传导关系"), list):
             evidence["传导关系"] = []
         return evidence
@@ -282,6 +481,8 @@ class MaterialCandidateDialog(QDialog):
         self.topic = topic
         self.candidates = []
         self.imported_facts: list[dict] = []
+        self.imported_mechanisms: list[dict] = []
+        self.imported_exposures: list[dict] = []
         self.imported_links: list[dict] = []
 
         self.material_label = QLabel("尚未选择材料。仅提取原文候选，不会调用 LLM 或自动判断事实。")
@@ -294,18 +495,22 @@ class MaterialCandidateDialog(QDialog):
         choose = QPushButton("选择本地材料…")
         direct = QPushButton("从 HTTPS 直链获取…")
         import_fact = QPushButton("将选中原文作为事件事实")
+        import_mechanism = QPushButton("作为产业机制")
+        import_exposure = QPushButton("作为A股暴露")
         import_link = QPushButton("将选中原文作为传导证据")
         close = QPushButton("取消")
         choose.clicked.connect(self.choose_material)
         direct.clicked.connect(self.download_material)
-        import_fact.clicked.connect(lambda: self.import_selected(transmission=False))
-        import_link.clicked.connect(lambda: self.import_selected(transmission=True))
+        import_fact.clicked.connect(lambda: self.import_selected("事件事实"))
+        import_mechanism.clicked.connect(lambda: self.import_selected("产业机制"))
+        import_exposure.clicked.connect(lambda: self.import_selected("A股暴露"))
+        import_link.clicked.connect(lambda: self.import_selected("传导证据"))
         close.clicked.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "选择公司 IR、业绩公告或产业链材料后，系统只展示逐字原文候选。请自行核对原件，"
-            "再把选中内容明确归入事件事实或传导证据。直链仅支持 HTTPS 的原始文件，不抓取网页。"))
+            "再把选中内容明确归入事件事实、产业机制、A股暴露或直接传导证据。直链仅支持 HTTPS 的原始文件，不抓取网页。"))
         layout.itemAt(layout.count() - 1).widget().setWordWrap(True)
         layout.addWidget(self.material_label)
         layout.addWidget(ResearchHelperWindow._row(choose, direct))
@@ -313,7 +518,7 @@ class MaterialCandidateDialog(QDialog):
         layout.addWidget(self.list)
         layout.addWidget(QLabel("作为传导证据时的关系类型"))
         layout.addWidget(self.relation)
-        layout.addWidget(ResearchHelperWindow._row(import_fact, import_link, close))
+        layout.addWidget(ResearchHelperWindow._row(import_fact, import_mechanism, import_exposure, import_link, close))
 
     def choose_material(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -352,7 +557,7 @@ class MaterialCandidateDialog(QDialog):
         if not self.candidates:
             QMessageBox.information(self, "没有候选", "材料没有可展示的文本；扫描版 PDF 可能需要 OCR。")
 
-    def import_selected(self, *, transmission: bool) -> None:
+    def import_selected(self, evidence_type: str) -> None:
         selected = self.list.selectedItems()
         if not selected:
             QMessageBox.information(self, "尚未选择", "请选择至少一条原文候选。")
@@ -362,56 +567,531 @@ class MaterialCandidateDialog(QDialog):
             candidate = self.candidates[int(widget.data(Qt.ItemDataRole.UserRole))]
             item = {"内容": candidate.content, "来源": candidate.source,
                     "链接": candidate.reference, "材料页码": candidate.page}
-            if transmission:
+            if evidence_type in {"产业机制", "传导证据"}:
                 item["关系"] = self.relation.currentText()
             payload.append(item)
-        if transmission:
+        if evidence_type == "传导证据":
             self.imported_links = payload
+        elif evidence_type == "产业机制":
+            self.imported_mechanisms = payload
+        elif evidence_type == "A股暴露":
+            self.imported_exposures = payload
         else:
             self.imported_facts = payload
         self.accept()
+
+
+class EvidenceDiscoveryReviewDialog(QDialog):
+    """集中审核自动检索候选；默认全不选，分析师确认后才写入证据包。"""
+
+    def __init__(self, parent: QWidget | None, payload: dict) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("审核自动查找到的事件证据")
+        self.resize(1040, 780)
+        self.candidates = [dict(item) for item in (payload.get("candidates") or [])
+                           if isinstance(item, dict)]
+        self.chains = [dict(item) for item in (payload.get("chains") or []) if isinstance(item, dict)]
+        self.list = QListWidget()
+        self.list.setMinimumHeight(300)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list.setWordWrap(True)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._render_candidates()
+
+        query_groups = payload.get("query_groups") or {}
+        group_text = "；".join(
+            f"{name}：{' / '.join(str(query) for query in values)}"
+            for name, values in query_groups.items() if isinstance(values, list)
+        )
+        queries = group_text or "；".join(str(item) for item in (payload.get("queries") or [])) or "—"
+        channel_counts = payload.get("searched_by_channel") or {}
+        channel_text = "；".join(f"{name} {count} 份" for name, count in channel_counts.items()) or "—"
+        hit_counts = payload.get("search_hits_by_channel") or {}
+        hit_text = "；".join(f"{name} {count} 条" for name, count in hit_counts.items()) or "—"
+        failure_counts = payload.get("fetch_failures_by_channel") or {}
+        failure_text = "；".join(f"{name} {count} 条" for name, count in failure_counts.items()) or "0"
+        fact_count = sum(item.get("evidence_type") == "事件事实" for item in self.candidates)
+        mechanism_count = sum(item.get("evidence_type") == "产业机制" for item in self.candidates)
+        exposure_count = sum(item.get("evidence_type") == "A股暴露" for item in self.candidates)
+        link_count = sum(item.get("evidence_type") == "传导证据" for item in self.candidates)
+        hint = QLabel(
+            "自动检索不会自动采用任何内容。请核对原文并勾选。完整路径为“事件事实＋产业机制＋A股暴露＋组合传导链”；"
+            "若某段原文已经直接说明事件怎样影响本次A股对象，也可归为“直接传导证据”走兼容捷径。"
+        )
+        hint.setWordWrap(True)
+        diagnostics_text = (
+            f"分阶段检索：{queries}\n读取原文：{payload.get('searched_documents') or 0} 份（{channel_text}）"
+            f"\n搜索命中：{hit_text}；正文读取/质量失败：{failure_text}"
+            f"\n候选：事件事实 {fact_count}；产业机制 {mechanism_count}；A股暴露 {exposure_count}；"
+            f"直接传导 {link_count}；组合链 {len(self.chains)}"
+            + (f"\n提示：\n" + "\n".join(f"• {item}" for item in (payload.get("warnings") or []))
+               if payload.get("warnings") else "")
+        )
+        diagnostics = QPlainTextEdit(diagnostics_text)
+        diagnostics.setReadOnly(True)
+        diagnostics.setMaximumHeight(135)
+        diagnostics.setStyleSheet("color:#666; background:#f7f7f8;")
+        open_source = QPushButton("打开当前候选来源")
+        as_fact = QPushButton("改为事件事实")
+        as_mechanism = QPushButton("改为产业机制")
+        as_exposure = QPushButton("改为A股暴露")
+        as_link = QPushButton("改为直接传导")
+        select_all = QPushButton("全部勾选")
+        clear = QPushButton("清空勾选")
+        confirm, cancel = QPushButton("采用已勾选证据"), QPushButton("取消")
+        open_source.clicked.connect(self.open_current_source)
+        as_fact.clicked.connect(lambda: self._change_type("事件事实"))
+        as_mechanism.clicked.connect(lambda: self._change_type("产业机制"))
+        as_exposure.clicked.connect(lambda: self._change_type("A股暴露"))
+        as_link.clicked.connect(lambda: self._change_type("传导证据"))
+        select_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        clear.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        confirm.clicked.connect(self.accept)
+        cancel.clicked.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(hint)
+        layout.addWidget(diagnostics)
+        layout.addWidget(self.list)
+        layout.addWidget(ResearchHelperWindow._row(open_source, as_fact, as_mechanism, as_exposure, as_link))
+        self.chain_list = QListWidget()
+        self.chain_list.setMinimumHeight(120)
+        self.chain_list.setWordWrap(True)
+        self.chain_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        for index, chain in enumerate(self.chains):
+            refs = "+".join([
+                *(str(value) for value in (chain.get("fact_ids") or [])),
+                *(str(value) for value in (chain.get("mechanism_ids") or [])),
+                *(str(value) for value in (chain.get("exposure_ids") or [])),
+            ])
+            item = QListWidgetItem(
+                f"{refs}｜方向 {chain.get('direction') or '不确定'}｜置信度 {chain.get('confidence') or '低'}\n"
+                f"{chain.get('conclusion') or ''}\n边界：{chain.get('reason') or '—'}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.chain_list.addItem(item)
+        layout.addWidget(QLabel("组合传导链（勾选链时会自动采用其引用的三类原文）"))
+        layout.addWidget(self.chain_list)
+        layout.addWidget(ResearchHelperWindow._row(select_all, clear, confirm, cancel))
+
+    def _render_candidates(self, checked: set[int] | None = None, current_index: int | None = None) -> None:
+        """重新显示分析师改类后的候选，仍保持明确的逐条勾选边界。"""
+        checked = checked or set()
+        self.list.clear()
+        for index, candidate in enumerate(self.candidates):
+            kind = str(candidate.get("evidence_type") or "候选")
+            relation = str(candidate.get("relation") or "")
+            source_kind = str(candidate.get("source_kind") or "公开材料")
+            prefix = f"{kind}｜{relation}｜" if relation else f"{kind}｜"
+            text = (
+                f"{candidate.get('evidence_id') or '—'}｜{prefix}{source_kind}\n"
+                f"{candidate.get('content') or ''}\n"
+                f"来源：{candidate.get('source') or ''}\n"
+                f"模型相关性说明（不是证据原文）：{candidate.get('reason') or '—'}"
+            )
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if index in checked else Qt.CheckState.Unchecked)
+            self.list.addItem(item)
+        if current_index is not None and 0 <= current_index < self.list.count():
+            self.list.setCurrentRow(current_index)
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        for row in range(self.list.count()):
+            self.list.item(row).setCheckState(state)
+
+    def _change_type(self, evidence_type: str) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "尚未选择", "请先点选需要调整分类的候选。")
+            return
+        index = int(item.data(Qt.ItemDataRole.UserRole))
+        checked = {
+            int(self.list.item(row).data(Qt.ItemDataRole.UserRole))
+            for row in range(self.list.count())
+            if self.list.item(row).checkState() == Qt.CheckState.Checked
+        }
+        candidate = self.candidates[index]
+        if str(candidate.get("evidence_type") or "") != evidence_type:
+            # 分类改变后原来的 F/M/E/D 前缀不再可信；合并进证据包时按新类别重编号。
+            candidate["evidence_id"] = ""
+        candidate["evidence_type"] = evidence_type
+        if evidence_type in {"事件事实", "A股暴露"}:
+            candidate["relation"] = ""
+        elif evidence_type in {"产业机制", "传导证据"} and not str(candidate.get("relation") or "").strip():
+            relation, accepted = QInputDialog.getItem(
+                self, "确认传导关系", "该原文体现的传导关系：",
+                ["供应链", "客户需求", "直接竞争", "技术替代", "估值情绪映射", "其他"], 0, False,
+            )
+            candidate["relation"] = relation if accepted else "其他"
+        self._render_candidates(checked, index)
+
+    def open_current_source(self) -> None:
+        item = self.list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "尚未选择", "请先点选一条候选。")
+            return
+        candidate = self.candidates[int(item.data(Qt.ItemDataRole.UserRole))]
+        raw = str(candidate.get("link") or "").strip()
+        if not raw:
+            QMessageBox.information(self, "没有来源链接", "该候选没有可打开的链接或文件路径。")
+            return
+        if raw.lower().startswith("https://"):
+            QDesktopServices.openUrl(QUrl(raw))
+        else:
+            path = Path(raw)
+            if path.is_file():
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+            else:
+                QMessageBox.warning(self, "来源不可用", "找不到候选对应的本地材料。")
+
+    def selected(self) -> dict:
+        selected_ids: set[str] = set()
+        selected_chains: list[dict] = []
+        type_by_id = {str(item.get("evidence_id") or ""): str(item.get("evidence_type") or "")
+                      for item in self.candidates if str(item.get("evidence_id") or "")}
+        invalid_chains = 0
+        for row in range(self.chain_list.count()):
+            item = self.chain_list.item(row)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            chain = self.chains[int(item.data(Qt.ItemDataRole.UserRole))]
+            typed_refs = ((chain.get("fact_ids") or [], "事件事实"),
+                          (chain.get("mechanism_ids") or [], "产业机制"),
+                          (chain.get("exposure_ids") or [], "A股暴露"))
+            if any(type_by_id.get(str(value)) != expected
+                   for values, expected in typed_refs for value in values):
+                invalid_chains += 1
+                continue
+            selected_chains.append({
+                "事实证据ID": list(chain.get("fact_ids") or []),
+                "机制证据ID": list(chain.get("mechanism_ids") or []),
+                "暴露证据ID": list(chain.get("exposure_ids") or []),
+                "结论": str(chain.get("conclusion") or "").strip(),
+                "方向": str(chain.get("direction") or "不确定"),
+                "置信度": str(chain.get("confidence") or "低"),
+                "边界": str(chain.get("reason") or ""),
+            })
+            selected_ids.update(str(value) for key in ("fact_ids", "mechanism_ids", "exposure_ids")
+                                for value in (chain.get(key) or []))
+        chosen_indices = {
+            int(self.list.item(row).data(Qt.ItemDataRole.UserRole))
+            for row in range(self.list.count())
+            if self.list.item(row).checkState() == Qt.CheckState.Checked
+        }
+        for index, candidate in enumerate(self.candidates):
+            if str(candidate.get("evidence_id") or "") in selected_ids:
+                chosen_indices.add(index)
+        result = {"事件事实": [], "产业机制": [], "A股暴露": [],
+                  "组合传导链": selected_chains, "传导关系": []}
+        for index in sorted(chosen_indices):
+            candidate = self.candidates[index]
+            value = {
+                "证据ID": str(candidate.get("evidence_id") or "").strip(),
+                "内容": str(candidate.get("content") or "").strip(),
+                "来源": str(candidate.get("source") or "").strip(),
+                "链接": str(candidate.get("link") or "").strip(),
+                "取得方式": "自动检索后经分析师确认",
+            }
+            if candidate.get("evidence_type") == "传导证据":
+                value["关系"] = str(candidate.get("relation") or "其他")
+                result["传导关系"].append(value)
+            elif candidate.get("evidence_type") == "产业机制":
+                value["关系"] = str(candidate.get("relation") or "其他")
+                result["产业机制"].append(value)
+            elif candidate.get("evidence_type") == "A股暴露":
+                result["A股暴露"].append(value)
+            else:
+                result["事件事实"].append(value)
+        if invalid_chains:
+            QMessageBox.information(
+                self, "组合链未采用",
+                f"有 {invalid_chains} 条组合链引用的候选已被改类或移除，因此未写入证据包；请重新检索组合或手工建立链。",
+            )
+        return result
 
 
 class EventEvidenceDialog(QDialog):
     """事件型研究的表单式证据包；运行时由主窗口自动写成临时 overrides。"""
 
     def __init__(self, parent: QWidget | None = None, evidence: dict | None = None,
-                 *, topic: str = "") -> None:
+                 *, topic: str = "", discovery_mode: str = "foundation",
+                 research_context: dict | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("事件证据包")
         self.resize(860, 560)
         evidence = evidence or {}
         self.facts = [dict(item) for item in (evidence.get("事件事实") or []) if isinstance(item, dict)]
+        self.mechanisms = [dict(item) for item in (evidence.get("产业机制") or []) if isinstance(item, dict)]
+        self.exposures = [dict(item) for item in (evidence.get("A股暴露") or []) if isinstance(item, dict)]
+        self.chains = [dict(item) for item in (evidence.get("组合传导链") or []) if isinstance(item, dict)]
         self.links = [dict(item) for item in (evidence.get("传导关系") or []) if isinstance(item, dict)]
-        self.fact_list, self.link_list = QListWidget(), QListWidget()
-        self.fact_list.setMinimumHeight(175); self.link_list.setMinimumHeight(175)
+        self.fact_list, self.mechanism_list = QListWidget(), QListWidget()
+        self.exposure_list, self.chain_list, self.link_list = QListWidget(), QListWidget(), QListWidget()
+        self.topic = topic
+        self.discovery_mode = discovery_mode
+        self.research_context = dict(research_context or {})
+        self.discovery_process: QProcess | None = None
+        self.discovery_output = ""
+        self.discovery_error = ""
+        self.discovery_line_buffer = ""
+        self.discovery_cancelled = False
+        phase_text = (
+            "当前是研究对象确认后的第二阶段：系统将使用已确认的行业、公司篮子或主题ETF检索A股暴露，"
+            "并与已有事实和产业机制组合传导链。"
+            if discovery_mode in {"exposure", "complete"} else
+            "当前是第一阶段：先检索事件事实和产业机制；A股暴露将在研究取数对象确认后自动进入第二阶段。"
+        )
         self.hint = QLabel(
-            "此处平时可留空。只有事件型需求在运行时，才需要同时具备：①已披露的事件事实；"
-            "②该事件到本次行业或 ETF 的传导依据。可从已上传材料导入原文，不必重复手填；"
-            "导入后仍需由分析师确认分类与来源。"
+            phase_text + " 完整证据需包含事实、机制、A股暴露和经确认的组合链；"
+            "直接传导原文可作为兼容捷径。任何候选都必须由分析师确认后才会采用。"
         )
         self.hint.setWordWrap(True)
 
         add_fact, remove_fact = QPushButton("添加事件事实…"), QPushButton("删除选中")
-        add_link, remove_link = QPushButton("添加传导证据…"), QPushButton("删除选中")
+        add_mechanism, remove_mechanism = QPushButton("添加产业机制…"), QPushButton("删除选中")
+        add_exposure, remove_exposure = QPushButton("添加A股暴露…"), QPushButton("删除选中")
+        add_link, remove_link = QPushButton("添加直接传导…"), QPushButton("删除选中")
+        add_chain, remove_chain = QPushButton("添加组合传导链…"), QPushButton("删除选中")
         import_material = QPushButton("从已上传材料导入原文")
+        self.auto_discover = QPushButton("自动查找候选证据")
+        self.discovery_status = QLabel(
+            "自动查找会分别检索事件事实、产业机制和A股暴露原文，并尝试用证据ID组合传导链；各通道有独立配额，"
+            "不会自动写入报告。"
+        )
+        self.discovery_status.setWordWrap(True)
+        self.discovery_status.setStyleSheet("color:#666;")
+        self.discovery_progress = QProgressBar()
+        self.discovery_progress.setRange(0, 100)
+        self.discovery_progress.setValue(0)
+        self.discovery_progress.setFormat("尚未开始")
         add_fact.clicked.connect(self.add_fact); remove_fact.clicked.connect(self.remove_fact)
+        add_mechanism.clicked.connect(self.add_mechanism); remove_mechanism.clicked.connect(self.remove_mechanism)
+        add_exposure.clicked.connect(self.add_exposure); remove_exposure.clicked.connect(self.remove_exposure)
         add_link.clicked.connect(self.add_link); remove_link.clicked.connect(self.remove_link)
+        add_chain.clicked.connect(self.add_chain)
+        remove_chain.clicked.connect(self.remove_chain)
         import_material.clicked.connect(lambda: self.import_material(topic))
+        self.auto_discover.clicked.connect(self.start_discovery)
         save, cancel = QPushButton("保存证据"), QPushButton("取消")
         save.clicked.connect(self.accept); cancel.clicked.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.hint)
-        layout.addWidget(import_material)
-        layout.addWidget(QLabel("1. 事件事实（业绩实际、指引、公告等）"))
-        layout.addWidget(self.fact_list)
-        layout.addWidget(ResearchHelperWindow._row(add_fact, remove_fact))
-        layout.addWidget(QLabel("2. 传导证据（为何影响本次行业或 ETF）"))
-        layout.addWidget(self.link_list)
-        layout.addWidget(ResearchHelperWindow._row(add_link, remove_link))
+        layout.addWidget(ResearchHelperWindow._row(self.auto_discover, import_material))
+        layout.addWidget(self.discovery_status)
+        layout.addWidget(self.discovery_progress)
+        tabs = QTabWidget()
+        for title, widget, actions in (
+            ("1 事件事实", self.fact_list, (add_fact, remove_fact)),
+            ("2 产业机制", self.mechanism_list, (add_mechanism, remove_mechanism)),
+            ("3 A股暴露", self.exposure_list, (add_exposure, remove_exposure)),
+            ("4 组合传导链", self.chain_list, (add_chain, remove_chain)),
+            ("直接传导（兼容）", self.link_list, (add_link, remove_link)),
+        ):
+            page = QWidget(); page_layout = QVBoxLayout(page)
+            widget.setMinimumHeight(260)
+            page_layout.addWidget(widget)
+            page_layout.addWidget(ResearchHelperWindow._row(*actions))
+            tabs.addTab(page, title)
+        layout.addWidget(tabs)
         layout.addWidget(ResearchHelperWindow._row(save, cancel))
         self.refresh()
+
+    def start_discovery(self) -> None:
+        if self.discovery_process is not None:
+            self.discovery_cancelled = True
+            self.discovery_status.setText("正在停止自动查找…")
+            self.discovery_process.kill()
+            return
+        if not self.topic.strip():
+            QMessageBox.information(self, "缺少客户需求", "请先填写客户需求，再自动查找事件证据。")
+            return
+        approved = QMessageBox.question(
+            self, "确认外部检索",
+            "自动查找会把根据当前客户需求生成的检索词发送到公开搜索服务，"
+            "并把成功读取的公开原文发送给当前配置的 LLM 做分类。\n\n"
+            "不会自动采用任何结果；是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if approved != QMessageBox.StandardButton.Yes:
+            return
+        self.discovery_output = ""
+        self.discovery_error = ""
+        self.discovery_line_buffer = ""
+        self.discovery_cancelled = False
+        process = QProcess(self)
+        process.setWorkingDirectory(str(ROOT))
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        process.readyReadStandardOutput.connect(self._read_discovery_output)
+        process.readyReadStandardError.connect(self._read_discovery_error)
+        process.finished.connect(self._finish_discovery)
+        process.errorOccurred.connect(self._discovery_process_error)
+        self.discovery_process = process
+        self.auto_discover.setText("停止自动查找")
+        self.discovery_status.setText(
+            "正在启动自动证据查找；窗口不会冻结，可随时停止。"
+        )
+        self.discovery_progress.setRange(0, 100)
+        self.discovery_progress.setValue(1)
+        self.discovery_progress.setFormat("1%｜正在启动…")
+        process.start(sys.executable, [str(ROOT / "core" / "event_evidence_worker.py")])
+        process.write(json.dumps({
+            "topic": self.topic, "sources_dir": str(ROOT / "sources"),
+            "mode": self.discovery_mode,
+            "research_context": self.research_context,
+            "existing_evidence": self.payload(),
+        }, ensure_ascii=False).encode("utf-8"))
+        process.closeWriteChannel()
+
+    def _read_discovery_output(self) -> None:
+        if self.discovery_process:
+            chunk = bytes(self.discovery_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+            self.discovery_output += chunk
+            self.discovery_line_buffer += chunk
+            lines = self.discovery_line_buffer.split("\n")
+            self.discovery_line_buffer = lines.pop()
+            for line in lines:
+                if not line.startswith("EVENT_EVIDENCE_PROGRESS="):
+                    continue
+                try:
+                    progress = json.loads(line.split("=", 1)[1])
+                except json.JSONDecodeError:
+                    continue
+                value = max(0, min(100, int(progress.get("value") or 0)))
+                message = str(progress.get("message") or "正在处理…")
+                self.discovery_progress.setValue(value)
+                self.discovery_progress.setFormat(f"{value}%｜{message}")
+                self.discovery_status.setText(message)
+
+    def _read_discovery_error(self) -> None:
+        if self.discovery_process:
+            self.discovery_error += bytes(
+                self.discovery_process.readAllStandardError()
+            ).decode("utf-8", errors="replace")
+
+    def _discovery_process_error(self, _error) -> None:
+        self.discovery_status.setText("自动查找进程无法启动；仍可从材料导入或手工添加。")
+
+    def _finish_discovery(self, _exit_code: int, _status) -> None:
+        self._read_discovery_output()
+        self._read_discovery_error()
+        self.discovery_process = None
+        self.auto_discover.setText("自动查找候选证据")
+        if self.discovery_cancelled:
+            self.discovery_cancelled = False
+            self.discovery_status.setText("自动查找已停止；现有证据包未改变。")
+            self.discovery_progress.setFormat("已停止")
+            return
+        prefix = "EVENT_EVIDENCE_DISCOVERY="
+        try:
+            line = next(
+                value for value in reversed(self.discovery_output.splitlines())
+                if value.startswith(prefix)
+            )
+            payload = json.loads(line[len(prefix):])
+        except (StopIteration, json.JSONDecodeError):
+            detail = self.discovery_error.strip()[-1000:] or "子进程没有返回可解析结果。"
+            self.discovery_status.setText("自动查找失败；仍可从材料导入或手工添加。")
+            self.discovery_progress.setFormat("失败")
+            QMessageBox.warning(self, "自动查找失败", detail)
+            return
+        candidates = payload.get("candidates") or []
+        fact_count = sum(item.get("evidence_type") == "事件事实" for item in candidates if isinstance(item, dict))
+        mechanism_count = sum(item.get("evidence_type") == "产业机制" for item in candidates if isinstance(item, dict))
+        exposure_count = sum(item.get("evidence_type") == "A股暴露" for item in candidates if isinstance(item, dict))
+        link_count = sum(item.get("evidence_type") == "传导证据" for item in candidates if isinstance(item, dict))
+        self.discovery_status.setText(
+            f"本次读取 {payload.get('searched_documents') or 0} 份原文，形成事件事实 {fact_count} 条、"
+            f"产业机制 {mechanism_count} 条、A股暴露 {exposure_count} 条、直接传导 {link_count} 条，"
+            f"组合链 {len(payload.get('chains') or [])} 条待审核。"
+        )
+        self.discovery_progress.setValue(100)
+        self.discovery_progress.setFormat("100%｜查找完成，等待审核")
+        if not candidates:
+            warnings = "\n".join(str(item) for item in (payload.get("warnings") or []))
+            QMessageBox.information(
+                self, "未形成可确认候选",
+                (warnings or "没有找到同时满足原文和来源要求的证据。")
+                + "\n\n你仍可以上传材料、粘贴原文或手工添加；也可以调整客户问题后重新检索。"
+                  "如果不需要验证具体事件影响，可将需求改为普通主题研究。",
+            )
+            return
+        dialog = EvidenceDiscoveryReviewDialog(self, payload)
+        if not dialog.exec():
+            return
+        selected = dialog.selected()
+        if not any(selected.values()):
+            QMessageBox.information(self, "没有采用候选", "你没有勾选任何证据，现有证据包未改变。")
+            return
+        self._merge_selected(selected)
+        self.refresh()
+        self.discovery_status.setText(
+            f"已采用事件事实 {len(selected['事件事实'])}、产业机制 {len(selected['产业机制'])}、"
+            f"A股暴露 {len(selected['A股暴露'])}、组合链 {len(selected['组合传导链'])}、"
+            f"直接传导 {len(selected['传导关系'])}；保存后进入本次运行。"
+        )
+
+    @staticmethod
+    def _extend_unique(target: list[dict], values: list[dict], *,
+                       keys: tuple[str, ...] = ("内容", "来源")) -> None:
+        existing = {
+            tuple(str(item.get(key) or "").strip() for key in keys)
+            for item in target
+        }
+        for value in values:
+            key = tuple(str(value.get(name) or "").strip() for name in keys)
+            if key not in existing:
+                target.append(value)
+                existing.add(key)
+
+    def _merge_selected(self, selected: dict) -> None:
+        """合并多次检索结果时重排证据ID，保证组合链始终引用唯一条目。"""
+        groups = (("事件事实", self.facts, "F"), ("产业机制", self.mechanisms, "M"),
+                  ("A股暴露", self.exposures, "E"), ("传导关系", self.links, "D"))
+        used: set[str] = set()
+        for _key, target, prefix in groups:
+            for index, item in enumerate(target, 1):
+                evidence_id = str(item.get("证据ID") or "").strip()
+                if not evidence_id or evidence_id in used:
+                    serial = index
+                    while f"{prefix}{serial}" in used:
+                        serial += 1
+                    evidence_id = f"{prefix}{serial}"
+                    item["证据ID"] = evidence_id
+                used.add(evidence_id)
+        remap: dict[str, str] = {}
+        for key, target, prefix in groups:
+            for value in selected.get(key) or []:
+                item = dict(value)
+                old_id = str(item.get("证据ID") or "").strip()
+                duplicate = next((existing for existing in target
+                                  if str(existing.get("内容") or "").strip() == str(item.get("内容") or "").strip()
+                                  and str(existing.get("来源") or "").strip() == str(item.get("来源") or "").strip()), None)
+                if duplicate is not None:
+                    if old_id:
+                        remap[old_id] = str(duplicate.get("证据ID") or "")
+                    continue
+                new_id = old_id
+                serial = 1
+                while not new_id or new_id in used:
+                    new_id = f"{prefix}{serial}"
+                    serial += 1
+                item["证据ID"] = new_id
+                if old_id:
+                    remap[old_id] = new_id
+                used.add(new_id)
+                self._extend_unique(target, [item])
+        chains: list[dict] = []
+        for raw in selected.get("组合传导链") or []:
+            chain = dict(raw)
+            for key in ("事实证据ID", "机制证据ID", "暴露证据ID"):
+                chain[key] = [remap.get(str(value), str(value)) for value in (chain.get(key) or [])]
+            chains.append(chain)
+        self._extend_unique(self.chains, chains, keys=("结论", "方向"))
 
     def import_material(self, topic: str) -> None:
         dialog = MaterialCandidateDialog(self, topic=topic)
@@ -431,6 +1111,8 @@ class EventEvidenceDialog(QDialog):
                 dialog.load_material(path, reference=str(path.resolve()))
         if dialog.exec():
             self.facts.extend(dialog.imported_facts)
+            self.mechanisms.extend(dialog.imported_mechanisms)
+            self.exposures.extend(dialog.imported_exposures)
             self.links.extend(dialog.imported_links)
             self.refresh()
 
@@ -451,9 +1133,9 @@ class EventEvidenceDialog(QDialog):
         layout.addWidget(source, 2); layout.addWidget(link, 3); layout.addWidget(browse)
         return row
 
-    def _edit_item(self, *, transmission: bool) -> dict | None:
+    def _edit_item(self, kind: str) -> dict | None:
         dialog = QDialog(self)
-        dialog.setWindowTitle("添加传导证据" if transmission else "添加事件事实")
+        dialog.setWindowTitle(f"添加{kind}")
         content, source, link = QPlainTextEdit(), QLineEdit(), QLineEdit()
         source.setPlaceholderText("来源（必填），例如 SK hynix 业绩公告 p4")
         link.setPlaceholderText("链接或本地材料路径（可选）")
@@ -462,11 +1144,11 @@ class EventEvidenceDialog(QDialog):
         confirm, cancel = QPushButton("添加"), QPushButton("取消")
         confirm.clicked.connect(dialog.accept); cancel.clicked.connect(dialog.reject)
         form = QFormLayout(dialog)
-        if transmission:
+        if kind in {"产业机制", "直接传导证据"}:
             form.addRow("关系类型", relation)
-            form.addRow("传导说明", content)
+            form.addRow("原文内容", content)
         else:
-            form.addRow("已披露事实", content)
+            form.addRow("原文内容", content)
         form.addRow("来源 / 链接", self._source_row(source, link, dialog))
         form.addRow("", ResearchHelperWindow._row(confirm, cancel))
         if not dialog.exec():
@@ -476,16 +1158,24 @@ class EventEvidenceDialog(QDialog):
             return None
         item = {"内容": content.toPlainText().strip(), "来源": source.text().strip(),
                 "链接": link.text().strip()}
-        if transmission:
+        if kind in {"产业机制", "直接传导证据"}:
             item["关系"] = relation.currentText()
         return item
 
     def add_fact(self) -> None:
-        if item := self._edit_item(transmission=False):
+        if item := self._edit_item("事件事实"):
             self.facts.append(item); self.refresh()
 
+    def add_mechanism(self) -> None:
+        if item := self._edit_item("产业机制"):
+            self.mechanisms.append(item); self.refresh()
+
+    def add_exposure(self) -> None:
+        if item := self._edit_item("A股暴露"):
+            self.exposures.append(item); self.refresh()
+
     def add_link(self) -> None:
-        if item := self._edit_item(transmission=True):
+        if item := self._edit_item("直接传导证据"):
             self.links.append(item); self.refresh()
 
     def remove_fact(self) -> None:
@@ -498,15 +1188,99 @@ class EventEvidenceDialog(QDialog):
         if row >= 0:
             self.links.pop(row); self.refresh()
 
+    def remove_mechanism(self) -> None:
+        row = self.mechanism_list.currentRow()
+        if row >= 0:
+            self.mechanisms.pop(row); self.refresh()
+
+    def remove_exposure(self) -> None:
+        row = self.exposure_list.currentRow()
+        if row >= 0:
+            self.exposures.pop(row); self.refresh()
+
+    def remove_chain(self) -> None:
+        row = self.chain_list.currentRow()
+        if row >= 0:
+            self.chains.pop(row); self.refresh()
+
+    def add_chain(self) -> None:
+        self._ensure_evidence_ids()
+        if not self.facts or not self.mechanisms or not self.exposures:
+            QMessageBox.information(
+                self, "三类原文尚未齐备",
+                "请先分别添加至少一条事件事实、产业机制和A股暴露原文，再组合传导链。",
+            )
+            return
+        dialog = QDialog(self); dialog.setWindowTitle("添加组合传导链")
+        fact, mechanism, exposure = QComboBox(), QComboBox(), QComboBox()
+        for combo, values in ((fact, self.facts), (mechanism, self.mechanisms), (exposure, self.exposures)):
+            for item in values:
+                combo.addItem(f"{item.get('证据ID')}｜{str(item.get('内容') or '')[:60]}", item.get("证据ID"))
+        conclusion, boundary = QPlainTextEdit(), QLineEdit()
+        conclusion.setPlaceholderText("只根据所选三类原文说明事件如何传导至本次A股对象，不补充新事实或新数字。")
+        direction, confidence = QComboBox(), QComboBox()
+        direction.addItems(["不确定", "正向", "负向", "双向", "中性"])
+        confidence.addItems(["低", "中", "高"])
+        confirm, cancel = QPushButton("添加"), QPushButton("取消")
+        confirm.clicked.connect(dialog.accept); cancel.clicked.connect(dialog.reject)
+        form = QFormLayout(dialog)
+        form.addRow("事件事实", fact); form.addRow("产业机制", mechanism); form.addRow("A股暴露", exposure)
+        form.addRow("组合结论", conclusion); form.addRow("方向", direction); form.addRow("置信度", confidence)
+        form.addRow("边界/风险", boundary); form.addRow("", ResearchHelperWindow._row(confirm, cancel))
+        if not dialog.exec():
+            return
+        if not conclusion.toPlainText().strip():
+            QMessageBox.information(self, "缺少组合结论", "请填写只基于所选原文的组合结论。")
+            return
+        self.chains.append({
+            "事实证据ID": [str(fact.currentData())],
+            "机制证据ID": [str(mechanism.currentData())],
+            "暴露证据ID": [str(exposure.currentData())],
+            "结论": conclusion.toPlainText().strip(), "方向": direction.currentText(),
+            "置信度": confidence.currentText(), "边界": boundary.text().strip(),
+        })
+        self.refresh()
+
+    def _ensure_evidence_ids(self) -> None:
+        used: set[str] = set()
+        for values, prefix in ((self.facts, "F"), (self.mechanisms, "M"),
+                               (self.exposures, "E"), (self.links, "D")):
+            serial = 1
+            for item in values:
+                value = str(item.get("证据ID") or "").strip()
+                if not value or value in used:
+                    while f"{prefix}{serial}" in used:
+                        serial += 1
+                    value = f"{prefix}{serial}"
+                    item["证据ID"] = value
+                used.add(value)
+                serial += 1
+
     def refresh(self) -> None:
-        self.fact_list.clear(); self.link_list.clear()
+        self._ensure_evidence_ids()
+        self.fact_list.clear(); self.mechanism_list.clear(); self.exposure_list.clear()
+        self.chain_list.clear(); self.link_list.clear()
         for item in self.facts:
-            self.fact_list.addItem(f"事实｜{item.get('内容', '')}\n来源：{item.get('来源', '')}")
+            self.fact_list.addItem(f"{item.get('证据ID', 'F?')}｜事实｜{item.get('内容', '')}\n来源：{item.get('来源', '')}")
         for item in self.links:
-            self.link_list.addItem(f"{item.get('关系', '传导')}｜{item.get('内容', '')}\n来源：{item.get('来源', '')}")
+            self.link_list.addItem(f"{item.get('证据ID', 'D?')}｜{item.get('关系', '传导')}｜{item.get('内容', '')}\n来源：{item.get('来源', '')}")
+        for item in self.mechanisms:
+            self.mechanism_list.addItem(
+                f"{item.get('证据ID', 'M?')}｜{item.get('关系', '机制')}｜{item.get('内容', '')}\n来源：{item.get('来源', '')}")
+        for item in self.exposures:
+            self.exposure_list.addItem(
+                f"{item.get('证据ID', 'E?')}｜{item.get('内容', '')}\n来源：{item.get('来源', '')}")
+        for item in self.chains:
+            refs = "+".join([*(item.get("事实证据ID") or []), *(item.get("机制证据ID") or []),
+                             *(item.get("暴露证据ID") or [])])
+            self.chain_list.addItem(
+                f"{refs}｜方向 {item.get('方向', '不确定')}｜置信度 {item.get('置信度', '低')}\n"
+                f"{item.get('结论', '')}\n边界：{item.get('边界', '—')}")
 
     def payload(self) -> dict:
-        return {"事件事实": list(self.facts), "传导关系": list(self.links)}
+        return {"事件事实": list(self.facts), "产业机制": list(self.mechanisms),
+                "A股暴露": list(self.exposures), "组合传导链": list(self.chains),
+                "传导关系": list(self.links)}
 
 
 class LogicPickDialog(QDialog):
@@ -830,12 +1604,15 @@ class QuoteUnderlyingPoolDialog(QDialog):
         self.setWindowTitle("确认待报价标的")
         self.resize(860, 500)
         self.checks: list[tuple[str, QCheckBox]] = []
-        system_provided = any(str(item.get("origin") or "") == "系统推荐" for item in candidates)
+        candidate_provided = any(
+            str(item.get("origin") or "") in {"系统推荐", "研究取数目标"}
+            for item in candidates
+        )
         hint = QLabel(
             ("系统根据本次研究主题、标准行业及候选流动性找到了下列 ETF。请选择需要进入正式报价审核的工具；"
              "这不是产品推荐结论，OptionHelper 仍会独立核验行情并生成结构候选。")
-            if system_provided else
-            ("客户点名了多个 ETF/个股。Research Helper 的主题研究不替代产品比较；"
+            if candidate_provided else
+            ("客户点名了一个或多个 ETF/个股。Research Helper 的主题研究不替代产品选择；"
              "请勾选需要送入 OptionHelper 的标的。系统会对每一只标的分别生成结构推荐、"
              "等待你确认后再分别正式报价，绝不混成一份多标的报价。")
         )
@@ -992,8 +1769,9 @@ class MarketConfirmationDialog(QDialog):
         self.payload = payload
         previous = payload.get("previous_confirmation") or {}
         previous = previous if isinstance(previous, dict) else {}
-        self.setWindowTitle("确认研究市场、行业口径与挂钩工具")
-        self.resize(720, 430)
+        self.setWindowTitle("确认研究市场与取数目标")
+        self.resize(1080, 760)
+        self.setMinimumSize(900, 620)
 
         self.topic = QLabel(str(payload.get("topic") or "—"))
         self.topic.setWordWrap(True)
@@ -1001,7 +1779,7 @@ class MarketConfirmationDialog(QDialog):
         self.mode = QComboBox()
         self.mode.addItem("明确映射到 A 股研究口径并继续", "map_a")
         self.mode.addItem("仅研究当前市场（不生成产品报价）", "research_only")
-        self.mode.addItem("保留原市场并指定 ETF/指数", "keep_market")
+        self.mode.addItem("保留原市场并选择主题 ETF/指数取数", "keep_market")
         # 即使解析器先识别到“全球/港股”等事件背景，也默认给出可执行的 A 股研究路径；
         # 选择该项时 value() 会强制写入 A股，不依赖禁用下拉框的显示值。
         self.mode.setCurrentIndex(0)
@@ -1105,7 +1883,12 @@ class MarketConfirmationDialog(QDialog):
         self.underlying.addItem("", {"code": "", "name": ""})
         for item in payload.get("suggested_instruments") or []:
             origin = str(item.get("origin") or "")
-            label = f"{item.get('code', '')}｜{item.get('name', '')}｜{origin}｜{item.get('note', '')}"
+            exposure = item.get("exposure") if isinstance(item.get("exposure"), dict) else {}
+            exposure_label = str(exposure.get("label") or {
+                "direct": "直接暴露", "partial": "部分暴露", "unrelated": "不相关",
+            }.get(str(item.get("exposure_level") or ""), "待核验"))
+            label = (f"{item.get('code', '')}｜{item.get('name', '')}｜主题暴露：{exposure_label}｜"
+                     f"{origin}｜{item.get('note', '')}")
             self.underlying.addItem(label, item)
         previous_code = str(previous.get("underlying_code") or "").strip().upper()
         if previous_code:
@@ -1118,12 +1901,22 @@ class MarketConfirmationDialog(QDialog):
                 self.underlying.setCurrentIndex(matched_index)
             else:
                 self.underlying.setEditText(previous_code)
-        self.underlying.lineEdit().setPlaceholderText("请选择建议标的；也可输入代码，例如 513050.SH")
-        self.underlying_hint = QLabel("请选择候选后查看其主题匹配与流动性说明；手工输入代码会在提交后重新核验。")
+        self.underlying.lineEdit().setPlaceholderText("请选择研究 ETF；也可输入代码，例如 513050.SH")
+        self.underlying_hint = QLabel(
+            "仅在选择“主题 ETF 路径”时填写。该 ETF 的真实指数成分将成为研究取数篮子；"
+            "它不会因此自动成为正式报价标的。"
+        )
         self.underlying_hint.setWordWrap(True)
         self.underlying_hint.setStyleSheet("color:#666;")
         self.reason = QLineEdit(str(payload.get("reason") or ""))
-        self.reason.setPlaceholderText("选填：说明为什么采用这个研究口径/标的")
+        self.reason.setPlaceholderText("部分暴露时必填：说明为何该 ETF 仍可代表本次主题")
+        self.partial_exposure_confirmed = QCheckBox(
+            "若系统判定为“部分暴露”，我已核对跟踪指数和主要成分，确认按填写的映射理由继续"
+        )
+        self.partial_exposure_confirmed.setChecked(bool(previous.get("partial_exposure_confirmed", False)))
+        self.partial_exposure_confirmed.setToolTip(
+            "只用于部分暴露 ETF；证券真实性、跟踪指数真实性和流动性不足不能通过此项绕过。"
+        )
 
         errors = payload.get("errors") or []
         notice = str(payload.get("notice") or "")
@@ -1134,27 +1927,56 @@ class MarketConfirmationDialog(QDialog):
         self.message.setWordWrap(True)
         self.message.setStyleSheet("color:#a61b29;" if errors else "color:#666;")
         confirm, cancel = QPushButton("校验并继续"), QPushButton("取消本次运行")
+        confirm.setProperty("role", "primary")
+        cancel.setProperty("role", "danger")
         confirm.clicked.connect(self._submit)
         cancel.clicked.connect(self.reject)
         self.mode.currentIndexChanged.connect(self._sync_mode)
         self.scope.currentIndexChanged.connect(self._sync_scope_path)
         self.underlying.currentIndexChanged.connect(self._sync_underlying_hint)
 
-        form = QFormLayout(self)
-        form.addRow("解析主题", self.topic)
-        form.addRow("处理方式", self.mode)
-        form.addRow("确认市场", self.market)
-        form.addRow("研究主题（研究什么）", self.theme)
+        intro = QLabel(
+            "这一步只确认“研究什么、数据从哪里取”。正式挂钩标的不会在这里自动确定；"
+            "研究完成后，系统会另开窗口让分析师选择哪些证券进入 OptionHelper。"
+        )
+        intro.setWordWrap(True)
+        intro.setProperty("kind", "callout")
+
+        form = QFormLayout()
+        form.setContentsMargins(22, 20, 22, 20)
+        form.setHorizontalSpacing(20)
+        form.setVerticalSpacing(14)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.addRow(_purpose_label("解析主题", "系统对客户原始需求的摘要；只用于核对是否理解正确。"), self.topic)
+        form.addRow(_purpose_label("处理方式", "决定映射到哪个市场研究，以及研究后是否允许进入产品报价流程。"), self.mode)
+        form.addRow(_purpose_label("确认市场", "限定行情、行业和证券校验所使用的市场范围。"), self.market)
+        form.addRow(_purpose_label("研究主题", "用于材料检索、论点生成和报告标题；不直接指定成分股。"), self.theme)
         scope_box = QWidget()
         scope_layout = QVBoxLayout(scope_box); scope_layout.setContentsMargins(0, 0, 0, 0)
+        scope_layout.setSpacing(6)
         scope_layout.addWidget(self.scope); scope_layout.addWidget(self.scope_hint)
-        form.addRow("研究取数路径（系统建议）", scope_box)
-        form.addRow("主题研究篮子（取数用）", self.theme_basket_selector)
-        form.addRow("ETF / 指数（主题 ETF 取数或正式报价时填写）", self.underlying)
-        form.addRow("候选理由", self.underlying_hint)
-        form.addRow("映射理由", self.reason)
+        form.addRow(_purpose_label("研究取数路径", "决定研究数据来自标准行业成分、人工勾选公司，还是 ETF 真实指数成分。"), scope_box)
+        form.addRow(_purpose_label("主题研究篮子", "仅“人工主题篮子”路径参与取数；其他路径下不会使用这些勾选。"), self.theme_basket_selector)
+        form.addRow(_purpose_label("主题 ETF / 指数", "仅“主题 ETF”路径必填；其真实指数成分用于研究，不等于正式报价标的。"), self.underlying)
+        form.addRow(_purpose_label("取数目标说明", "展示系统为什么推荐当前 ETF，以及真实性、主题暴露和流动性校验规则。"), self.underlying_hint)
+        form.addRow(_purpose_label("映射理由", "说明研究主题为何映射到当前行业、篮子或 ETF，并写入内部审计。"), self.reason)
+        form.addRow(_purpose_label("部分暴露确认", "仅 ETF 为较宽行业或相邻产业链时使用；需同时填写映射理由。"), self.partial_exposure_confirmed)
         form.addRow("", self.message)
         form.addRow("", ResearchHelperWindow._row(confirm, cancel))
+
+        content = QFrame()
+        content.setObjectName("card")
+        content.setLayout(form)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(22, 18, 22, 20)
+        outer.setSpacing(12)
+        outer.addWidget(intro)
+        outer.addWidget(scroll, 1)
         self._sync_mode()
         self._sync_scope_path()
         self._sync_underlying_hint()
@@ -1165,25 +1987,43 @@ class MarketConfirmationDialog(QDialog):
         if mode == "map_a":
             self.market.setCurrentText("A股")
             self.market.setEnabled(False)
-            self.underlying.setEnabled(True)
         elif mode == "research_only":
             self.market.setCurrentText(self.original)
             self.market.setEnabled(False)
-            self.underlying.setEnabled(False)
         else:
             self.market.setCurrentText(self.original)
             self.market.setEnabled(True)
-            self.underlying.setEnabled(True)
+        self._sync_scope_path()
 
     def _sync_underlying_hint(self, *_args) -> None:
         data = self.underlying.currentData() if self.underlying.currentIndex() >= 0 else {}
         data = data if isinstance(data, dict) else {}
         note = str(data.get("note") or "").strip()
         origin = str(data.get("origin") or "").strip()
+        exposure = data.get("exposure") if isinstance(data.get("exposure"), dict) else {}
+        level = str(exposure.get("level") or data.get("exposure_level") or "")
+        label = {"direct": "直接暴露", "partial": "部分暴露", "unrelated": "不相关"}.get(level, "待数据源核验")
+        exposure_reason = str(exposure.get("reason") or "").strip()
+        tracking = str(exposure.get("tracking_index") or data.get("tracking_index") or "").strip()
+        components = [str(item) for item in (exposure.get("major_constituents") or []) if str(item).strip()]
+        exposure_text = f"主题暴露：{label}" + (f"（{exposure_reason}）" if exposure_reason else "")
+        if tracking:
+            exposure_text += f"；跟踪指数：{tracking}"
+        if components:
+            exposure_text += "；主要成分：" + "、".join(components[:5])
+        if level == "partial":
+            exposure_text += "。必须勾选下方确认并填写映射理由后才能继续。"
         if note:
-            self.underlying_hint.setText(f"{origin or '候选'}理由：{note}")
+            self.underlying_hint.setText(
+                f"{exposure_text}。{origin or '候选'}理由：{note}。该选择只确定研究取数篮子，"
+                "研究完成后仍需单独确认是否用于报价。"
+            )
         else:
-            self.underlying_hint.setText("手工输入代码将在提交后校验证券真实性、主题暴露与近20日流动性。")
+            self.underlying_hint.setText(
+                f"{exposure_text}。手工输入代码将在提交后校验证券真实性、主题暴露、真实跟踪指数、"
+                "主要成分与近20日流动性；"
+                "通过后仅作为本次研究取数目标。"
+            )
 
     def _scope_value(self) -> tuple[str, str]:
         data = self.scope.currentData() if self.scope.currentIndex() >= 0 else {}
@@ -1194,6 +2034,9 @@ class MarketConfirmationDialog(QDialog):
 
     def _sync_scope_path(self, *_args) -> None:
         scope, research_mode = self._scope_value()
+        self.underlying.setEnabled(
+            research_mode == "theme_etf")
+        self.partial_exposure_confirmed.setEnabled(research_mode == "theme_etf")
         if research_mode == "theme_etf":
             self.scope_hint.setText(
                 f"将研究“{scope or self.theme.text().strip()}”：所选 ETF 通过官方信息校验后，"
@@ -1269,10 +2112,13 @@ class MarketConfirmationDialog(QDialog):
             "research_theme": self.theme.text().strip(),
             "research_scope": scope,
             "research_mode": research_mode,
-            "underlying_code": "" if mode == "research_only" else code,
-            "underlying_name": "" if mode == "research_only" else name,
+            # 确认页中该字段只是“主题 ETF 研究取数目标”。标准行业和
+            # 人工篮子的报价标的必须等研究完成后再由分析师确认。
+            "underlying_code": code if research_mode == "theme_etf" else "",
+            "underlying_name": name if research_mode == "theme_etf" else "",
             "research_only": mode == "research_only",
             "reason": self.reason.text().strip(),
+            "partial_exposure_confirmed": self.partial_exposure_confirmed.isChecked(),
             "theme_basket_codes": (self._selected_theme_basket_codes()
                                    if research_mode == "theme_basket" else []),
         }
@@ -1292,11 +2138,23 @@ class MarketConfirmationDialog(QDialog):
             return
         if value.get("research_mode") == "theme_etf" and not value["underlying_code"]:
             QMessageBox.information(
-                self, "请确认挂钩工具",
+                self, "请确认主题 ETF 取数目标",
                 "当前选择的是“主题 ETF 取数路径”，系统需要 ETF 的真实成分作为研究篮子。\n\n"
                 "如只做标准行业研究，可改选标准行业取数路径并暂不填写 ETF；正式报价前再选择挂钩标的。",
             )
             return
+        selected = self.underlying.currentData() if self.underlying.currentIndex() >= 0 else {}
+        selected = selected if isinstance(selected, dict) else {}
+        selected_level = str((selected.get("exposure") or {}).get("level")
+                             or selected.get("exposure_level") or "")
+        if value.get("research_mode") == "theme_etf" and selected_level == "partial":
+            if not value["partial_exposure_confirmed"] or not value["reason"]:
+                QMessageBox.information(
+                    self, "请确认部分暴露 ETF",
+                    "该候选属于较宽行业或相邻产业链，并非对研究主题的直接暴露。\n\n"
+                    "请填写映射理由，并勾选“部分暴露确认”；也可以改选标注为“直接暴露”的 ETF。",
+                )
+                return
         if value.get("research_mode") == "theme_basket" and not value["theme_basket_codes"]:
             QMessageBox.information(
                 self, "请选择主题公司",
@@ -1322,7 +2180,8 @@ class ResearchHelperWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Research Helper · 场外衍生品一页通")
-        self.resize(1280, 820)
+        self.resize(1440, 900)
+        self.setMinimumSize(1120, 720)
         self.process: QProcess | None = None
         self.option_process: QProcess | None = None
         self.profile_process: QProcess | None = None
@@ -1335,7 +2194,8 @@ class ResearchHelperWindow(QMainWindow):
         self.last_summary: dict = {}
         self._output_buffer = ""
         self.event_evidence_message = ""
-        self.event_evidence: dict = {"事件事实": [], "传导关系": []}
+        self.event_evidence: dict = {"事件事实": [], "产业机制": [], "A股暴露": [],
+                                     "组合传导链": [], "传导关系": []}
         self._generated_override_path = ""
         self._selection_written_for_quote = ""
         self.quote_jobs: list[QuoteJob] = []
@@ -1346,6 +2206,7 @@ class ResearchHelperWindow(QMainWindow):
         self._recommender_batch_comparison = False
         self._recommender_batch_results: list[dict] = []
         self._recommender_profiles: dict[str, dict] = {}
+        self._quote_candidate_context: dict[str, dict] = {}
         # 同一批报价只自动提示一次；分析师可随时通过队列旁的按钮重新打开选择框。
         self._last_quote_inclusion_signature = ""
         self._quote_pdf_exporting = False
@@ -1358,8 +2219,14 @@ class ResearchHelperWindow(QMainWindow):
         self.quote_timeout_timer.timeout.connect(self._quote_timed_out)
 
         self.prompt = QPlainTextEdit()
-        self.prompt.setPlaceholderText("输入客户需求，例如：根据目前酒ETF 512690.SH 的市场情况推荐产品")
-        self.prompt.setFixedHeight(72)
+        self.prompt.setPlaceholderText(
+            "请完整粘贴客户原始需求，可包含研究主题、事件、期限，以及客户点名的 ETF/个股。\n"
+            "例如：分析未来半年汽车电子智能化趋势，并为客户筛选可报价标的。"
+        )
+        self.prompt.setMinimumHeight(150)
+        self.prompt.setMaximumHeight(230)
+        self.prompt.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.prompt.setToolTip("支持多行输入和滚动；这里保留客户原文，不会因显示空间不足而截断。")
         self.horizon = QLineEdit("3个月")
         self.max_loss = QLineEdit("100%")
         self.principal = QComboBox()
@@ -1396,8 +2263,10 @@ class ResearchHelperWindow(QMainWindow):
         llm_settings.clicked.connect(self.edit_llm_settings)
         ifind_settings.clicked.connect(self.edit_ifind_credentials)
         self.run_button = QPushButton("开始生成")
+        self.run_button.setProperty("role", "primary")
         self.run_button.clicked.connect(self.start_run)
         self.stop_run_button = QPushButton("停止本次运行")
+        self.stop_run_button.setProperty("role", "danger")
         self.stop_run_button.setEnabled(False)
         self.stop_run_button.clicked.connect(self.cancel_active_run)
         self.progress = QProgressBar()
@@ -1433,9 +2302,10 @@ class ResearchHelperWindow(QMainWindow):
         refresh = QPushButton("刷新运行记录")
         refresh.clicked.connect(self.refresh_history)
         self.quote_review_button = QPushButton("审核产品并加入正式报价队列")
+        self.quote_review_button.setProperty("role", "primary")
         self.quote_review_button.setEnabled(False)
         self.quote_review_button.clicked.connect(self.prepare_formal_quote)
-        self.quote_review_hint = QLabel("请先完成一份含已确认挂钩标的的研究报告。")
+        self.quote_review_hint = QLabel("请先完成研究报告；研究完成后才能确认待报价标的。")
         self.quote_review_hint.setWordWrap(True)
         self.quote_queue = QListWidget()
         self.quote_queue.setMaximumHeight(112)
@@ -1445,46 +2315,88 @@ class ResearchHelperWindow(QMainWindow):
         self.retry_quote_job_button = QPushButton("重新审核并加入重试队列")
         self.retry_quote_job_button.clicked.connect(self.retry_selected_quote_job)
         self.include_quote_button = QPushButton("选择写入一页通的正式报价")
+        self.include_quote_button.setProperty("role", "primary")
         self.include_quote_button.setEnabled(False)
         self.include_quote_button.clicked.connect(self.choose_comparison_quotes_for_report)
         self._sync_quote_queue_actions()
 
-        # 页面主操作统一采用可点击尺寸；文字不以省略号替代，避免分析师无法理解功能。
+        # 按钮保持紧凑单行高度，窄屏时由左栏滚动承接，避免高按钮叠压相邻控件。
         for button in (upload_sources, paste_sources, open_sources, choose_override, edit_override,
                        edit_evidence, clear_evidence, llm_settings, ifind_settings,
                        self.run_button, self.stop_run_button, self.quote_review_button, self.cancel_quote_job_button,
                        self.retry_quote_job_button, self.include_quote_button):
-            button.setMinimumHeight(32)
+            button.setMinimumHeight(24)
         for button in (upload_sources, paste_sources, open_sources, choose_override, edit_override,
                        edit_evidence, llm_settings, ifind_settings):
             button.setMinimumWidth(138)
         self.quote_review_button.setMinimumWidth(270)
 
         form = QFormLayout()
-        form.addRow(QLabel("<b>1. 需求与客户约束</b>"))
-        form.addRow("客户需求", self.prompt)
+        form.setContentsMargins(22, 20, 22, 20)
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(12)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.addRow(_section_label("1. 需求与客户约束"))
+        prompt_box = QWidget()
+        prompt_layout = QVBoxLayout(prompt_box)
+        prompt_layout.setContentsMargins(0, 0, 0, 0)
+        prompt_layout.setSpacing(6)
+        prompt_hint = QLabel("保留客户完整原文；输入框支持多行、自动换行和滚动查看。")
+        prompt_hint.setProperty("kind", "caption")
+        prompt_layout.addWidget(self.prompt)
+        prompt_layout.addWidget(prompt_hint)
+        form.addRow("客户需求", prompt_box)
         form.addRow("期限", self.horizon)
         form.addRow("最大损失", self.max_loss)
         form.addRow("本金波动", self.principal)
         form.addRow("收益偏好", self.preference)
         form.addRow("交付选项", self._row(self.quote, self.pdf))
-        form.addRow(QLabel("<b>2. 研究口径与补充材料</b>"))
-        form.addRow("市场/行业/ETF", QLabel("启动后按需求自动弹出确认卡；高风险映射必须人工确认。"))
-        form.addRow("补充材料", self._row(self.source_label, upload_sources, paste_sources, open_sources))
-        form.addRow("事件型需求", self._row(self.evidence_label, edit_evidence, clear_evidence))
-        form.addRow("人工数据补充", self._row(self.override_label, choose_override, edit_override))
+        form.addRow(_section_label("2. 研究口径与补充材料"))
+        research_target_hint = QLabel(
+            "启动后按需求弹出确认卡，只确认标准行业、人工主题篮子或主题 ETF 取数路径；"
+            "挂钩标的在研究完成后另行选择。")
+        research_target_hint.setWordWrap(True)
+        research_target_hint.setProperty("kind", "caption")
+        form.addRow("研究取数目标", research_target_hint)
+
+        material_box = QWidget()
+        material_layout = QVBoxLayout(material_box)
+        material_layout.setContentsMargins(0, 0, 0, 0)
+        material_layout.setSpacing(7)
+        material_layout.addWidget(self.source_label)
+        material_layout.addWidget(self._row(upload_sources, paste_sources, open_sources))
+        form.addRow("补充材料", material_box)
+
+        evidence_box = QWidget()
+        evidence_layout = QVBoxLayout(evidence_box)
+        evidence_layout.setContentsMargins(0, 0, 0, 0)
+        evidence_layout.setSpacing(7)
+        evidence_layout.addWidget(self.evidence_label)
+        evidence_layout.addWidget(self._row(edit_evidence, clear_evidence))
+        form.addRow("事件型需求", evidence_box)
+
+        override_box = QWidget()
+        override_layout = QVBoxLayout(override_box)
+        override_layout.setContentsMargins(0, 0, 0, 0)
+        override_layout.setSpacing(7)
+        override_layout.addWidget(self.override_label)
+        override_layout.addWidget(self._row(choose_override, edit_override))
+        form.addRow("人工数据补充", override_box)
         form.addRow("分析模型", self._row(llm_settings))
         form.addRow("数据与报价凭证", self._row(ifind_settings))
-        form.addRow(QLabel("<b>3. 运行与交付</b>"))
+        form.addRow(_section_label("3. 运行与交付"))
         form.addRow("", self._row(self.run_button, self.stop_run_button))
 
         input_card = QFrame()
-        input_card.setFrameShape(QFrame.Shape.StyledPanel)
+        input_card.setObjectName("card")
         input_card.setLayout(form)
         quote_box = QFrame()
-        quote_box.setFrameShape(QFrame.Shape.StyledPanel)
+        quote_box.setObjectName("card")
         quote_layout = QVBoxLayout(quote_box)
-        quote_layout.addWidget(QLabel("正式报价（研究完成后才可用）"))
+        quote_layout.setContentsMargins(22, 20, 22, 20)
+        quote_layout.setSpacing(10)
+        quote_layout.addWidget(_section_label("正式报价（研究完成后才可用）"))
         quote_layout.addWidget(self.quote_review_hint)
         quote_layout.addWidget(self.quote_review_button)
         quote_layout.addWidget(QLabel("报价任务（仅当前会话）"))
@@ -1493,11 +2405,19 @@ class ResearchHelperWindow(QMainWindow):
         quote_layout.addWidget(self.include_quote_button)
 
         run_box = QVBoxLayout()
+        run_box.setContentsMargins(14, 14, 10, 14)
+        run_box.setSpacing(14)
         run_box.addWidget(input_card)
         run_box.addWidget(quote_box)
         run_box.addStretch(1)
         run_widget = QWidget()
         run_widget.setLayout(run_box)
+        run_widget.setMinimumWidth(600)
+        run_scroll = QScrollArea()
+        run_scroll.setWidgetResizable(True)
+        run_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        run_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        run_scroll.setWidget(run_widget)
 
         delivery_box = QVBoxLayout()
         delivery_box.addWidget(QLabel("最终交付预览"))
@@ -1529,13 +2449,15 @@ class ResearchHelperWindow(QMainWindow):
         result_tabs.addTab(delivery_tab, "交付与报价")
         result_tabs.addTab(review_tab, "内部复核（可选）")
         result_box = QVBoxLayout()
+        result_box.setContentsMargins(10, 14, 14, 14)
         result_box.addWidget(result_tabs, 1)
         result_widget = QWidget()
         result_widget.setLayout(result_box)
         splitter = QSplitter()
-        splitter.addWidget(run_widget)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(run_scroll)
         splitter.addWidget(result_widget)
-        splitter.setSizes([720, 560])
+        splitter.setSizes([690, 750])
         self.setCentralWidget(splitter)
 
         self.timer = QTimer(self)
@@ -1649,23 +2571,39 @@ class ResearchHelperWindow(QMainWindow):
         if not isinstance(evidence, dict):
             return
         facts = [dict(item) for item in (evidence.get("事件事实") or []) if isinstance(item, dict)]
+        mechanisms = [dict(item) for item in (evidence.get("产业机制") or []) if isinstance(item, dict)]
+        exposures = [dict(item) for item in (evidence.get("A股暴露") or []) if isinstance(item, dict)]
+        chains = [dict(item) for item in (evidence.get("组合传导链") or evidence.get("传导链") or []) if isinstance(item, dict)]
         links = [dict(item) for item in (evidence.get("传导关系") or []) if isinstance(item, dict)]
-        self.event_evidence = {"事件事实": facts, "传导关系": links}
+        self.event_evidence = {"事件事实": facts, "产业机制": mechanisms, "A股暴露": exposures,
+                               "组合传导链": chains, "传导关系": links}
         self._refresh_evidence_summary()
 
     def _refresh_evidence_summary(self) -> None:
         facts = len(self.event_evidence.get("事件事实") or [])
+        mechanisms = len(self.event_evidence.get("产业机制") or [])
+        exposures = len(self.event_evidence.get("A股暴露") or [])
+        chains = len(self.event_evidence.get("组合传导链") or [])
         links = len(self.event_evidence.get("传导关系") or [])
-        if facts and links:
-            self.evidence_label.setText(f"已录入：事件事实 {facts} 条，传导证据 {links} 条。")
+        if facts and (links or (mechanisms and exposures and chains)):
+            detail = (f"直接传导 {links} 条" if links else
+                      f"产业机制 {mechanisms} 条，A股暴露 {exposures} 条，组合链 {chains} 条")
+            self.evidence_label.setText(f"已录入：事件事实 {facts} 条，{detail}。")
             self.evidence_label.setStyleSheet("color:#176b3a;")
         else:
             missing = []
             if not facts:
                 missing.append("事件事实")
-            if not links:
-                missing.append("传导证据")
-            self.evidence_label.setText("仅事件型需求需要填写：" + "、".join(missing) + "。普通板块/ETF研究无需填写。")
+            if not links and not mechanisms:
+                missing.append("产业机制")
+            if not links and not exposures:
+                missing.append("A股暴露")
+            if not links and mechanisms and exposures and not chains:
+                missing.append("组合传导链")
+            self.evidence_label.setText(
+                "仅事件型需求需要确认：" + "、".join(missing)
+                + "。可自动查找候选；普通板块/ETF研究无需处理。"
+            )
             self.evidence_label.setStyleSheet("color:#8a5b14;")
 
     def edit_event_evidence(self) -> None:
@@ -1675,7 +2613,8 @@ class ResearchHelperWindow(QMainWindow):
             self._refresh_evidence_summary()
 
     def clear_event_evidence(self) -> None:
-        self.event_evidence = {"事件事实": [], "传导关系": []}
+        self.event_evidence = {"事件事实": [], "产业机制": [], "A股暴露": [],
+                               "组合传导链": [], "传导关系": []}
         self._refresh_evidence_summary()
 
     def _effective_override_data(self) -> dict | None:
@@ -1692,9 +2631,14 @@ class ResearchHelperWindow(QMainWindow):
                 return None
             data = raw
         facts = list(self.event_evidence.get("事件事实") or [])
+        mechanisms = list(self.event_evidence.get("产业机制") or [])
+        exposures = list(self.event_evidence.get("A股暴露") or [])
+        chains = list(self.event_evidence.get("组合传导链") or [])
         links = list(self.event_evidence.get("传导关系") or [])
-        if facts or links:
-            data["事件证据"] = {"事件事实": facts, "传导关系": links}
+        if facts or mechanisms or exposures or chains or links:
+            data["事件证据"] = {"事件事实": facts, "产业机制": mechanisms,
+                                  "A股暴露": exposures, "组合传导链": chains,
+                                  "传导关系": links}
         return data
 
     def _write_generated_override(self, data: dict) -> str:
@@ -1720,7 +2664,7 @@ class ResearchHelperWindow(QMainWindow):
 
     @staticmethod
     def _confirmed_underlying(summary: dict) -> tuple[str, bool]:
-        """仅接受本次市场确认写进运行日志的标的，不能把内部研究锚点当报价工具。"""
+        """读取主题 ETF 研究目标作为报价候选；它仍需在研究后再次确认。"""
         metadata = summary.get("metadata") or {}
         raw = metadata.get("分析师确认") or ""
         try:
@@ -1739,18 +2683,22 @@ class ResearchHelperWindow(QMainWindow):
         """构建本次待报价池：客户点名优先，否则采用运行时冻结的系统候选。"""
         from core.brief import _SECURITY_CODE_RE
         request = str(summary.get("request") or "")
-        candidates: list[dict] = [
+        client_candidates: list[dict] = [
             {"code": match.group(0).upper(), "name": "", "origin": "客户点名",
              "note": "客户原始需求中明确写入的代码"}
             for match in _SECURITY_CODE_RE.finditer(request)
         ]
+        candidates: list[dict] = list(client_candidates)
         fallback = str(fallback or "").strip().upper()
-        if fallback and fallback not in {item["code"] for item in candidates}:
-            candidates.insert(0, {"code": fallback, "name": "", "origin": "分析师确认",
-                                  "note": "市场确认页已选择的挂钩工具"})
-        # 只在客户没有点名、也没有先行确认工具时，才使用系统按研究主题发现的候选。
-        # 不能把系统候选混入客户多标的比较池，改变客户原本的比较范围。
-        if not candidates:
+        # 客户已点名时严格保持客户给出的比较范围，不混入系统自行发现的其它标的。
+        # 客户未点名时，主题 ETF 研究目标只是报价池中的优先候选，不能遮住同批
+        # 动态发现结果；分析师应在一个窗口里看到并选择所有可用候选。
+        if not client_candidates:
+            if fallback:
+                candidates.append({
+                    "code": fallback, "name": "", "origin": "研究取数目标",
+                    "note": "需求解析页用于主题 ETF 真实成分取数；报价前仍需再次确认",
+                })
             raw = (summary.get("metadata") or {}).get("系统建议挂钩工具") or "[]"
             try:
                 suggested = json.loads(raw) if isinstance(raw, str) else raw
@@ -1773,11 +2721,16 @@ class ResearchHelperWindow(QMainWindow):
         return unique
 
     def _start_recommender_batch(self, *, summary: dict, request: str,
-                                 underlyings: list[str]) -> None:
+                                 underlyings: list[str], candidates: list[dict] | None = None) -> None:
         self._recommender_batch = list(underlyings)
         self._recommender_batch_comparison = len(underlyings) > 1
         self._recommender_batch_results = []
         self._recommender_profiles = {}
+        if candidates is not None:
+            self._quote_candidate_context = {
+                str(item.get("code") or "").strip().upper(): dict(item)
+                for item in candidates if isinstance(item, dict) and item.get("code")
+            }
         self._start_next_recommender(summary=summary, request=request)
 
     def _start_next_recommender(self, *, summary: dict, request: str) -> None:
@@ -1809,23 +2762,28 @@ class ResearchHelperWindow(QMainWindow):
             self.quote_review_hint.setText("本次分析师选择“仅研究”，不能发起正式报价。")
         elif ready:
             codes = [str(item["code"]) for item in candidates]
-            system_provided = any(item.get("origin") == "系统推荐" for item in candidates)
+            candidate_provided = any(
+                item.get("origin") in {"系统推荐", "研究取数目标"}
+                for item in candidates
+            )
             if len(candidates) > 1:
                 self.quote_review_hint.setText(
-                    f"{'系统建议' if system_provided else '客户点名'} {len(candidates)} 只待报价标的：{'、'.join(codes)}。"
+                    f"{'系统/研究路径提供' if candidate_provided else '客户点名'} {len(candidates)} 只待报价标的：{'、'.join(codes)}。"
                     "点击后勾选送入 OptionHelper 的候选，系统将逐只报价。")
-            elif system_provided:
+            elif candidate_provided:
                 self.quote_review_hint.setText(
-                    f"系统建议挂钩标的：{codes[0]}。点击后确认该工具，再进入 OptionHelper 产品审核与正式报价。")
+                    f"待确认报价候选：{codes[0]}。它尚不是已确认挂钩标的；"
+                    "点击后确认是否送入 OptionHelper 产品审核与正式报价。")
             else:
                 self.quote_review_hint.setText(
-                    f"已确认挂钩标的：{codes[0]}。先审核产品选择，再用一次性 selection 发起报价。")
+                    f"客户点名待报价标的：{codes[0]}。点击后确认是否送入产品审核，"
+                    "再用一次性 selection 发起正式报价。")
         elif research_ready:
             self.quote_review_hint.setText(
                 "本次已完成行业研究，但系统未找到可供确认的 ETF 候选，因此未发起产品报价。"
                 "可重新运行并检查 iFinD 凭证，或在客户需求中明确 ETF/个股代码。")
         else:
-            self.quote_review_hint.setText("请先完成一份含已确认挂钩标的的研究报告。")
+            self.quote_review_hint.setText("请先完成研究报告；研究完成后才能确认待报价标的。")
 
     def _selection_pending_path(self) -> Path:
         # 与桥接层使用同一配置，避免 GUI 写到默认位置而自定义项目路径从另一处读取。
@@ -2012,6 +2970,32 @@ class ResearchHelperWindow(QMainWindow):
                      if "OptionHelper 观点包" in str(name)), None)
         return _load_json(path) if path else {}
 
+    def _market_prompt_for_underlying(self, summary: dict, underlying: str,
+                                      product_profile: dict | None = None) -> str:
+        """把共同研究观点与本轮已确认挂钩标的组装，并清除旧运行的预选标的。"""
+        handoff = self._optionhelper_handoff(summary)
+        prompt = str(handoff.get("market_prompt") or "").strip()
+        if not prompt:
+            return ""
+        # 兼容修复前的交接包：旧版会把自动 ETF 候选写成“拟挂钩标的”。
+        prompt = "\n".join(
+            line for line in prompt.splitlines()
+            if not line.startswith("拟挂钩标的是") and not line.startswith("标的选择原因：")
+        ).strip()
+        code = str(underlying or "").strip().upper()
+        context = self._quote_candidate_context.get(code) or {}
+        name = str(context.get("name") or (product_profile or {}).get("name") or "").strip()
+        note = str(context.get("note") or "").strip()
+        label = f"{name}（{code}）" if name else code
+        prompt += f"\n【本轮已确认挂钩标的】{label}。仅为该标的形成产品候选与报价。"
+        if note:
+            prompt += "\n【候选来源与关联依据】" + note
+        from core.product_profile import render_for_prompt
+        rendered = render_for_prompt(product_profile)
+        if rendered:
+            prompt += "\n" + rendered
+        return prompt
+
     def _review_and_enqueue_quote(self, *, request: str, underlying: str, source_summary: dict,
                                   recommended_candidates: list[dict], source_run_id: str = "",
                                   comparison_mode: bool = False,
@@ -2037,8 +3021,8 @@ class ResearchHelperWindow(QMainWindow):
         overrides = self._effective_override_data()
         if overrides is None:
             return False
-        handoff = self._optionhelper_handoff(source_summary)
-        market_prompt = str(handoff.get("market_prompt") or "").strip()
+        market_prompt = self._market_prompt_for_underlying(
+            source_summary, underlying, self._recommender_profiles.get(underlying.upper()))
         if not market_prompt:
             QMessageBox.warning(self, "缺少本次观点包", "该研究运行未保存可复用的 OptionHelper 观点包；请重新生成研究报告后再报价。")
             return False
@@ -2072,6 +3056,8 @@ class ResearchHelperWindow(QMainWindow):
             selection_payload=payload,
             overrides=json.loads(json.dumps(overrides, ensure_ascii=False)),
             export_pdf=self.pdf.isChecked(),
+            underlying_name=str((self._quote_candidate_context.get(underlying.upper()) or {}).get("name") or ""),
+            underlying_note=str((self._quote_candidate_context.get(underlying.upper()) or {}).get("note") or ""),
             source_run_id=source_run_id or str(source_summary.get("run_id") or ""),
             comparison_mode=comparison_mode,
         )
@@ -2134,20 +3120,21 @@ class ResearchHelperWindow(QMainWindow):
         if not request or research_only or not candidates:
             QMessageBox.information(self, "无法报价", "本次运行没有客户点名或系统发现的可报价标的代码。")
             return
-        system_provided = any(item.get("origin") == "系统推荐" for item in candidates)
-        # 系统发现的候选即使只有一只也必须展示给分析师确认，不能静默把研究锚点
-        # 当成客户的报价标的；客户点名的单标的则沿用直接进入产品审核的既有流程。
-        if len(candidates) > 1 or system_provided:
-            dialog = QuoteUnderlyingPoolDialog(self, candidates=candidates)
-            if not dialog.exec():
-                return
-            selected_codes = dialog.selected_codes()
-            metadata = summary.setdefault("metadata", {})
-            metadata["分析师确认待报价池"] = "、".join(selected_codes)
-            self._persist_quote_delivery()
-        else:
-            selected_codes = [str(item["code"]) for item in candidates]
-        self._start_recommender_batch(summary=summary, request=request, underlyings=selected_codes)
+        # 不论候选来自客户、主题 ETF 研究目标还是系统发现，也不论只有一只还是
+        # 多只，都必须在研究完成后统一展示并由分析师再次确认。研究取数选择绝不
+        # 自动等同于正式挂钩标的选择。
+        dialog = QuoteUnderlyingPoolDialog(self, candidates=candidates)
+        if not dialog.exec():
+            return
+        selected_codes = dialog.selected_codes()
+        metadata = summary.setdefault("metadata", {})
+        metadata["分析师确认待报价池"] = "、".join(selected_codes)
+        self._persist_quote_delivery()
+        selected_set = set(selected_codes)
+        self._start_recommender_batch(
+            summary=summary, request=request, underlyings=selected_codes,
+            candidates=[item for item in candidates if str(item.get("code") or "") in selected_set],
+        )
 
     def retry_selected_quote_job(self) -> None:
         job = self._selected_quote_job()
@@ -2183,8 +3170,30 @@ class ResearchHelperWindow(QMainWindow):
         prefix = f"{underlying}：" if comparison_mode else ""
         self.status.setText(prefix + "Research Helper 正在生成标的产品画像（收益、波动、回撤、情景和流动性）…")
         process.start(sys.executable, [str(ROOT / "core" / "product_profile_worker.py")])
-        process.write(json.dumps({"underlying": underlying}, ensure_ascii=False).encode("utf-8"))
+        process.write(json.dumps({
+            "underlying": underlying,
+            "name": self._quote_underlying_name(summary, underlying),
+        }, ensure_ascii=False).encode("utf-8"))
         process.closeWriteChannel()
+
+    def _quote_underlying_name(self, summary: dict, underlying: str) -> str:
+        """尽量沿用本次已核验的候选名称，不因动态标的不在人工池中而显示为空。"""
+        code = str(underlying or "").strip().upper()
+        context = self._quote_candidate_context.get(code) or {}
+        if context.get("name"):
+            return str(context.get("name") or "").strip()
+        for item in ResearchHelperWindow._quote_underlying_candidates(summary, ""):
+            if str(item.get("code") or "").strip().upper() == code:
+                return str(item.get("name") or "").strip()
+        confirmation = (summary.get("metadata") or {}).get("分析师确认") or {}
+        if isinstance(confirmation, str):
+            try:
+                confirmation = json.loads(confirmation)
+            except json.JSONDecodeError:
+                confirmation = {}
+        if isinstance(confirmation, dict) and str(confirmation.get("underlying_code") or "").upper() == code:
+            return str(confirmation.get("underlying_name") or "").strip()
+        return ""
 
     def _read_profile_output(self) -> None:
         if self.profile_process:
@@ -2196,29 +3205,27 @@ class ResearchHelperWindow(QMainWindow):
 
     def _finish_product_profile(self, summary: dict, request: str, underlying: str, exit_code: int,
                                 *, supplement: str = "", comparison_mode: bool = False) -> None:
+        from core.product_profile_worker import extract_result
+
         self._read_profile_output()
         self._read_profile_error()
         self.profile_process = None
-        try:
-            raw = self._profile_output.strip()
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                payload = {}
-        except json.JSONDecodeError:
-            payload = {}
+        payload = extract_result(self._profile_output)
         profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {
             "code": underlying.upper(), "source": "iFinD", "ok": False,
-            "gaps": [str(payload.get("message") or "标的产品画像进程未返回可用结果")],
+            "gaps": [str(payload.get("message") or "标的产品画像进程未返回可解析结果")],
         }
         self._recommender_profiles[underlying.upper()] = profile
-        self._record_product_profile(summary, profile, exit_code=exit_code, stderr=self._profile_error_output,
+        self._record_product_profile(summary, profile, exit_code=exit_code,
+                                     stdout=self._profile_output, stderr=self._profile_error_output,
                                      underlying=underlying, comparison_mode=comparison_mode)
         self._start_optionhelper_recommender(
             summary=summary, request=request, underlying=underlying, supplement=supplement,
             comparison_mode=comparison_mode, product_profile=profile,
         )
 
-    def _record_product_profile(self, summary: dict, profile: dict, *, exit_code: int, stderr: str,
+    def _record_product_profile(self, summary: dict, profile: dict, *, exit_code: int,
+                                stdout: str, stderr: str,
                                 underlying: str, comparison_mode: bool) -> None:
         run_id = str(summary.get("run_id") or "").strip()
         if not run_id:
@@ -2226,7 +3233,7 @@ class ResearchHelperWindow(QMainWindow):
         suffix = "-" + re.sub(r"[^A-Za-z0-9]+", "-", underlying).strip("-")
         path = RUNS / f"{run_id}.product-profile{suffix}.json"
         record = {"run_id": run_id, "worker_exit_code": exit_code, "product_profile": profile,
-                  "stderr": stderr[-2000:]}
+                  "stdout_tail": stdout[-2000:], "stderr": stderr[-2000:]}
         try:
             path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
             summary.setdefault("artifacts", {})[f"标的产品画像（{underlying.upper()}）"] = str(path)
@@ -2242,22 +3249,13 @@ class ResearchHelperWindow(QMainWindow):
         if self.process is not None or self.option_process is not None or self.profile_process is not None:
             return
         handoff = self._optionhelper_handoff(summary)
-        market_prompt = str(handoff.get("market_prompt") or "").strip()
+        market_prompt = self._market_prompt_for_underlying(summary, underlying, product_profile)
         if not market_prompt:
             QMessageBox.warning(self, "缺少本次观点包", "该运行未保存可复用观点包；请重新生成研究报告后再报价。")
             return
         if supplement.strip():
             # 只追加分析师刚回答的客户约束，不改写已冻结的研究市场观点。
             market_prompt += "\n客户补充条件：" + supplement.strip()
-        handoff_underlying = str(handoff.get("underlying") or "").strip().upper()
-        if underlying and (comparison_mode or underlying.upper() != handoff_underlying):
-            # 同一主题研究可服务于系统发现或客户点名的其它工具，但本轮 Recommender
-            # 只能为一个明确的挂钩标的形成 selection。显式覆盖观点包中的内部研究
-            # 锚点，避免把它误读成本轮待报价 ETF。
-            market_prompt += (f"\n【本轮独立报价挂钩标的】{underlying}。"
-                              "仅为该标的形成产品候选；不得与其它客户候选合并定价。")
-        from core.product_profile import render_for_prompt
-        market_prompt += "\n" + render_for_prompt(product_profile or self._recommender_profiles.get(underlying.upper()))
         from core import config
         if not config.has_optionhelper():
             QMessageBox.warning(self, "OptionHelper 未就绪", "请先在本机完成 OptionHelper 解释器与 Skill 配置。")
@@ -2283,7 +3281,8 @@ class ResearchHelperWindow(QMainWindow):
         process.finished.connect(
             lambda exit_code, _status: self._finish_recommender(
                 summary, request, underlying, exit_code, comparison_mode=comparison_mode,
-                product_profile=product_profile or self._recommender_profiles.get(underlying.upper()))
+                product_profile=product_profile or self._recommender_profiles.get(underlying.upper()),
+                market_prompt=market_prompt, constraints=dict(constraints))
         )
         process.errorOccurred.connect(lambda _error: self.status.setText("OptionHelper 推荐进程无法启动"))
         self.option_process = process
@@ -2304,6 +3303,7 @@ class ResearchHelperWindow(QMainWindow):
     def _record_recommender_result(
         self, summary: dict, payload: dict, stderr: str, *, exit_code: int, candidates: list,
         underlying: str = "", comparison_mode: bool = False, product_profile: dict | None = None,
+        market_prompt: str = "", constraints: dict | None = None,
     ) -> None:
         """把审核前的 OptionHelper 调用写入本次 run，避免它成为不可追踪黑箱。"""
         run_id = str(summary.get("run_id") or "").strip()
@@ -2313,12 +3313,19 @@ class ResearchHelperWindow(QMainWindow):
         detail = result if isinstance(result, dict) else {}
         message = str(detail.get("message") or payload.get("message") or "")
         status = str(detail.get("status") or ("completed" if candidates else "failed"))
+        context = self._quote_candidate_context.get(underlying.upper()) or {}
         record = {
             "run_id": run_id,
             "worker_exit_code": exit_code,
             "outer_ok": payload.get("ok") is True,
             "status": status,
             "message": message,
+            "underlying": underlying.upper(),
+            "underlying_name": str(
+                context.get("name") or (product_profile or {}).get("name") or ""
+            ).strip(),
+            "market_prompt": market_prompt,
+            "constraints": dict(constraints or {}),
             "candidate_count": len(candidates),
             "product_profile": product_profile or {},
             "candidates": [
@@ -2363,7 +3370,8 @@ class ResearchHelperWindow(QMainWindow):
             pass
 
     def _finish_recommender(self, summary: dict, request: str, underlying: str, exit_code: int,
-                            *, comparison_mode: bool = False, product_profile: dict | None = None) -> None:
+                            *, comparison_mode: bool = False, product_profile: dict | None = None,
+                            market_prompt: str = "", constraints: dict | None = None) -> None:
         self._read_option_output()
         self._read_option_error()
         self.option_process = None
@@ -2387,6 +3395,7 @@ class ResearchHelperWindow(QMainWindow):
         self._record_recommender_result(
             summary, payload, self._option_error_output, exit_code=exit_code, candidates=candidates,
             underlying=underlying, comparison_mode=comparison_mode, product_profile=product_profile,
+            market_prompt=market_prompt, constraints=constraints,
         )
         detail = result if isinstance(result, dict) else {}
         message = str(
@@ -2430,7 +3439,7 @@ class ResearchHelperWindow(QMainWindow):
                         0,
                         lambda: self._start_optionhelper_recommender(
                             summary=summary, request=request, underlying=underlying, supplement=answer,
-                            comparison_mode=comparison_mode,
+                            comparison_mode=comparison_mode, product_profile=product_profile,
                         ),
                     )
                 else:
@@ -2557,9 +3566,21 @@ class ResearchHelperWindow(QMainWindow):
                 client_constraints=dict(job.selection_payload.get("constraints") or {}),
                 recovery_action="核对 OptionHelper/iFinD 诊断后重新发起本次报价；不要复用旧 selection。",
             )
-            gaps.refresh_optionhelper_result(gap_path, result)
+            gaps.refresh_optionhelper_result(
+                gap_path, result, input_record=self._quote_input_record(job, "正式报价失败"))
         except (OSError, TypeError):
             pass
+
+    def _quote_input_record(self, job: QuoteJob, status: str) -> dict:
+        """正式报价与结构推荐共用同一份可审计的逐标的输入记录。"""
+        return {
+            "underlying": job.underlying,
+            "underlying_name": job.underlying_name,
+            "status": status,
+            "market_prompt": job.market_prompt,
+            "constraints": dict(job.selection_payload.get("constraints") or {}),
+            "product_profile": dict(self._recommender_profiles.get(job.underlying.upper()) or {}),
+        }
 
     @staticmethod
     def _serialise_quote_groups(groups) -> list[dict]:
@@ -2645,6 +3666,7 @@ class ResearchHelperWindow(QMainWindow):
                 gaps.refresh_optionhelper_result(
                     gap_file, oh, html_path=str(report_file), pdf_path=pdf,
                     pdf_pages=pages, pdf_error=export_error,
+                    input_record=self._quote_input_record(job, "正式报价已完成"),
                 )
             for name in [key for key in artifacts if "PDF" in str(key)]:
                 artifacts.pop(name, None)
@@ -2744,7 +3766,21 @@ class ResearchHelperWindow(QMainWindow):
                     # 文末，因而页脚跑到表格上方且结构建议缺失。
                     html = re.sub(r'<section class="recommendation">.*?</section>\s*', "", html, flags=re.DOTALL)
                     html = re.sub(r'<section class="quote">.*?</section>\s*', "", html, flags=re.DOTALL)
-                    append = report_layout._recommendation_block(oh) + report_layout._quote_block(oh)
+                    # 兼容修复前已生成的“系统候选被写成挂钩标的”卡片。
+                    html = re.sub(
+                        r'<div class="under">.*?(?=<section class="recommendation"|'
+                        r'<section class="quote"|<div class="foot">)',
+                        "", html, flags=re.DOTALL,
+                    )
+                    profile = self._recommender_profiles.get(job.underlying.upper()) or {}
+                    append = (
+                        report_layout.confirmed_underlying_block(
+                            job.underlying, name=job.underlying_name,
+                            reason=job.underlying_note, product_profile=profile,
+                        )
+                        + report_layout._recommendation_block(oh)
+                        + report_layout._quote_block(oh)
+                    )
                     footer_at = html.rfind('<div class="foot">')
                     if footer_at >= 0:
                         html = html[:footer_at] + append + html[footer_at:]
@@ -2900,6 +3936,31 @@ class ResearchHelperWindow(QMainWindow):
                     self.status.setText("已取消市场/行业确认")
             elif line.startswith("MARKET_CONFIRMATION_REJECTED="):
                 self.status.setText("确认未通过；请根据校验原因修改后重试")
+            elif line.startswith("EVENT_EVIDENCE_CONTEXT_REQUIRED="):
+                try:
+                    payload = json.loads(line.split("=", 1)[1])
+                except json.JSONDecodeError:
+                    payload = {}
+                evidence = payload.get("existing_evidence")
+                evidence = evidence if isinstance(evidence, dict) else self.event_evidence
+                context = payload.get("research_context")
+                context = context if isinstance(context, dict) else {}
+                dialog = EventEvidenceDialog(
+                    self, evidence, topic=self.prompt.toPlainText().strip(),
+                    discovery_mode="complete", research_context=context,
+                )
+                # 研究取数对象已经确认，自动进入第二阶段检索。
+                QTimer.singleShot(0, dialog.start_discovery)
+                if dialog.exec():
+                    self.event_evidence = dialog.payload()
+                    self._refresh_evidence_summary()
+                    response = json.dumps(
+                        {"event_evidence": self.event_evidence}, ensure_ascii=True) + "\n"
+                    self.process.write(response.encode("ascii"))
+                    self.status.setText("事件证据已确认，正在校验证据链并继续研究…")
+                else:
+                    self.process.write(b'{"cancelled":true}\n')
+                    self.status.setText("已取消事件证据确认")
             elif line.startswith("EVENT_EVIDENCE_REQUIRED="):
                 try:
                     payload = json.loads(line.split("=", 1)[1])
@@ -2907,7 +3968,11 @@ class ResearchHelperWindow(QMainWindow):
                     payload = {}
                 self.event_evidence_message = str(payload.get("message") or "事件证据不足，未生成报告。")
                 missing = payload.get("missing") or []
-                text = self.event_evidence_message + "\n\n未生成报告。请通过“管理事件证据”从已上传材料导入原文，或手动补录后重跑。"
+                text = (
+                    self.event_evidence_message
+                    + "\n\n未生成报告。请打开“管理事件证据”，先自动查找候选并确认；"
+                      "也可以从已上传材料导入或手工补录，保存后重跑。"
+                )
                 if missing:
                     text += "\n\n缺少：\n• " + "\n• ".join(str(item) for item in missing)
                 self.status.setText("未生成报告：事件证据不足")
@@ -3008,6 +4073,19 @@ class ResearchHelperWindow(QMainWindow):
         if self.last_summary:
             self._sync_quote_review(self.last_summary)
         self._refresh_quote_queue()
+        if (completed_quote_job is None and not self._run_cancelled and not self.event_evidence_message
+                and self.quote.isChecked() and self._has_research_artifact(self.last_summary)):
+            # 研究取数、正文和交付校验结束后，才进入独立的挂钩标的确认。
+            # 使用下一个事件循环节拍，避免与研究 QProcess 的 finished 信号交叉。
+            _underlying, research_only = self._confirmed_underlying(self.last_summary)
+            if self.quote_review_button.isEnabled():
+                QTimer.singleShot(0, self.prepare_formal_quote)
+            elif not research_only:
+                QTimer.singleShot(0, lambda: QMessageBox.information(
+                    self, "没有待报价候选",
+                    "研究报告已经完成，但客户未点名可报价证券，系统也没有找到通过基础筛选的 ETF/指数候选。\n\n"
+                    "本次只保留研究报告，不会自动指定挂钩标的。可补充明确代码后重新运行。",
+                ))
         # 用事件循环下一拍启动，避免 QProcess 刚结束时与下一份任务的信号/临时文件清理交叉。
         QTimer.singleShot(0, self._pump_quote_queue)
 
@@ -3302,6 +4380,9 @@ class ResearchHelperWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setApplicationDisplayName("Research Helper")
+    app.setStyleSheet(APPLE_STYLE)
     window = ResearchHelperWindow()
     window.show()
     sys.exit(app.exec())

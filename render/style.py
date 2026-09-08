@@ -1,41 +1,49 @@
-"""图表与一页通视觉风格（经 dataviz 方法论校验）。
+"""图表与一页通视觉风格。
 
-配色与 OptionHelper Designer 的 design_tokens.py 对齐：品牌红、蓝灰、风险金和纸白。
-类别色板固定、不循环；图表与 HTML 报告共用同一套视觉语义。
-
-本地化要点：上涨使用品牌红；下跌使用蓝灰，以保持金融语义与统一色系。
+图表与 HTML 报告使用同一份浅色酒红—浅金色板。红、蓝、绿各有相同的
+明度阶梯：红用于核心结论，蓝用于对照/负向，绿用于验证/改善；浅色只作
+面积、置信区间和卡片底色，不靠颜色替代数字或标签。
 """
 
 from __future__ import annotations
 
 import matplotlib as mpl
 
-# ---- OptionHelper Designer tokens ----
-# 与 option-helper/scripts/modules/designer/design_tokens.py 一一对应；
-# 本地 matplotlib 无法消费 CSS 变量，故在此保留同值映射。
-PRIMARY = "#C8102E"       # brand_red：标题、核心数字、主标记
-PRIMARY_D = "#890D26"     # brand_red_deep：强调/深色轮廓
-PRIMARY_L = "#E5C5CC"     # red_border_soft：次级元素、浅填充
-INK = "#241D20"           # ink：正文
-MUTED = "#6E5F63"         # muted：次要文字/坐标
-GRID = "#E9DADC"          # rule：网格、分隔线
-SURFACE = "#FFFDFB"       # paper：图表画布与报告纸面
-CARD = "#FBF1F3"          # brand_red_soft：浅色卡片
-BLUE_GRAY = "#49647D"     # blue_gray：中性对比/负向序列
-RISK_GOLD = "#855E22"     # risk_gold：风险提示序列
-CHART_GRAY = "#7E8A99"    # chart_gray：低优先级序列
+# ---- 报告视觉 token（matplotlib 无法消费 CSS 变量，故在此保留同值映射） ----
+# 红/蓝/绿三列采用相同的明度阶梯；数值与直接标签始终是主识别方式。
+PRIMARY_D = "#7D0A0A"     # 深酒红：主标题、风险重点、关键标记
+PRIMARY = "#BF3131"       # 砖红：默认核心数据线
+PRIMARY_L = "#D96B6B"     # 浅红：次级红色序列
+PRIMARY_FILL = "#F0D1D1"  # 浅红底：面积、区间、卡片
 
-# ---- 涨跌语义（红涨蓝灰跌）----
-# 涨用主红，跌用 Designer 的蓝灰；两者明度与色相均有足够差异，
-# 色觉障碍读者亦可通过深浅与图表标签区分。
+BLUE_D = "#0A377D"        # 深蓝：强对照
+BLUE = "#316FBF"          # 标准蓝：基准、负向或第二系列
+BLUE_L = "#6B9FD9"        # 浅蓝：次级对照
+BLUE_FILL = "#D1E0F0"     # 浅蓝底
+
+GREEN_D = "#0A7D35"       # 深绿：强验证
+GREEN = "#31BF73"         # 标准绿：改善、验证或第三系列
+GREEN_L = "#6BD99F"       # 浅绿：次级验证
+GREEN_FILL = "#D1F0E0"    # 浅绿底
+
+RISK_GOLD = "#EAD196"     # 浅金：提示、非数据装饰与低强调底色
+INK = "#2D2525"           # 正文
+MUTED = "#6F6464"         # 次要文字/坐标
+GRID = "#EEEEEE"          # 网格、分隔线
+SURFACE = "#FFFDFB"       # 暖白纸面与图表画布
+CARD = PRIMARY_FILL
+DATA_CARD_BG = "#FCF8F8" # 数据卡专用近白浅粉底，不与面积图的浅红填充混用
+DATA_CARD_BORDER = "#EADDDD"
+CHART_GRAY = "#9B9292"    # 低优先级辅助序列
+
+# ---- 涨跌语义（红涨蓝跌）----
+# 绿不承担“涨”或“跌”，只表示验证/改善，避免同一颜色在不同图中换语义。
 UP = PRIMARY            # 涨 / 正（品牌红）
-DOWN = BLUE_GRAY        # 跌 / 负（蓝灰；与 Designer 中性色语义一致）
+DOWN = BLUE             # 跌 / 负（数据蓝）
 FLAT = MUTED
 
-# ---- 类别色板：Designer 固定顺序 ----
-# 红、蓝灰、风险金、图表灰与深红均来自同一份 Designer token；
-# 图表一律直接标数值与标签，不依赖"看颜色猜是哪条"。
-SERIES = [PRIMARY, BLUE_GRAY, RISK_GOLD, CHART_GRAY, PRIMARY_D]
+# ---- 类别色板：同明度红/蓝/绿优先，超过三组不循环 ----
+SERIES = [PRIMARY, BLUE, GREEN, PRIMARY_L, BLUE_L, GREEN_L]
 
 # ---- 字体：优先可商用 ----
 # 成品要发给客户，字体授权是实打实的合规问题：
