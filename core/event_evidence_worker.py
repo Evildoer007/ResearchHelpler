@@ -44,6 +44,11 @@ def main() -> int:
     except Exception as error:  # noqa: BLE001 - worker must always return a machine-readable result
         print(RESULT_PREFIX + json.dumps({
             "candidates": [], "queries": [], "searched_documents": 0,
+            "configured_search_provider": "", "search_providers": [],
+            "search_calls_by_provider": {}, "search_credits_by_provider": {},
+            "search_hits_by_channel": {}, "searched_by_channel": {},
+            "fetch_failures_by_channel": {}, "search_audit": [],
+            "classification_rejections": [], "filtered_entity_mismatch_hits": 0,
             "warnings": [f"自动查找失败：{type(error).__name__}: {error}"],
         }, ensure_ascii=False))
         return 0

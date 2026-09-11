@@ -434,7 +434,7 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertTrue(any(item["code"] == "515050.SH" for item in candidates))
 
     def test_frozen_system_etf_candidates_enable_post_research_quote_review(self) -> None:
-        """客户未点名代码时，GUI 应使用本次运行冻结的系统候选，而不是研究锚点。"""
+        """没有研究 ETF 时，GUI 默认使用冻结候选的第一名，并隐藏其余扩展项。"""
         from gui.app import ResearchHelperWindow
 
         summary = {
@@ -476,7 +476,7 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertIn("无法生成事件影响报告", result.error)
 
     def test_event_evidence_is_source_required_and_attached_as_separate_fields(self) -> None:
-        from core import event_evidence, pipeline
+        from core import event_evidence, pipeline, planner
         from core.genres import TYPE_EVENT
 
         b = Brief(
@@ -502,8 +502,33 @@ class MarketConfirmationTests(unittest.TestCase):
         self.assertIn("自动检索", ma.field_values["触发标的_事件事实1"].note)
         self.assertEqual(ma.事件证据["事件主体"], "SK海力士 000660.KS")
 
+    def test_analyst_forced_event_requires_evidence_without_security_entity(self) -> None:
+        from core import event_evidence, pipeline
+
+        b = Brief(
+            原始需求="英伟达AI芯片进展如何影响A股产业链",
+            主题="英伟达AI芯片进展对A股产业链的影响",
+            研究主题="AI芯片",
+            触发事件="英伟达AI芯片进展",
+            主导类型="产业趋势",
+            分析师强制事件驱动=True,
+            ok=True,
+        )
+        self.assertTrue(event_evidence.required_for(b))
+        self.assertFalse(event_evidence.assess(b, event_evidence.parse(None)).ready)
+
+        evidence = event_evidence.parse({
+            "事件事实": [{"内容": "公司公告确认新产品已发布。", "来源": "公司公告"}],
+            "传导关系": [{"关系": "客户需求", "内容": "该产品影响A股相关供应链需求。",
+                         "来源": "产业报告"}],
+        })
+        ma = pipeline.MarketAnalysis(plan=None, rep_code="", ok=True)
+        event_evidence.attach_to_analysis(ma, b, evidence)
+        self.assertIn("触发标的_事件事实1", ma.field_values)
+        self.assertEqual(ma.事件证据["事件主体"], "英伟达AI芯片进展")
+
     def test_event_evidence_accepts_reviewed_three_part_chain(self) -> None:
-        from core import event_evidence
+        from core import event_evidence, pipeline, planner
         from core.genres import TYPE_EVENT
 
         b = Brief(原始需求="海外厂商业绩对A股产业链影响", 主导类型=TYPE_EVENT,
@@ -517,6 +542,49 @@ class MarketConfirmationTests(unittest.TestCase):
                            "方向": "正向", "置信度": "中"}],
         })
         self.assertTrue(event_evidence.assess(b, evidence).ready, evidence.errors)
+        claims = event_evidence.claims(evidence, subject="海外厂商 TEST.US")
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0].id, "event_chain_1")
+        self.assertEqual(claims[0].direction, "看涨")
+        self.assertIn("[F1]", claims[0].source_text)
+        self.assertIn("[M1]", claims[0].source_text)
+        self.assertIn("[E1]", claims[0].source_text)
+
+        prepared = pipeline.Prepared(
+            profile={}, fired=[], rep_code="159995.SZ",
+            event_claims=claims, event_required=True,
+        )
+        candidates = pipeline.candidates(prepared)
+        self.assertEqual(candidates[0].kind, "event")
+        suggested = pipeline.recommend(candidates)
+        self.assertEqual(suggested, [1])
+        plan = planner._postprocess(
+            "海外厂商业绩对A股产业链影响", {"类型": TYPE_EVENT},
+            {"论证计划": [], "叙事主轴": "事件传导", "整体方向": "谨慎看涨"},
+            fired=[], chosen=["event_chain_1"], event_claims=claims,
+        )
+        self.assertTrue(plan.ok)
+        self.assertEqual(plan.logics[0].逻辑id, "event_chain_1")
+        self.assertEqual(plan.logics[0].所需数据字段, ["事件链依据·event_chain_1"])
+        self.assertEqual(plan.未知字段, [])
+
+    def test_event_evidence_preserves_internal_search_audit(self) -> None:
+        from core import event_evidence
+
+        raw = {
+            "事件事实": [], "产业机制": [], "A股暴露": [], "组合传导链": [],
+            "传导关系": [],
+            "检索审计": [{
+                "时间": "2026-09-09T10:00:00+01:00",
+                "实际搜索服务": ["Tavily"],
+                "搜索调用": {"Tavily": 3},
+                "额度消耗": {"Tavily": 3.0},
+            }],
+        }
+        parsed = event_evidence.parse(raw)
+        self.assertEqual(parsed.search_audit[0]["实际搜索服务"], ["Tavily"])
+        self.assertEqual(event_evidence.to_dict(parsed)["检索审计"], raw["检索审计"])
+        self.assertNotIn("API Key", json.dumps(event_evidence.to_dict(parsed), ensure_ascii=False))
 
     def test_hk_internet_accepts_only_explicit_cross_border_tool(self) -> None:
         b = brief("基于港股互联网板块的投资机会", "港股", ["传媒"])

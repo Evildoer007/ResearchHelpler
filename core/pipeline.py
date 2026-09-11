@@ -22,10 +22,10 @@ from dataclasses import dataclass, field as dfield
 
 from llm.client import DeepSeekClient
 
-from . import fetcher, planner
+from . import event_evidence, fetcher, planner
 from . import genres as gr
 from .fetcher import FieldValue
-from .planner import DOC_FIELD_PREFIX, ArgumentPlan, PlanLogic
+from .planner import DOC_FIELD_PREFIX, EVENT_FIELD_PREFIX, ArgumentPlan, PlanLogic
 from .provider import DataProvider, get_provider
 
 _THEME_BASKET_MIN = 5
@@ -598,18 +598,20 @@ class Prepared:
     rep_code: str
     sector: str | None = None
     claims: list = dfield(default_factory=list)   # list[docs.DocClaim]，仅 with_docs 时有值
+    event_claims: list = dfield(default_factory=list)  # 已确认事件传导链；与研报候选分开
+    event_required: bool = False
 
 
 @dataclass
 class Candidate:
-    """统一编号的候选论证角度——数据触发的论点与研报提炼的观点并列。
+    """统一编号的候选论证角度——数据触发、事件传导与研报观点并列。
 
     两者的可证伪性来源不同：`thesis` 由阈值机械判定，`doc` 靠分析师点开原文核对。
     故 doc 类候选**只在人工勾选模式下出现**，不参与自动挑选（DESIGN §7.5）。
     """
 
-    kind: str                # "thesis" | "doc"
-    id: str                  # V1 / doc_1
+    kind: str                # "thesis" | "event" | "doc"
+    id: str                  # V1 / event_chain_1 / doc_1
     名称: str = ""
     类别: str = ""
     方向: str = ""
@@ -619,6 +621,7 @@ class Candidate:
     证据主体: str = ""
     trigger: object = None
     claim: object = None
+    event_claim: object = None
 
 
 def prepare(rep_code: str, sector: str | None = None,
@@ -678,12 +681,17 @@ def prepare(rep_code: str, sector: str | None = None,
 
     # sector 以 profile 里的为准——fetch_profile 已把主题名解析成行业名，
     # 存回来供 run() 的补充取数复用，避免两处各解析一次（结果可能不一致）
+    evidence = getattr(overrides, "事件证据", None)
+    if evidence is not None and not isinstance(evidence, event_evidence.EventEvidence):
+        evidence = event_evidence.parse(evidence)
+    event_claims = event_evidence.claims(evidence) if evidence is not None else []
     return Prepared(profile=profile, fired=fired, rep_code=rep_code,
-                    sector=profile.get("__sector__") or sector, claims=claims)
+                    sector=profile.get("__sector__") or sector, claims=claims,
+                    event_claims=event_claims)
 
 
 def candidates(prepared: Prepared) -> list[Candidate]:
-    """把数据触发的论点与研报提炼的观点合成一份**统一编号**的候选清单。
+    """把数据触发、事件传导链与研报观点合成一份**统一编号**的候选清单。
 
     编号即列表下标+1，渲染与选号共用这一个顺序，避免两处各自排序而错位
     （与 thesis.group_for_pick 同一个教训）。
@@ -696,6 +704,13 @@ def candidates(prepared: Prepared) -> list[Candidate]:
             kind="thesis", id=t.thesis.id, 名称=t.thesis.名称,
             类别=t.thesis.类别, 方向=t.thesis.方向 or t.thesis.特征.get("方向", ""),
             依据=t.说明, trigger=t,
+        ))
+    for c in prepared.event_claims:
+        out.append(Candidate(
+            kind="event", id=c.id, 名称=c.viewpoint, 类别=c.category,
+            方向=c.direction, 依据=c.source_text, 出处=c.source,
+            证据范围=c.evidence_scope, 证据主体=c.evidence_subject,
+            event_claim=c,
         ))
     by_cat: dict[str, list] = {}
     for c in prepared.claims:
@@ -738,6 +753,7 @@ def recommend(cands: list[Candidate], n: int = 3) -> list[int]:
             continue
         q = _quality(c)
         s = min(q["nums"], 6) * 2                   # 可引用数字越多，正文越写得实
+        s += 8 if c.kind == "event" else 0           # 事件型报告必须先回答事件如何传导
         s += 4 if c.kind == "thesis" else 0          # 自有数据可机械溯源，权重更高
         s += 3 if q["chart"] else 0                  # 带数列＝这条能配图
         s -= 6 if q["stale"] else 0                  # 过期研报降权
@@ -759,23 +775,32 @@ def recommend(cands: list[Candidate], n: int = 3) -> list[int]:
             if ("看跌" in (c.方向 or "")) != 同向:
                 picked[-1] = (i, c)
                 break
+    # 只要存在已确认事件传导链，建议组合必须至少包含一条；不能让一般行情观点
+    # 把客户真正询问的事件影响挤出正文主轴。
+    event_items = [(i, c) for _s, i, c in scored if c.kind == "event"]
+    if event_items and not any(c.kind == "event" for _i, c in picked):
+        if len(picked) >= n:
+            picked[-1] = event_items[0]
+        else:
+            picked.append(event_items[0])
     return [i for i, _ in picked]
 
 
 def render_candidates(cands: list[Candidate], *, with_hint: bool = True) -> str:
-    """候选清单，按来源分两段、各自按类别分组，并给出概览与建议组合。"""
+    """候选清单，按三类来源分组，并给出概览与建议组合。"""
     if not cands:
         return "本次没有可用的论证角度（数据未触发任何论点，sources/ 也没有可用研报）。"
 
     lines: list[str] = []
     if with_hint:
         n_t = sum(1 for c in cands if c.kind == "thesis")
-        n_d = len(cands) - n_t
+        n_e = sum(1 for c in cands if c.kind == "event")
+        n_d = sum(1 for c in cands if c.kind == "doc")
         bull = sum(1 for c in cands if "看涨" in (c.方向 or ""))
         bear = sum(1 for c in cands if "看跌" in (c.方向 or ""))
         stale = sum(1 for c in cands if "⚠" in (c.出处 or ""))
         chart = sum(1 for c in cands if _quality(c)["chart"])
-        lines.append(f"共 {len(cands)} 条候选（数据触发 {n_t} · 研报提炼 {n_d}）　"
+        lines.append(f"共 {len(cands)} 条候选（数据触发 {n_t} · 已确认事件传导 {n_e} · 研报提炼 {n_d}）　"
                      f"方向：看涨 {bull} / 看跌 {bear} / 其它 {len(cands)-bull-bear}")
         extra = [f"{chart} 条自带配图数列"] if chart else []
         if stale:
@@ -785,6 +810,7 @@ def render_candidates(cands: list[Candidate], *, with_hint: bool = True) -> str:
         lines.append("")
 
     for kind, title in (("thesis", "数据触发（行情数据阈值判定）"),
+                        ("event", "已确认事件传导（正文至少选择一条）"),
                         ("doc", "研报提炼（请点开原文核对后再选）")):
         group = [(i, c) for i, c in enumerate(cands, 1) if c.kind == kind]
         if not group:
@@ -809,11 +835,12 @@ def render_candidates(cands: list[Candidate], *, with_hint: bool = True) -> str:
             lines.append(f"  {i:>2}. {head}{tag}{mk}")
             if c.出处:
                 lines.append(f"      {c.出处}")
-            if kind == "doc" and c.证据范围:
+            if kind in {"doc", "event"} and c.证据范围:
                 note = "仅可作公司案例，不可外推为板块结论" if c.证据范围 == "公司级" else "可作行业/市场层证据"
                 lines.append(f"      证据边界：{c.证据范围}（{c.证据主体 or '主体待核'}）｜{note}")
             if c.依据:
-                lines.append(f"      {'原文' if kind == 'doc' else '依据'}：{c.依据[:100]}")
+                label = "受控证据链" if kind == "event" else ("原文" if kind == "doc" else "依据")
+                lines.append(f"      {label}：{c.依据[:180]}")
         lines.append("")
 
     if with_hint:
@@ -826,6 +853,8 @@ def render_candidates(cands: list[Candidate], *, with_hint: bool = True) -> str:
                 why = []
                 if c.kind == "thesis":
                     why.append("自有数据可机械溯源")
+                if c.kind == "event":
+                    why.append("直接回答事件传导且已由分析师确认")
                 if q["nums"] >= 3:
                     why.append(f"含 {q['nums']} 个可引用数字")
                 if q["chart"]:
@@ -882,16 +911,19 @@ def run(
                            overrides=overrides)
     profile = prepared.profile
 
-    # 被勾选的研报观点（chosen 里 doc_ 打头的那些）
+    # 被勾选的研报观点与事件传导链。后者必须保持独立来源，不能伪装成研报。
     doc_chosen = [c for c in prepared.claims
                   if chosen and c.id in set(chosen)]
+    event_chosen = [c for c in prepared.event_claims
+                    if chosen and c.id in set(chosen)]
 
     # ②【顺序已调整】规划：触发引擎按这份真实数据筛出候选论点
     #   —— 无 chosen 时 planner 自己挑 2~3 条；有 chosen 时挑选权归分析师，planner 只措辞
     #   （planner 内部仍守铁律：论点文本不得引用画像里的具体数字）
     plan = planner.plan(topic, topic_type, client, genre=g, context=context,
                         profile=profile, fired=planner.triggers_to_spec(prepared.fired),
-                        chosen=chosen, doc_claims=doc_chosen)
+                        chosen=chosen, doc_claims=doc_chosen,
+                        event_claims=event_chosen)
     if not plan.ok:
         return MarketAnalysis(plan=plan, rep_code=rep_code, ok=False, error=plan.error,
                               tokens=client.total_tokens, data_vol=getattr(provider, "total_data_vol", 0))
@@ -899,7 +931,8 @@ def run(
     # ③ 补充取数：规划中出现、但摸底没覆盖的字段（多来自自由槽新拟的字段名）
     missing = [f for f in plan.取数清单
                if f not in profile and not f.startswith("__")
-               and not f.startswith(DOC_FIELD_PREFIX)]      # 研报字段不走取数层
+               and not f.startswith(DOC_FIELD_PREFIX)
+               and not f.startswith(EVENT_FIELD_PREFIX)]    # 原文证据不走行情取数层
     extra: list[FieldValue] = []
     if missing:
         # 用 profile 里已解析的行业名，别用入参的原始主题名——否则补充取数会绕开解析
@@ -950,6 +983,16 @@ def run(
             field=fname, value=text, ok=True, source=c.来源,
             as_of=c.文档日期, status="ok",
             note=f"p{c.页码} · {c.时效}", display=text,
+        )
+
+    # 已确认事件链：将完整的事实/机制/A股暴露原文与组合边界绑定到这一条逻辑。
+    # 它与全局事件证据块互补：前者保证正文主轴真正使用证据，后者供整体复核。
+    for c in event_chosen:
+        fname = f"{EVENT_FIELD_PREFIX}{c.id}"
+        fv_map[fname] = FieldValue(
+            field=fname, value=c.source_text, ok=True, source=c.source,
+            status="ok", note="分析师确认的受控事件传导链；不得扩写未列出的因果环节",
+            display=c.source_text,
         )
 
     # ③b 给每条研报逻辑配上可佐证的自有数据。
@@ -1106,13 +1149,20 @@ def prepare_from_brief(b, *, provider: DataProvider | None = None,
     trigger_name = trig.名称 if trig is not None and trig.可用 else ""
     theme_basket = _theme_basket_from_brief(b)
     theme_basket_required = _theme_basket_required(b)
-    return prepare(t.代码, (b.涉及板块[0] if b.涉及板块 else None), provider,
-                   with_docs=with_docs, topic=主题,
-                   trigger_code=trigger_code, trigger_name=trigger_name,
-                   analysis_etf=explicit_etf,
-                   theme_basket=theme_basket,
-                   theme_basket_required=theme_basket_required,
-                   overrides=overrides)
+    prepared = prepare(t.代码, (b.涉及板块[0] if b.涉及板块 else None), provider,
+                       with_docs=with_docs, topic=主题,
+                       trigger_code=trigger_code, trigger_name=trigger_name,
+                       analysis_etf=explicit_etf,
+                       theme_basket=theme_basket,
+                       theme_basket_required=theme_basket_required,
+                       overrides=overrides)
+    prepared.event_required = event_evidence.required_for(b)
+    subject = event_evidence.subject_for(b)
+    if prepared.event_claims:
+        # ``prepare`` 不依赖 Brief；到这里补充准确的事件主体展示名。
+        prepared.event_claims = event_evidence.claims(
+            getattr(overrides, "事件证据", None), subject=subject)
+    return prepared
 
 
 def run_from_brief(
@@ -1138,9 +1188,11 @@ def run_from_brief(
     # 即使未来 GUI/脚本绕过 main.py，也无法生成一份没有事件本体与传导依据的成品。
     from . import event_evidence
     evidence = getattr(overrides, "事件证据", None) or event_evidence.parse(None)
+    if not isinstance(evidence, event_evidence.EventEvidence):
+        evidence = event_evidence.parse(evidence)
     gate = event_evidence.assess(b, evidence)
     if gate.required and not gate.ready:
-        entity = getattr(getattr(b, "触发实体", None), "名称", "该事件主体")
+        entity = event_evidence.subject_for(b)
         return MarketAnalysis(plan=None, rep_code="", ok=False,
             error=gate.message(entity))
     explicit_etf = _explicit_etf_from_brief(b)
@@ -1170,6 +1222,29 @@ def run_from_brief(
         basket_state = "未选择主题公司篮子；不用于行业整体聚合"
     else:
         basket_state = "行业整体法（非细分主题公司篮子）"
+
+    # 后端同样约束事件主轴，不能只依赖 GUI。非人工勾选模式自动采用包含事件链的
+    # 建议组合；人工明确选择却漏掉事件链时直接说明原因，不生成答非所问的报告。
+    if gate.required and prepared is None:
+        prepared = prepare_from_brief(b, provider=provider, with_docs=False, overrides=overrides)
+    if prepared is not None:
+        prepared.event_required = gate.required
+    if gate.required and prepared is not None:
+        available = candidates(prepared)
+        event_ids = {item.id for item in available if item.kind == "event"}
+        if not event_ids:
+            return MarketAnalysis(
+                plan=None, rep_code=target.代码, ok=False,
+                error="事件证据已经通过完整性校验，但未能形成可选的事件传导主轴。",
+            )
+        if chosen is None:
+            selected = select_candidates(available, recommend(available))
+            chosen = [item.id for item in selected]
+        elif not event_ids.intersection(chosen):
+            return MarketAnalysis(
+                plan=None, rep_code=target.代码, ok=False,
+                error="事件型报告至少必须选择一条已确认事件传导主轴。",
+            )
     ctx = {
         # 禁止把原始口语整段送入研究链：其中可能包含客户点名的产品结构。
         "研究需求": getattr(b, "研究主题", "") or b.主题,

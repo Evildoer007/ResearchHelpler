@@ -24,10 +24,12 @@ from urllib.parse import quote_plus, urlparse
 
 import requests
 
+from core import config
 from llm.client import DeepSeekClient
 
 
 SEARCH_URL = "https://www.bing.com/search?format=rss&q={query}"
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
 MAX_DOCUMENT_CHARS = 6_000
 MAX_LOCAL_DOCUMENTS = 4
@@ -45,6 +47,9 @@ class SearchHit:
     title: str
     url: str
     summary: str = ""
+    raw_content: str = ""
+    provider: str = ""
+    score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,13 @@ class DiscoveryResult:
     search_hits_by_channel: dict[str, int] = field(default_factory=dict)
     fetch_failures_by_channel: dict[str, int] = field(default_factory=dict)
     filtered_low_value_hits: int = 0
+    filtered_entity_mismatch_hits: int = 0
+    configured_search_provider: str = ""
+    search_providers: list[str] = field(default_factory=list)
+    search_calls_by_provider: dict[str, int] = field(default_factory=dict)
+    search_credits_by_provider: dict[str, float] = field(default_factory=dict)
+    search_audit: list[dict] = field(default_factory=list)
+    classification_rejections: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -107,6 +119,13 @@ class DiscoveryResult:
             "search_hits_by_channel": dict(self.search_hits_by_channel),
             "fetch_failures_by_channel": dict(self.fetch_failures_by_channel),
             "filtered_low_value_hits": self.filtered_low_value_hits,
+            "filtered_entity_mismatch_hits": self.filtered_entity_mismatch_hits,
+            "configured_search_provider": self.configured_search_provider,
+            "search_providers": list(self.search_providers),
+            "search_calls_by_provider": dict(self.search_calls_by_provider),
+            "search_credits_by_provider": dict(self.search_credits_by_provider),
+            "search_audit": list(self.search_audit),
+            "classification_rejections": list(self.classification_rejections),
         }
 
 
@@ -189,6 +208,70 @@ def _is_low_value_hit(hit: SearchHit) -> bool:
     return any(marker in title for marker in quote_markers)
 
 
+def _normalized_entity_text(value: object) -> str:
+    """实体匹配忽略空格、连字符和标点，但不做语义扩展。"""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _event_entity_profile(topic: str) -> tuple[list[str], list[str]]:
+    """提取需要在事件事实网页中真实出现的主体别名与已知歧义词。
+
+    这里只做高精度实体锚定，不猜产业主题。已知歧义实体维护显式别名，其他
+    公司名则从“发布/披露/公布业绩”等事件句式中提取原文名称。
+    """
+    value = _compact(topic)
+    known = (
+        (r"(?:SK[\s\-]*海力士|海力士|SK[\s\-]*hynix)",
+         ["SK海力士", "SK hynix"], ["SK-II", "SK II", "SKII", "护肤", "化妆品", "美妆"]),
+    )
+    for pattern, aliases, exclusions in known:
+        if re.search(pattern, value, flags=re.IGNORECASE):
+            return aliases, exclusions
+
+    patterns = (
+        r"(?:针对|关于|结合)?\s*([A-Za-z][A-Za-z0-9 .&·\-]{1,28}|[\u4e00-\u9fffA-Za-z0-9&·\-]{2,18})"
+        r"(?:发布|公布|披露|宣布|发了|交出|上调|下调)(?:了|其|最新|本次|季度|年度|半年度)?(?:业绩|财报|指引|公告|预告|进展)",
+        r"(?:针对|关于)?\s*([A-Za-z][A-Za-z0-9 .&·\-]{1,28}|[\u4e00-\u9fffA-Za-z0-9&·\-]{2,18})"
+        r"(?:业绩|财报|指引|公告|预告)(?:发布|公布|披露|落地)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value, flags=re.IGNORECASE)
+        if not match:
+            continue
+        entity = _compact(match.group(1))
+        entity = re.sub(r"^(?:请问|请分析|分析|市场关注)", "", entity).strip()
+        if 2 <= len(entity) <= 30:
+            return [entity], []
+    return [], []
+
+
+def _anchor_event_queries(queries: Iterable[str], topic: str) -> list[str]:
+    """把事实查询逐条绑定到事件主体；多别名轮流使用以覆盖中英文官方来源。"""
+    aliases, _exclusions = _event_entity_profile(topic)
+    values = _unique_queries(queries, limit=3)
+    if not aliases:
+        return values
+    anchored: list[str] = []
+    for index, query in enumerate(values):
+        alias = aliases[index % len(aliases)]
+        # 已有同一精确短语时不重复添加；引号使搜索入口减少同形品牌误召回。
+        prefix = "" if f'"{alias}"'.lower() in query.lower() else f'"{alias}" '
+        # 不把已知歧义词拼进查询；部分语义搜索会忽略减号，反而提高歧义词召回。
+        # 排除由读取前的实体硬门完成。
+        anchored.append(_compact(f"{prefix}{query}"))
+    return anchored
+
+
+def _hit_matches_event_entity(hit: SearchHit, aliases: Iterable[str]) -> bool:
+    haystack = _normalized_entity_text(
+        f"{hit.title}\n{hit.summary}\n{hit.raw_content[:2000]}"
+    )
+    return any(
+        normalized and normalized in haystack
+        for normalized in (_normalized_entity_text(alias) for alias in aliases)
+    )
+
+
 def _fallback_query_groups(topic: str, research_context: dict | None = None) -> dict[str, list[str]]:
     compact = _compact(topic)[:70]
     context = research_context or {}
@@ -223,13 +306,13 @@ def _fallback_query_groups(topic: str, research_context: dict | None = None) -> 
             f"{compact} ETF 跟踪指数 成分股 官方",
         ]
     return {
-        "事件事实": [
+        "事件事实": _anchor_event_queries([
             f"{compact} 官方公告 业绩 指引",
             f"{compact} 产品 产能 研发进展 官方披露",
-        ],
+        ], topic),
         "产业机制": [
-            f"{compact} 产业链 供应链 需求 竞争机制",
-            f"{compact} 产品价格 产能 技术替代 行业影响",
+            f"{compact} 产业链 供应链 需求 竞争机制 行业研究",
+            f"{compact} 产品价格 产能 技术替代 行业影响 权威媒体",
         ],
         "A股暴露": exposure_queries,
     }
@@ -269,7 +352,7 @@ def plan_query_groups(topic: str, client: DeepSeekClient | None = None, *,
             "A股暴露检索词：2至3条，寻找本次A股行业、公司或ETF与受影响产业环节的官方业务、指数编制或成分依据",
             "若已提供确认后的A股研究对象，A股暴露检索词必须使用其中的具体行业、公司名称/代码或ETF跟踪指数，不得重新猜研究对象",
             "每条必须是可直接交给搜索引擎的简短关键词组合，不得写成要求模型分析投资机会的完整问句",
-            "涉及境外公司时可加入其官方英文名；事件事实优先公司官网、交易所或监管披露，A股暴露优先年报、指数公司或基金公告",
+            "涉及境外公司时可加入其官方英文名；事件事实优先公司官网、交易所或监管披露；产业机制优先研究机构、行业组织和权威财经媒体；A股暴露优先公司年报、指数公司或基金公告",
             "不得编造基金代码、数据、来源或结论",
             "只返回合法 JSON 对象，不附加解释文字",
         ],
@@ -306,7 +389,8 @@ def plan_query_groups(topic: str, client: DeepSeekClient | None = None, *,
     if not exposures:
         exposures = fallback["A股暴露"]
     return {
-        "事件事实": facts[:3], "产业机制": mechanisms[:3], "A股暴露": exposures[:3],
+        "事件事实": _anchor_event_queries(facts[:3], topic),
+        "产业机制": mechanisms[:3], "A股暴露": exposures[:3],
     }, []
 
 
@@ -340,6 +424,218 @@ def search_web(query: str, *, limit: int = 6, session=requests) -> list[SearchHi
     return hits
 
 
+def _usage_credits(raw: object) -> float:
+    """兼容 Tavily 不同版本的 usage 结构，只记录额度，不影响搜索结果。"""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not isinstance(raw, dict):
+        return 0.0
+    value = raw.get("credits")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        for key in ("total", "used", "search"):
+            nested = value.get(key)
+            if isinstance(nested, (int, float)):
+                return float(nested)
+    return 0.0
+
+
+def load_search_settings(overrides: dict | None = None) -> dict:
+    """返回不含日志副作用的统一搜索设置；API Key 只在内存中使用。"""
+    values = {
+        "provider": str(config.SEARCH_PROVIDER or "tavily").lower(),
+        "api_key": str(config.TAVILY_API_KEY or ""),
+        "search_depth": str(config.SEARCH_DEPTH or "basic").lower(),
+        "country": str(config.SEARCH_COUNTRY or "").lower(),
+        "language": str(config.SEARCH_LANGUAGE or "").lower(),
+        "bing_fallback": bool(config.SEARCH_BING_FALLBACK),
+    }
+    if isinstance(overrides, dict):
+        values.update({key: value for key, value in overrides.items() if value is not None})
+    values["provider"] = str(values.get("provider") or "tavily").strip().lower()
+    if values["provider"] not in {"tavily", "bing"}:
+        values["provider"] = "tavily"
+    values["search_depth"] = str(values.get("search_depth") or "basic").strip().lower()
+    if values["search_depth"] not in {"basic", "advanced"}:
+        values["search_depth"] = "basic"
+    values["country"] = str(values.get("country") or "").strip().lower()
+    values["language"] = str(values.get("language") or "").strip().lower()
+    fallback = values.get("bing_fallback", True)
+    if isinstance(fallback, str):
+        fallback = fallback.strip().lower() not in {"0", "false", "no", "off", "否"}
+    values["bing_fallback"] = bool(fallback)
+    values["api_key"] = str(values.get("api_key") or "").strip()
+    return values
+
+
+def search_tavily(query: str, *, limit: int = 6, api_key: str = "",
+                   search_depth: str = "basic", country: str = "",
+                   language: str = "", include_raw_content: bool = True,
+                   session=requests) -> tuple[list[SearchHit], dict]:
+    """调用 Tavily 官方 REST Search API，并保留其清洗正文与额度信息。"""
+    key = str(api_key or "").strip()
+    if not key:
+        raise RuntimeError("未配置 Tavily API Key")
+    payload: dict[str, object] = {
+        "query": query,
+        "search_depth": search_depth if search_depth in {"basic", "advanced"} else "basic",
+        "max_results": max(1, min(20, int(limit))),
+        "topic": "general",
+        "include_answer": False,
+        "include_raw_content": "text" if include_raw_content else False,
+        "include_images": False,
+        "include_usage": True,
+        "safe_search": True,
+    }
+    if country:
+        payload["country"] = country
+    if language:
+        payload["language"] = language
+    response = session.post(
+        TAVILY_SEARCH_URL,
+        json=payload,
+        timeout=35,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+    )
+    try:
+        response.raise_for_status()
+    except Exception as error:
+        status = getattr(response, "status_code", "?")
+        detail = _compact(getattr(response, "text", ""))[:240]
+        raise RuntimeError(f"Tavily HTTP {status}: {detail or error}") from error
+    try:
+        data = response.json()
+    except (ValueError, AttributeError) as error:
+        raise RuntimeError("Tavily 返回的不是合法 JSON") from error
+    if not isinstance(data, dict):
+        raise RuntimeError("Tavily 返回格式无效")
+    hits: list[SearchHit] = []
+    for item in data.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        title = _compact(item.get("title") or "")
+        url = _compact(item.get("url") or "")
+        if not title or not _public_https(url):
+            continue
+        try:
+            score = float(item.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        hits.append(SearchHit(
+            title=title,
+            url=url,
+            summary=_compact(item.get("content") or ""),
+            raw_content=_compact(item.get("raw_content") or "")[:MAX_DOCUMENT_CHARS],
+            provider="Tavily",
+            score=score,
+        ))
+        if len(hits) >= limit:
+            break
+    return hits, {
+        "provider": "Tavily",
+        "query": query,
+        "ok": True,
+        "hit_count": len(hits),
+        "credits": _usage_credits(data.get("usage")),
+        "response_time": data.get("response_time"),
+        "error": "",
+    }
+
+
+class UnifiedSearcher:
+    """Tavily 主搜索与 Bing RSS 兜底的统一可调用接口。"""
+
+    def __init__(self, settings: dict | None = None, *, session=requests) -> None:
+        self.settings = load_search_settings(settings)
+        self.session = session
+        self._diagnostics: list[dict] = []
+
+    @property
+    def display_name(self) -> str:
+        if self.settings["provider"] == "bing":
+            return "Bing RSS"
+        return "Tavily + Bing RSS兜底" if self.settings["bing_fallback"] else "Tavily"
+
+    def take_diagnostics(self) -> list[dict]:
+        values, self._diagnostics = self._diagnostics, []
+        return values
+
+    def _bing(self, query: str, limit: int) -> list[SearchHit]:
+        try:
+            hits = [replace(item, provider="Bing RSS")
+                    for item in search_web(query, limit=limit, session=self.session)]
+            self._diagnostics.append({
+                "provider": "Bing RSS", "query": query, "ok": True,
+                "hit_count": len(hits), "credits": 0.0, "error": "",
+            })
+            return hits
+        except Exception as error:
+            self._diagnostics.append({
+                "provider": "Bing RSS", "query": query, "ok": False,
+                "hit_count": 0, "credits": 0.0,
+                "error": f"{type(error).__name__}: {str(error)[:240]}",
+            })
+            return []
+
+    def __call__(self, query: str, *, limit: int = 6) -> list[SearchHit]:
+        self._diagnostics = []
+        if self.settings["provider"] == "bing":
+            return self._bing(query, limit)
+        try:
+            hits, diagnostic = search_tavily(
+                query, limit=limit, api_key=self.settings["api_key"],
+                search_depth=self.settings["search_depth"],
+                country=self.settings["country"], language=self.settings["language"],
+                session=self.session,
+            )
+            self._diagnostics.append(diagnostic)
+            if hits or not self.settings["bing_fallback"]:
+                return hits
+            self._diagnostics[-1]["fallback_reason"] = "Tavily 未返回结果"
+        except Exception as error:
+            self._diagnostics.append({
+                "provider": "Tavily", "query": query, "ok": False,
+                "hit_count": 0, "credits": 0.0,
+                "error": f"{type(error).__name__}: {str(error)[:240]}",
+            })
+            if not self.settings["bing_fallback"]:
+                return []
+            self._diagnostics[-1]["fallback_reason"] = "Tavily 不可用"
+        return self._bing(query, limit)
+
+
+def build_searcher(settings: dict | None = None, *, session=requests) -> UnifiedSearcher:
+    return UnifiedSearcher(settings, session=session)
+
+
+def test_search_connection(settings: dict | None = None, *, session=requests) -> dict:
+    """测试当前选中的入口；测试 Tavily 时不允许 Bing 掩盖配置错误。"""
+    values = load_search_settings(settings)
+    if values["provider"] == "tavily":
+        try:
+            hits, diagnostic = search_tavily(
+                "Research Helper financial research official disclosure",
+                limit=1, api_key=values["api_key"], search_depth="basic",
+                country=values["country"], language=values["language"],
+                include_raw_content=False, session=session,
+            )
+        except Exception as error:
+            return {
+                "provider": "Tavily", "ok": False, "hit_count": 0, "credits": 0.0,
+                "error": f"{type(error).__name__}: {str(error)[:240]}", "sample_title": "",
+            }
+        return {**diagnostic, "ok": True, "sample_title": hits[0].title if hits else "未命中样例，但接口已响应"}
+    searcher = UnifiedSearcher({**values, "bing_fallback": False}, session=session)
+    hits = searcher("Research Helper financial research official disclosure", limit=1)
+    diagnostics = searcher.take_diagnostics()
+    diagnostic = diagnostics[-1] if diagnostics else {
+        "provider": "Bing RSS", "ok": False, "error": "未返回连接诊断",
+    }
+    return {**diagnostic, "ok": bool(diagnostic.get("ok")),
+            "sample_title": hits[0].title if hits else ""}
+
+
 def _pdf_text(raw: bytes) -> str:
     try:
         from pypdf import PdfReader
@@ -352,6 +648,14 @@ def _pdf_text(raw: bytes) -> str:
 def fetch_document(hit: SearchHit, *, session=requests) -> EvidenceDocument | None:
     if not _public_https(hit.url) or _is_low_value_hit(hit):
         return None
+    # Tavily Search 可直接返回已经清洗的正文；优先使用它，避免再次访问动态网页、
+    # 登录墙或易触发反爬的站点。摘要不足 80 字时仍回到原网页抓取路径。
+    cleaned = _compact(hit.raw_content)
+    if len(cleaned) >= 80:
+        return EvidenceDocument(
+            document_id="", title=hit.title, source=hit.title, reference=hit.url,
+            text=cleaned[:MAX_DOCUMENT_CHARS], source_kind=f"{hit.provider or '搜索服务'}清洗正文",
+        )
     response = session.get(
         hit.url, timeout=20, stream=True,
         headers={"User-Agent": "Mozilla/5.0 ResearchHelper/1.0"},
@@ -428,7 +732,8 @@ def _assign_ids(documents: Iterable[EvidenceDocument]) -> list[EvidenceDocument]
 
 def classify_documents(topic: str, documents: list[EvidenceDocument],
                        client: DeepSeekClient | None = None, *,
-                       expected_type: str = "", limit: int = 8) -> tuple[list[DiscoveredEvidence], list[str]]:
+                       expected_type: str = "", limit: int = 8,
+                       rejections: list[dict] | None = None) -> tuple[list[DiscoveredEvidence], list[str]]:
     """LLM 分类后做逐字校验；被改写、无来源或越界的结果一律不返回。"""
     if not documents:
         return [], []
@@ -476,14 +781,35 @@ def classify_documents(topic: str, documents: list[EvidenceDocument],
     raw_candidates = response.data.get("candidates") or []
     for raw in raw_candidates:
         if not isinstance(raw, dict):
+            if rejections is not None:
+                rejections.append({"reason": "LLM候选不是对象", "expected_type": expected_type})
             continue
         document = by_id.get(str(raw.get("document_id") or ""))
         evidence_type = str(raw.get("type") or "").strip()
         quote = _compact(raw.get("quote") or "")
-        if (document is None or evidence_type not in EVIDENCE_TYPES
-                or (expected_type and evidence_type != expected_type)):
+        rejected_reason = ""
+        if document is None:
+            rejected_reason = "引用的document_id不存在"
+        elif evidence_type not in EVIDENCE_TYPES:
+            rejected_reason = "证据类型无效"
+        elif expected_type and evidence_type != expected_type:
+            rejected_reason = f"本通道只接受{expected_type}"
+        if rejected_reason:
+            if rejections is not None:
+                rejections.append({
+                    "document_id": str(raw.get("document_id") or ""),
+                    "source": document.source if document else "",
+                    "returned_type": evidence_type, "expected_type": expected_type,
+                    "reason": rejected_reason,
+                })
             continue
         if len(quote) < 16 or not _literal_in(quote, document.text):
+            if rejections is not None:
+                rejections.append({
+                    "document_id": document.document_id, "source": document.source,
+                    "returned_type": evidence_type, "expected_type": expected_type,
+                    "reason": "逐字引文少于16字" if len(quote) < 16 else "引文不在已读取原文中",
+                })
             continue
         relation = str(raw.get("relation") or "其他").strip()
         if evidence_type in {"产业机制", "传导证据"} and relation not in RELATIONS:
@@ -501,10 +827,45 @@ def classify_documents(topic: str, documents: list[EvidenceDocument],
         )
         if not duplicate:
             candidates.append(item)
+        elif rejections is not None:
+            rejections.append({
+                "document_id": document.document_id, "source": document.source,
+                "returned_type": evidence_type, "expected_type": expected_type,
+                "reason": "同类逐字引文重复",
+            })
     rejected = max(0, len(raw_candidates) - len(candidates)) if isinstance(raw_candidates, list) else 0
     warnings = ([f"LLM 返回的 {rejected} 条候选未通过逐字原文、类型或来源校验，已丢弃。"]
                 if rejected else [])
     return candidates[:limit], warnings
+
+
+def _record_search_diagnostics(result: DiscoveryResult, searcher: object, *,
+                               channel: str, query: str,
+                               hits: list[SearchHit]) -> list[dict]:
+    take = getattr(searcher, "take_diagnostics", None)
+    diagnostics = take() if callable(take) else []
+    if not diagnostics:
+        provider = next((item.provider for item in hits if item.provider), "自定义搜索入口")
+        diagnostics = [{
+            "provider": provider, "query": query, "ok": True,
+            "hit_count": len(hits), "credits": 0.0, "error": "",
+        }]
+    for raw in diagnostics:
+        item = dict(raw)
+        provider = str(item.get("provider") or "未知搜索入口")
+        item["channel"] = channel
+        item["urls"] = [hit.url for hit in hits if (hit.provider or provider) == provider][:10]
+        result.search_calls_by_provider[provider] = result.search_calls_by_provider.get(provider, 0) + 1
+        try:
+            credits = float(item.get("credits") or 0.0)
+        except (TypeError, ValueError):
+            credits = 0.0
+        result.search_credits_by_provider[provider] = (
+            result.search_credits_by_provider.get(provider, 0.0) + credits)
+        if provider not in result.search_providers:
+            result.search_providers.append(provider)
+        result.search_audit.append(item)
+    return diagnostics
 
 
 def _collect_web_documents(queries: Iterable[str], *, channel: str, limit: int,
@@ -514,7 +875,8 @@ def _collect_web_documents(queries: Iterable[str], *, channel: str, limit: int,
                            filtered_urls: set[str] | None = None,
                            progress: Callable[[int, str], None] | None = None,
                            progress_start: int = 0,
-                           progress_end: int = 0) -> list[EvidenceDocument]:
+                           progress_end: int = 0,
+                           required_entity_aliases: Iterable[str] = ()) -> list[EvidenceDocument]:
     """为一个证据通道保留独立原文配额，不能被另一通道或本地材料占满。"""
     queries = list(queries)
     if not queries:
@@ -523,6 +885,7 @@ def _collect_web_documents(queries: Iterable[str], *, channel: str, limit: int,
     documents: list[EvidenceDocument] = []
     hits_before = result.search_hits_by_channel.get(channel, 0)
     failures_before = result.fetch_failures_by_channel.get(channel, 0)
+    required_entity_aliases = tuple(required_entity_aliases)
     span = max(0, progress_end - progress_start)
     for query_index, query in enumerate(queries):
         if span:
@@ -536,7 +899,16 @@ def _collect_web_documents(queries: Iterable[str], *, channel: str, limit: int,
         except Exception as error:  # noqa: BLE001 - per-query recovery is deliberate
             result.warnings.append(f"{channel}公开检索失败（{query[:36]}）：{type(error).__name__}")
             continue
+        diagnostics = _record_search_diagnostics(
+            result, searcher, channel=channel, query=query, hits=hits)
+        providers = " → ".join(str(item.get("provider") or "未知入口") for item in diagnostics)
         result.search_hits_by_channel[channel] = result.search_hits_by_channel.get(channel, 0) + len(hits)
+        if span:
+            _notify_progress(
+                progress,
+                progress_start + round(span * (query_index + 0.2) / max(1, len(queries))),
+                f"{channel}：{providers} 命中 {len(hits)} 条，正在读取正文…",
+            )
         query_start = progress_start + round(span * query_index / max(1, len(queries)))
         query_end = progress_start + round(span * (query_index + 1) / max(1, len(queries)))
         for hit_index, hit in enumerate(hits):
@@ -548,6 +920,21 @@ def _collect_web_documents(queries: Iterable[str], *, channel: str, limit: int,
                     f"正在读取{channel}原文（{hit_index + 1}/{len(hits)}）：{hit.title[:42]}…",
                 )
             if hit.url in seen_urls:
+                result.search_audit.append({
+                    "channel": channel, "provider": hit.provider or "未知入口",
+                    "query": query, "url": hit.url, "fetch_status": "跳过",
+                    "reason": "同一证据通道内URL重复",
+                })
+                continue
+            if required_entity_aliases and not _hit_matches_event_entity(hit, required_entity_aliases):
+                seen_urls.add(hit.url)
+                result.filtered_entity_mismatch_hits += 1
+                result.search_audit.append({
+                    "channel": channel, "provider": hit.provider or "未知入口",
+                    "query": query, "url": hit.url, "fetch_status": "淘汰",
+                    "reason": "网页标题、摘要和搜索正文均未出现事件主体或其确认别名",
+                    "required_entity_aliases": list(required_entity_aliases),
+                })
                 continue
             seen_urls.add(hit.url)
             if _is_low_value_hit(hit):
@@ -555,16 +942,35 @@ def _collect_web_documents(queries: Iterable[str], *, channel: str, limit: int,
                     result.filtered_low_value_hits += 1
                 if filtered_urls is not None:
                     filtered_urls.add(hit.url)
+                result.search_audit.append({
+                    "channel": channel, "provider": hit.provider or "未知入口",
+                    "query": query, "url": hit.url, "fetch_status": "淘汰",
+                    "reason": "纯行情、走势图或报价页",
+                })
                 continue
             try:
                 document = fetcher(hit)
-            except Exception:  # individual sites frequently block crawlers; skip, do not fail the run
+            except Exception as error:  # individual sites frequently block crawlers; skip, do not fail the run
                 document = None
+                fetch_error = f"{type(error).__name__}: {str(error)[:180]}"
+            else:
+                fetch_error = ""
             if document is not None:
                 documents.append(document)
+                result.search_audit.append({
+                    "channel": channel, "provider": hit.provider or "未知入口",
+                    "query": query, "url": hit.url, "fetch_status": "成功",
+                    "source_kind": document.source_kind,
+                    "chars": len(document.text),
+                })
             else:
                 result.fetch_failures_by_channel[channel] = (
                     result.fetch_failures_by_channel.get(channel, 0) + 1)
+                result.search_audit.append({
+                    "channel": channel, "provider": hit.provider or "未知入口",
+                    "query": query, "url": hit.url, "fetch_status": "失败",
+                    "reason": fetch_error or "正文为空、格式不支持或质量不足",
+                })
             if len(documents) >= limit:
                 break
         if len(documents) >= limit:
@@ -783,8 +1189,10 @@ def discover(topic: str, *, sources_dir: Path | None = None,
     local_docs = _assign_ids(local_documents(sources_dir or Path("sources"), topic=topic))
     result.searched_by_channel["已上传材料"] = len(local_docs)
 
-    searcher = searcher or search_web
+    searcher = searcher or build_searcher()
     fetcher = fetcher or fetch_document
+    result.configured_search_provider = str(getattr(searcher, "display_name", "自定义搜索入口"))
+    _notify_progress(progress, 12, f"正在使用 {result.configured_search_provider} 检索公开原文…")
     seen_urls: dict[str, set[str]] = {"事件事实": set(), "产业机制": set(), "A股暴露": set()}
     filtered_urls: set[str] = set()
     active_channels = [key for key in ("事件事实", "产业机制", "A股暴露") if key in wanted]
@@ -800,6 +1208,7 @@ def discover(topic: str, *, sources_dir: Path | None = None,
         filtered_urls=filtered_urls, progress=progress,
         progress_start=progress_ranges.get("事件事实", (0, 0))[0],
         progress_end=progress_ranges.get("事件事实", (0, 0))[1],
+        required_entity_aliases=_event_entity_profile(topic)[0],
     ))
     mechanism_docs = _assign_ids(_collect_web_documents(
         result.query_groups.get("产业机制", []), channel="产业机制", limit=MAX_MECHANISM_WEB_DOCUMENTS,
@@ -818,17 +1227,21 @@ def discover(topic: str, *, sources_dir: Path | None = None,
     _notify_progress(progress, 70, "原文读取完成，正在分类已上传材料…")
 
     # 四类输入独立送审：本地材料可命中任意类型，但不挤占三个外部通道的配额。
-    local_candidates, local_warnings = classify_documents(topic, local_docs, client, limit=6)
+    local_candidates, local_warnings = classify_documents(
+        topic, local_docs, client, limit=6, rejections=result.classification_rejections)
     local_candidates = [item for item in local_candidates if item.evidence_type in wanted]
     _notify_progress(progress, 73, "正在逐字校验事件事实候选…")
     fact_candidates, fact_warnings = classify_documents(
-        topic, fact_docs, client, expected_type="事件事实", limit=4)
+        topic, fact_docs, client, expected_type="事件事实", limit=4,
+        rejections=result.classification_rejections)
     _notify_progress(progress, 76, "正在逐字校验产业机制候选…")
     mechanism_candidates, mechanism_warnings = classify_documents(
-        topic, mechanism_docs, client, expected_type="产业机制", limit=4)
+        topic, mechanism_docs, client, expected_type="产业机制", limit=4,
+        rejections=result.classification_rejections)
     _notify_progress(progress, 79, "正在逐字校验A股暴露候选…")
     exposure_candidates, exposure_warnings = classify_documents(
-        topic, exposure_docs, client, expected_type="A股暴露", limit=4)
+        topic, exposure_docs, client, expected_type="A股暴露", limit=4,
+        rejections=result.classification_rejections)
     _notify_progress(progress, 82, "证据分类完成，正在检查是否需要定向补检…")
     result.warnings.extend([
         *local_warnings, *fact_warnings, *mechanism_warnings, *exposure_warnings,
@@ -846,7 +1259,8 @@ def discover(topic: str, *, sources_dir: Path | None = None,
             progress_start=82, progress_end=85,
         ))
         retry_candidates, retry_warnings = classify_documents(
-            topic, retry_docs, client, expected_type="产业机制", limit=4)
+            topic, retry_docs, client, expected_type="产业机制", limit=4,
+            rejections=result.classification_rejections)
         mechanism_candidates.extend(retry_candidates)
         result.warnings.extend(retry_warnings)
 
@@ -862,7 +1276,8 @@ def discover(topic: str, *, sources_dir: Path | None = None,
             progress_start=85, progress_end=88,
         ))
         retry_candidates, retry_warnings = classify_documents(
-            topic, retry_docs, client, expected_type="A股暴露", limit=4)
+            topic, retry_docs, client, expected_type="A股暴露", limit=4,
+            rejections=result.classification_rejections)
         exposure_candidates.extend(retry_candidates)
         result.warnings.extend(retry_warnings)
 
@@ -903,6 +1318,19 @@ def discover(topic: str, *, sources_dir: Path | None = None,
         result.warnings.append("三类证据均有候选，但未形成通过引用校验的组合传导链；请人工复核或补充直接传导证据。")
     if result.filtered_low_value_hits:
         result.warnings.append(f"已过滤 {result.filtered_low_value_hits} 条纯行情/走势图/报价页，它们不能作为事实、机制或暴露证据。")
+    if result.filtered_entity_mismatch_hits:
+        aliases = " / ".join(_event_entity_profile(topic)[0]) or "已识别事件主体"
+        result.warnings.append(
+            f"事件事实通道已在读取前过滤 {result.filtered_entity_mismatch_hits} 条主体不匹配结果；"
+            f"本轮主体锚点为 {aliases}。")
+    tavily_failures = sum(
+        item.get("provider") == "Tavily" and not item.get("ok")
+        for item in result.search_audit if isinstance(item, dict))
+    bing_calls = result.search_calls_by_provider.get("Bing RSS", 0)
+    if tavily_failures and bing_calls:
+        result.warnings.append(
+            f"Tavily 有 {tavily_failures} 次请求不可用或额度不足，系统已自动使用 Bing RSS 兜底；"
+            "具体原因和命中网址保留在检索审计中。")
     if not result.candidates:
         result.warnings.append("没有形成可直接确认的候选；可调整客户问题、上传材料，或继续手工录入。")
     _notify_progress(progress, 100, "自动查找完成，等待分析师审核。")

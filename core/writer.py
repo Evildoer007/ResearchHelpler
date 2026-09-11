@@ -284,7 +284,7 @@ def _chart_type(logic_id: str, doc_cats: dict | None = None) -> str:
 
 
 def _build_user_prompt(ma: MarketAnalysis) -> str:
-    from .planner import DOC_FIELD_PREFIX
+    from .planner import DOC_FIELD_PREFIX, EVENT_FIELD_PREFIX
 
     packages = []
     for lw in ma.logics:
@@ -297,7 +297,9 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
             "惯用图类型": _chart_type(lg.逻辑id, getattr(ma, "doc_cats", None)),
             "可用数据": [
                 {"字段": f.field, "值": f.display or str(f.value)}
-                for f in lw.auto if not f.field.startswith(DOC_FIELD_PREFIX)
+                for f in lw.auto
+                if not f.field.startswith(DOC_FIELD_PREFIX)
+                and not f.field.startswith(EVENT_FIELD_PREFIX)
             ],
             "缺失数据": [f.field for f in lw.gaps],
         }
@@ -323,6 +325,12 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
                              if getattr(claim, "证据范围", "") == "公司级" else
                              "仅可在该证据范围内表述，不得扩大外推。"),
                 }
+        event_cites = [f for f in lw.auto if f.field.startswith(EVENT_FIELD_PREFIX)]
+        if event_cites:
+            pkg["已确认事件传导主轴_只能依据所列原文和边界"] = [
+                {"出处": f.source, "证据链": f.display, "规则": f.note}
+                for f in event_cites
+            ]
         packages.append(pkg)
     # 板块全景：摸底取到但没进任何一条逻辑"所需字段"的那些数据。
     # 此前 writer 每条逻辑只看得到自己的 2~3 个触发字段，而摸底实际取了 17 个——
@@ -340,7 +348,8 @@ def _build_user_prompt(ma: MarketAnalysis) -> str:
     for name, fv in (ma.field_values or {}).items():
         if not isinstance(name, str) or name.startswith("__"):
             continue
-        if name.startswith(DOC_FIELD_PREFIX) or not getattr(fv, "ok", False):
+        if (name.startswith(DOC_FIELD_PREFIX) or name.startswith(EVENT_FIELD_PREFIX)
+                or not getattr(fv, "ok", False)):
             continue
         if name == "成分股明细":
             detail = fv.display

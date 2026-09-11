@@ -610,6 +610,16 @@ class EvidenceDiscoveryReviewDialog(QDialog):
         hit_text = "；".join(f"{name} {count} 条" for name, count in hit_counts.items()) or "—"
         failure_counts = payload.get("fetch_failures_by_channel") or {}
         failure_text = "；".join(f"{name} {count} 条" for name, count in failure_counts.items()) or "0"
+        entity_mismatch = int(payload.get("filtered_entity_mismatch_hits") or 0)
+        provider_text = ("、".join(str(item) for item in (payload.get("search_providers") or []))
+                         or str(payload.get("configured_search_provider") or "—"))
+        call_text = "；".join(
+            f"{name} {count} 次" for name, count in (payload.get("search_calls_by_provider") or {}).items()
+        ) or "—"
+        credit_text = "；".join(
+            f"{name} {float(value or 0):g} credits"
+            for name, value in (payload.get("search_credits_by_provider") or {}).items()
+        ) or "0"
         fact_count = sum(item.get("evidence_type") == "事件事实" for item in self.candidates)
         mechanism_count = sum(item.get("evidence_type") == "产业机制" for item in self.candidates)
         exposure_count = sum(item.get("evidence_type") == "A股暴露" for item in self.candidates)
@@ -620,8 +630,10 @@ class EvidenceDiscoveryReviewDialog(QDialog):
         )
         hint.setWordWrap(True)
         diagnostics_text = (
-            f"分阶段检索：{queries}\n读取原文：{payload.get('searched_documents') or 0} 份（{channel_text}）"
+            f"搜索服务：{provider_text}；调用：{call_text}；额度：{credit_text}"
+            f"\n分阶段检索：{queries}\n读取原文：{payload.get('searched_documents') or 0} 份（{channel_text}）"
             f"\n搜索命中：{hit_text}；正文读取/质量失败：{failure_text}"
+            f"；事件主体不匹配过滤：{entity_mismatch} 条"
             f"\n候选：事件事实 {fact_count}；产业机制 {mechanism_count}；A股暴露 {exposure_count}；"
             f"直接传导 {link_count}；组合链 {len(self.chains)}"
             + (f"\n提示：\n" + "\n".join(f"• {item}" for item in (payload.get("warnings") or []))
@@ -629,7 +641,7 @@ class EvidenceDiscoveryReviewDialog(QDialog):
         )
         diagnostics = QPlainTextEdit(diagnostics_text)
         diagnostics.setReadOnly(True)
-        diagnostics.setMaximumHeight(135)
+        diagnostics.setMaximumHeight(160)
         diagnostics.setStyleSheet("color:#666; background:#f7f7f8;")
         open_source = QPushButton("打开当前候选来源")
         as_fact = QPushButton("改为事件事实")
@@ -828,6 +840,8 @@ class EventEvidenceDialog(QDialog):
         self.exposures = [dict(item) for item in (evidence.get("A股暴露") or []) if isinstance(item, dict)]
         self.chains = [dict(item) for item in (evidence.get("组合传导链") or []) if isinstance(item, dict)]
         self.links = [dict(item) for item in (evidence.get("传导关系") or []) if isinstance(item, dict)]
+        self.discovery_audit = [dict(item) for item in (evidence.get("检索审计") or [])
+                                if isinstance(item, dict)]
         self.fact_list, self.mechanism_list = QListWidget(), QListWidget()
         self.exposure_list, self.chain_list, self.link_list = QListWidget(), QListWidget(), QListWidget()
         self.topic = topic
@@ -1000,12 +1014,34 @@ class EventEvidenceDialog(QDialog):
             QMessageBox.warning(self, "自动查找失败", detail)
             return
         candidates = payload.get("candidates") or []
+        self.discovery_audit.append({
+            "时间": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "阶段": self.discovery_mode,
+            "配置的搜索服务": str(payload.get("configured_search_provider") or ""),
+            "实际搜索服务": list(payload.get("search_providers") or []),
+            "检索词": dict(payload.get("query_groups") or {}),
+            "搜索调用": dict(payload.get("search_calls_by_provider") or {}),
+            "额度消耗": dict(payload.get("search_credits_by_provider") or {}),
+            "命中统计": dict(payload.get("search_hits_by_channel") or {}),
+            "正文读取": dict(payload.get("searched_by_channel") or {}),
+            "读取失败": dict(payload.get("fetch_failures_by_channel") or {}),
+            "主体不匹配过滤": int(payload.get("filtered_entity_mismatch_hits") or 0),
+            "搜索与读取明细": list(payload.get("search_audit") or []),
+            "分类淘汰": list(payload.get("classification_rejections") or []),
+            "提示": list(payload.get("warnings") or []),
+        })
         fact_count = sum(item.get("evidence_type") == "事件事实" for item in candidates if isinstance(item, dict))
         mechanism_count = sum(item.get("evidence_type") == "产业机制" for item in candidates if isinstance(item, dict))
         exposure_count = sum(item.get("evidence_type") == "A股暴露" for item in candidates if isinstance(item, dict))
         link_count = sum(item.get("evidence_type") == "传导证据" for item in candidates if isinstance(item, dict))
+        providers = ("、".join(str(item) for item in (payload.get("search_providers") or []))
+                     or str(payload.get("configured_search_provider") or "未知搜索入口"))
+        credits = sum(float(value or 0) for value in (payload.get("search_credits_by_provider") or {}).values())
         self.discovery_status.setText(
-            f"本次读取 {payload.get('searched_documents') or 0} 份原文，形成事件事实 {fact_count} 条、"
+            f"{providers} 共命中 {sum((payload.get('search_hits_by_channel') or {}).values())} 条、"
+            f"读取 {payload.get('searched_documents') or 0} 份原文、消耗 {credits:g} credits；"
+            f"过滤主体不匹配 {int(payload.get('filtered_entity_mismatch_hits') or 0)} 条；"
+            f"形成事件事实 {fact_count} 条、"
             f"产业机制 {mechanism_count} 条、A股暴露 {exposure_count} 条、直接传导 {link_count} 条，"
             f"组合链 {len(payload.get('chains') or [])} 条待审核。"
         )
@@ -1280,7 +1316,7 @@ class EventEvidenceDialog(QDialog):
     def payload(self) -> dict:
         return {"事件事实": list(self.facts), "产业机制": list(self.mechanisms),
                 "A股暴露": list(self.exposures), "组合传导链": list(self.chains),
-                "传导关系": list(self.links)}
+                "传导关系": list(self.links), "检索审计": list(self.discovery_audit)}
 
 
 class LogicPickDialog(QDialog):
@@ -1291,21 +1327,32 @@ class LogicPickDialog(QDialog):
         self.setWindowTitle("选择本次报告逻辑")
         self.resize(900, 650)
         self._auto = False
+        self.require_event_chain = bool(payload.get("require_event_chain"))
+        self._payload_candidates = [
+            dict(item) for item in (payload.get("candidates") or []) if isinstance(item, dict)
+        ]
         suggested = {int(item) for item in (payload.get("suggested") or []) if str(item).isdigit()}
         self.suggested = suggested
         self.checks: list[tuple[int, QCheckBox]] = []
-        hint = QLabel(
+        hint_text = (
             "请选择 2–3 条作为报告正文主轴。数据触发项来自已核验行情；材料提炼项仅在您核对原文后才应勾选。"
             "“采用系统建议”只按证据质量和结构组合，不替代专业判断。")
+        if self.require_event_chain:
+            hint_text += " 本次是事件型报告，至少必须选择一条“已确认事件传导”。"
+        hint = QLabel(hint_text)
         hint.setWordWrap(True)
         self.list = QListWidget()
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        for raw in payload.get("candidates") or []:
+        for raw in self._payload_candidates:
             try:
                 index = int(raw.get("index"))
             except (TypeError, ValueError):
                 continue
-            source_kind = "数据触发" if raw.get("kind") == "thesis" else "材料原文（请核对）"
+            source_kind = ({
+                "thesis": "数据触发",
+                "event": "已确认事件传导",
+                "doc": "材料原文（请核对）",
+            }).get(str(raw.get("kind") or ""), "其他")
             boundary = ""
             if raw.get("kind") == "doc" and raw.get("evidence_scope"):
                 scope = str(raw.get("evidence_scope"))
@@ -1346,9 +1393,22 @@ class LogicPickDialog(QDialog):
             check.setChecked(index in self.suggested)
 
     def _confirm(self) -> None:
-        if not self.selected_indices():
+        selected = self.selected_indices()
+        if not selected:
             QMessageBox.information(self, "请选择逻辑", "请至少勾选一条逻辑，或选择“交由系统自动挑选”。")
             return
+        if self.require_event_chain:
+            selected_set = set(selected)
+            has_event = any(
+                int(raw.get("index") or 0) in selected_set and raw.get("kind") == "event"
+                for raw in self._payload_candidates
+            )
+            if not has_event:
+                QMessageBox.information(
+                    self, "缺少事件传导主轴",
+                    "事件型报告至少需要勾选一条“已确认事件传导”，否则正文无法回答事件如何影响A股对象。",
+                )
+                return
         self.accept()
 
     def _automatic(self) -> None:
@@ -1597,13 +1657,15 @@ class BatchQuoteInclusionDialog(QDialog):
 
 
 class QuoteUnderlyingPoolDialog(QDialog):
-    """确认客户点名或系统发现的待报价标的；不在此处评价产品适配度。"""
+    """确认待报价标的；系统扩展候选只有在分析师主动展开后才显示。"""
 
-    def __init__(self, parent: QWidget | None, *, candidates: list[dict]) -> None:
+    def __init__(self, parent: QWidget | None, *, candidates: list[dict],
+                 alternatives: list[dict] | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("确认待报价标的")
         self.resize(860, 500)
         self.checks: list[tuple[str, QCheckBox]] = []
+        self._alternatives = [dict(item) for item in (alternatives or [])]
         candidate_provided = any(
             str(item.get("origin") or "") in {"系统推荐", "研究取数目标"}
             for item in candidates
@@ -1619,18 +1681,21 @@ class QuoteUnderlyingPoolDialog(QDialog):
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#8a5b14;")
         list_box = QWidget()
-        list_layout = QVBoxLayout(list_box)
-        list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout = QVBoxLayout(list_box)
+        self.list_layout.setContentsMargins(0, 0, 0, 0)
+        self.list_layout.addStretch()
         for item in candidates:
-            code = str(item.get("code") or "").strip().upper()
-            name = str(item.get("name") or "").strip()
-            origin = str(item.get("origin") or "客户指定")
-            note = str(item.get("note") or "由 OptionHelper 独立核验、定价")
-            check = QCheckBox(f"{code}｜{name or origin}｜{origin}\n{note}")
-            check.setChecked(True)
-            list_layout.addWidget(check)
-            self.checks.append((code, check))
-        list_layout.addStretch()
+            self._add_candidate(item, checked=True)
+        self.compare_button = QPushButton(f"比较其他同主题工具（{len(self._alternatives)}）")
+        self.compare_button.setVisible(bool(self._alternatives))
+        self.compare_button.clicked.connect(self._show_alternatives)
+        self.compare_hint = QLabel(
+            "其他工具只是系统发现的同主题候选，尚未形成与本次研究完全一致的标的级观点。"
+            "只有主动展开并勾选后，才会进入多标的 OptionHelper 审核。"
+        )
+        self.compare_hint.setWordWrap(True)
+        self.compare_hint.setProperty("kind", "caption")
+        self.compare_hint.setVisible(bool(self._alternatives))
         confirm, cancel = QPushButton("进入逐标的报价审核"), QPushButton("取消")
         confirm.clicked.connect(self._submit)
         cancel.clicked.connect(self.reject)
@@ -1638,7 +1703,27 @@ class QuoteUnderlyingPoolDialog(QDialog):
         layout.addWidget(hint)
         layout.addWidget(QLabel("待报价池"))
         layout.addWidget(list_box)
+        layout.addWidget(self.compare_button)
+        layout.addWidget(self.compare_hint)
         layout.addWidget(ResearchHelperWindow._row(confirm, cancel))
+
+    def _add_candidate(self, item: dict, *, checked: bool) -> None:
+        code = str(item.get("code") or "").strip().upper()
+        name = str(item.get("name") or "").strip()
+        origin = str(item.get("origin") or "客户指定")
+        note = str(item.get("note") or "由 OptionHelper 独立核验、定价")
+        check = QCheckBox(f"{code}｜{name or '名称待核验'}｜{origin}\n{note}")
+        check.setChecked(checked)
+        # stretch 始终位于末尾；扩展候选应插在它前面。
+        self.list_layout.insertWidget(max(0, self.list_layout.count() - 1), check)
+        self.checks.append((code, check))
+
+    def _show_alternatives(self) -> None:
+        for item in self._alternatives:
+            self._add_candidate(item, checked=False)
+        self._alternatives = []
+        self.compare_button.hide()
+        self.compare_hint.setText("已展开其他同主题工具；请只勾选确实需要进行标的级审核的项目。")
 
     def _submit(self) -> None:
         if not self.selected_codes():
@@ -1679,6 +1764,193 @@ class LlmSettingsDialog(QDialog):
         config["DEEPSEEK_MODEL"] = self.model.currentText()
         if self.key.text().strip():
             config["DEEPSEEK_API_KEY"] = self.key.text().strip()
+        try:
+            LOCAL_CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as error:
+            QMessageBox.warning(self, "保存失败", str(error))
+            return
+        self.accept()
+
+
+class SearchSettingsDialog(QDialog):
+    """管理事件证据公开检索；秘密只写本机配置，连接测试在子进程执行。"""
+
+    RESULT_PREFIX = "SEARCH_CONNECTION_RESULT="
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("搜索设置（仅本机）")
+        self.resize(620, 390)
+        self.config = _load_json(LOCAL_CONFIG)
+        self.test_process: QProcess | None = None
+        self.test_output = ""
+        self.test_error = ""
+
+        self.provider = QComboBox()
+        self.provider.addItem("Tavily（推荐，清洗正文）", "tavily")
+        self.provider.addItem("Bing RSS（免费搜索入口）", "bing")
+        provider = str(self.config.get("SEARCH_PROVIDER") or "tavily").lower()
+        self.provider.setCurrentIndex(max(0, self.provider.findData(provider)))
+
+        self.key = QLineEdit()
+        self.key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key.setPlaceholderText("已配置；留空则不修改")
+
+        self.depth = QComboBox()
+        self.depth.addItem("基础搜索（1 credit/次）", "basic")
+        self.depth.addItem("高级搜索（2 credits/次）", "advanced")
+        depth = str(self.config.get("SEARCH_DEPTH") or "basic").lower()
+        self.depth.setCurrentIndex(max(0, self.depth.findData(depth)))
+
+        self.country = QComboBox()
+        self.country.addItem("不限定国家", "")
+        self.country.addItem("中国", "china")
+        self.country.addItem("美国", "united states")
+        self.country.addItem("英国", "united kingdom")
+        self.country.addItem("韩国", "south korea")
+        self.country.addItem("日本", "japan")
+        country = str(self.config.get("SEARCH_COUNTRY") or "china").lower()
+        index = self.country.findData(country)
+        self.country.setCurrentIndex(index if index >= 0 else 0)
+
+        self.language = QComboBox()
+        self.language.addItem("不限定语言", "")
+        self.language.addItem("简体中文优先", "zh-cn")
+        self.language.addItem("英文优先", "en")
+        language = str(self.config.get("SEARCH_LANGUAGE") or "zh-cn").lower()
+        index = self.language.findData(language)
+        self.language.setCurrentIndex(index if index >= 0 else 0)
+
+        self.fallback = QCheckBox("Tavily 不可用、额度不足或无结果时自动使用 Bing RSS")
+        raw_fallback = self.config.get("SEARCH_BING_FALLBACK", True)
+        enabled = (raw_fallback if isinstance(raw_fallback, bool) else
+                   str(raw_fallback).lower() not in {"0", "false", "no", "off"})
+        self.fallback.setChecked(bool(enabled))
+        self.status = QLabel("尚未测试连接。测试 Tavily 固定使用基础搜索，预计消耗 1 credit。")
+        self.status.setWordWrap(True)
+        self.status.setProperty("kind", "caption")
+        hint = QLabel(
+            "Tavily API Key 仅写入本机 config.local.json（Git 已忽略），不会写入运行日志。"
+            "环境变量 TAVILY_API_KEY 具有更高优先级。国家和语言仅用于结果排序偏好，不强制过滤其他来源。"
+        )
+        hint.setWordWrap(True)
+
+        self.test_button = QPushButton("测试连接")
+        self.save_button = QPushButton("保存设置")
+        cancel = QPushButton("取消")
+        self.test_button.clicked.connect(self.test_connection)
+        self.save_button.clicked.connect(self.save)
+        cancel.clicked.connect(self.reject)
+        self.provider.currentIndexChanged.connect(self._sync_provider)
+
+        form = QFormLayout(self)
+        form.addRow("搜索提供商", self.provider)
+        form.addRow("Tavily API Key", self.key)
+        form.addRow("搜索深度", self.depth)
+        form.addRow("国家偏好", self.country)
+        form.addRow("语言偏好", self.language)
+        form.addRow("失败兜底", self.fallback)
+        form.addRow("", hint)
+        form.addRow("连接状态", self.status)
+        form.addRow("", ResearchHelperWindow._row(self.test_button, self.save_button, cancel))
+        self._sync_provider()
+
+    def _sync_provider(self) -> None:
+        tavily = self.provider.currentData() == "tavily"
+        self.key.setEnabled(tavily)
+        self.depth.setEnabled(tavily)
+        self.country.setEnabled(tavily)
+        self.language.setEnabled(tavily)
+        self.fallback.setEnabled(tavily)
+
+    def _settings(self) -> dict:
+        values = {
+            "provider": str(self.provider.currentData() or "tavily"),
+            "search_depth": str(self.depth.currentData() or "basic"),
+            "country": str(self.country.currentData() or ""),
+            "language": str(self.language.currentData() or ""),
+            "bing_fallback": self.fallback.isChecked(),
+        }
+        if self.key.text().strip():
+            values["api_key"] = self.key.text().strip()
+        return values
+
+    def test_connection(self) -> None:
+        if self.test_process is not None:
+            return
+        from core import config as runtime_config
+        if self.provider.currentData() == "tavily" and not (
+                self.key.text().strip() or self.config.get("TAVILY_API_KEY")
+                or runtime_config.TAVILY_API_KEY):
+            QMessageBox.information(self, "缺少 Tavily API Key", "请先填写 API Key，再测试连接。")
+            return
+        self.test_output = ""
+        self.test_error = ""
+        process = QProcess(self)
+        process.setWorkingDirectory(str(ROOT))
+        process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+        process.readyReadStandardOutput.connect(
+            lambda: self._read_test_stream(standard_output=True))
+        process.readyReadStandardError.connect(
+            lambda: self._read_test_stream(standard_output=False))
+        process.finished.connect(self._finish_test)
+        process.errorOccurred.connect(self._test_process_error)
+        self.test_process = process
+        self.test_button.setEnabled(False)
+        self.save_button.setEnabled(False)
+        self.status.setText("正在测试搜索入口，请稍候…")
+        process.start(sys.executable, [str(ROOT / "core" / "search_test_worker.py")])
+        process.write(json.dumps(self._settings(), ensure_ascii=False).encode("utf-8"))
+        process.closeWriteChannel()
+
+    def _read_test_stream(self, *, standard_output: bool) -> None:
+        if not self.test_process:
+            return
+        raw = (self.test_process.readAllStandardOutput() if standard_output
+               else self.test_process.readAllStandardError())
+        value = bytes(raw).decode("utf-8", errors="replace")
+        if standard_output:
+            self.test_output += value
+        else:
+            self.test_error += value
+
+    def _finish_test(self, _exit_code: int, _status) -> None:
+        self._read_test_stream(standard_output=True)
+        self._read_test_stream(standard_output=False)
+        self.test_process = None
+        self.test_button.setEnabled(True)
+        self.save_button.setEnabled(True)
+        try:
+            line = next(item for item in reversed(self.test_output.splitlines())
+                        if item.startswith(self.RESULT_PREFIX))
+            result = json.loads(line[len(self.RESULT_PREFIX):])
+        except (StopIteration, json.JSONDecodeError):
+            self.status.setText("连接测试失败：" + (self.test_error.strip()[-300:] or "未返回测试结果"))
+            return
+        if result.get("ok"):
+            sample = str(result.get("sample_title") or "已连接")
+            credits = result.get("credits") or 0
+            self.status.setText(
+                f"连接成功｜{result.get('provider') or '搜索入口'}｜测试命中：{sample}｜本次 credits：{credits}")
+        else:
+            self.status.setText(
+                f"连接失败｜{result.get('provider') or '搜索入口'}｜{result.get('error') or '未返回原因'}")
+
+    def _test_process_error(self, _error) -> None:
+        self.test_button.setEnabled(True)
+        self.save_button.setEnabled(True)
+        self.status.setText("连接测试进程无法启动；请检查当前 Python 环境与网络设置。")
+
+    def save(self) -> None:
+        values = self._settings()
+        config = _load_json(LOCAL_CONFIG)
+        config["SEARCH_PROVIDER"] = values["provider"]
+        config["SEARCH_DEPTH"] = values["search_depth"]
+        config["SEARCH_COUNTRY"] = values["country"]
+        config["SEARCH_LANGUAGE"] = values["language"]
+        config["SEARCH_BING_FALLBACK"] = values["bing_fallback"]
+        if values.get("api_key"):
+            config["TAVILY_API_KEY"] = values["api_key"]
         try:
             LOCAL_CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as error:
@@ -1917,6 +2189,11 @@ class MarketConfirmationDialog(QDialog):
         self.partial_exposure_confirmed.setToolTip(
             "只用于部分暴露 ETF；证券真实性、跟踪指数真实性和流动性不足不能通过此项绕过。"
         )
+        # 下拉框只承担路径选择，不随宽窗口横向铺满；长说明由下方可换行标签展示。
+        self.mode.setMaximumWidth(560)
+        self.market.setMaximumWidth(240)
+        self.scope.setMaximumWidth(720)
+        self.underlying.setMaximumWidth(720)
 
         errors = payload.get("errors") or []
         notice = str(payload.get("notice") or "")
@@ -2236,6 +2513,11 @@ class ResearchHelperWindow(QMainWindow):
         self.preference.setPlaceholderText("例如：更偏上涨参与（可选）")
         self.quote = QCheckBox("研究完成后准备正式报价审核")
         self.quote.setChecked(True)
+        self.force_event = QCheckBox("按事件驱动型处理（启用事件证据硬门）")
+        self.force_event.setToolTip(
+            "勾选后不再依赖 LLM 判断报告类型；本次运行必须确认事件事实、产业机制、"
+            "A股暴露及组合传导链，或提供可直接证明传导的原文。"
+        )
         self.pdf = QCheckBox("导出 PDF 并校验一页（正式交付必需）")
         self.pdf.setChecked(True)
         self.source_label = QLabel("未添加补充材料（可选；支持 PDF 上传或粘贴文字）")
@@ -2252,6 +2534,7 @@ class ResearchHelperWindow(QMainWindow):
         edit_evidence = QPushButton("管理事件证据")
         clear_evidence = QPushButton("清空")
         llm_settings = QPushButton("LLM 设置")
+        search_settings = QPushButton("搜索设置")
         ifind_settings = QPushButton("iFinD 凭证")
         choose_override.clicked.connect(self.choose_override)
         edit_override.clicked.connect(self.edit_override)
@@ -2260,7 +2543,9 @@ class ResearchHelperWindow(QMainWindow):
         open_sources.clicked.connect(self.open_sources_folder)
         edit_evidence.clicked.connect(self.edit_event_evidence)
         clear_evidence.clicked.connect(self.clear_event_evidence)
+        self.force_event.toggled.connect(self._refresh_evidence_summary)
         llm_settings.clicked.connect(self.edit_llm_settings)
+        search_settings.clicked.connect(self.edit_search_settings)
         ifind_settings.clicked.connect(self.edit_ifind_credentials)
         self.run_button = QPushButton("开始生成")
         self.run_button.setProperty("role", "primary")
@@ -2322,12 +2607,12 @@ class ResearchHelperWindow(QMainWindow):
 
         # 按钮保持紧凑单行高度，窄屏时由左栏滚动承接，避免高按钮叠压相邻控件。
         for button in (upload_sources, paste_sources, open_sources, choose_override, edit_override,
-                       edit_evidence, clear_evidence, llm_settings, ifind_settings,
+                       edit_evidence, clear_evidence, llm_settings, search_settings, ifind_settings,
                        self.run_button, self.stop_run_button, self.quote_review_button, self.cancel_quote_job_button,
                        self.retry_quote_job_button, self.include_quote_button):
             button.setMinimumHeight(24)
         for button in (upload_sources, paste_sources, open_sources, choose_override, edit_override,
-                       edit_evidence, llm_settings, ifind_settings):
+                       edit_evidence, llm_settings, search_settings, ifind_settings):
             button.setMinimumWidth(138)
         self.quote_review_button.setMinimumWidth(270)
 
@@ -2368,10 +2653,13 @@ class ResearchHelperWindow(QMainWindow):
         material_layout.addWidget(self._row(upload_sources, paste_sources, open_sources))
         form.addRow("补充材料", material_box)
 
-        evidence_box = QWidget()
+        evidence_box = QFrame()
+        evidence_box.setObjectName("eventEvidenceBox")
+        self.event_evidence_box = evidence_box
         evidence_layout = QVBoxLayout(evidence_box)
-        evidence_layout.setContentsMargins(0, 0, 0, 0)
+        evidence_layout.setContentsMargins(10, 9, 10, 9)
         evidence_layout.setSpacing(7)
+        evidence_layout.addWidget(self.force_event)
         evidence_layout.addWidget(self.evidence_label)
         evidence_layout.addWidget(self._row(edit_evidence, clear_evidence))
         form.addRow("事件型需求", evidence_box)
@@ -2384,6 +2672,7 @@ class ResearchHelperWindow(QMainWindow):
         override_layout.addWidget(self._row(choose_override, edit_override))
         form.addRow("人工数据补充", override_box)
         form.addRow("分析模型", self._row(llm_settings))
+        form.addRow("公开资料检索", self._row(search_settings))
         form.addRow("数据与报价凭证", self._row(ifind_settings))
         form.addRow(_section_label("3. 运行与交付"))
         form.addRow("", self._row(self.run_button, self.stop_run_button))
@@ -2567,6 +2856,8 @@ class ResearchHelperWindow(QMainWindow):
     def _sync_evidence_from_override(self, path: str) -> None:
         """兼容旧补数文件：其中已有事件证据时同步展示为表单状态。"""
         raw = _load_json(Path(path))
+        if "强制事件驱动" in raw:
+            self.force_event.setChecked(bool(raw.get("强制事件驱动")))
         evidence = raw.get("事件证据") if isinstance(raw, dict) else None
         if not isinstance(evidence, dict):
             return
@@ -2585,10 +2876,22 @@ class ResearchHelperWindow(QMainWindow):
         exposures = len(self.event_evidence.get("A股暴露") or [])
         chains = len(self.event_evidence.get("组合传导链") or [])
         links = len(self.event_evidence.get("传导关系") or [])
+        forced = self.force_event.isChecked()
+        if forced:
+            self.event_evidence_box.setStyleSheet(
+                "QFrame#eventEvidenceBox {background:#fff7ed; border:1px solid #d97706; "
+                "border-radius:10px;}"
+                "QCheckBox {color:#9a4f00; font-weight:700;}"
+            )
+        else:
+            self.event_evidence_box.setStyleSheet(
+                "QFrame#eventEvidenceBox {background:transparent; border:1px solid transparent;}"
+            )
         if facts and (links or (mechanisms and exposures and chains)):
             detail = (f"直接传导 {links} 条" if links else
                       f"产业机制 {mechanisms} 条，A股暴露 {exposures} 条，组合链 {chains} 条")
-            self.evidence_label.setText(f"已录入：事件事实 {facts} 条，{detail}。")
+            prefix = "已启用事件驱动硬门；" if forced else ""
+            self.evidence_label.setText(f"{prefix}已录入：事件事实 {facts} 条，{detail}。")
             self.evidence_label.setStyleSheet("color:#176b3a;")
         else:
             missing = []
@@ -2600,11 +2903,18 @@ class ResearchHelperWindow(QMainWindow):
                 missing.append("A股暴露")
             if not links and mechanisms and exposures and not chains:
                 missing.append("组合传导链")
-            self.evidence_label.setText(
-                "仅事件型需求需要确认：" + "、".join(missing)
-                + "。可自动查找候选；普通板块/ETF研究无需处理。"
-            )
-            self.evidence_label.setStyleSheet("color:#8a5b14;")
+            if forced:
+                self.evidence_label.setText(
+                    "已启用事件驱动型，本次运行将强制进入事件证据流程。当前待确认："
+                    + "、".join(missing) + "。可以先管理证据，也可在运行中自动查找候选。"
+                )
+                self.evidence_label.setStyleSheet("color:#9a4f00; font-weight:600;")
+            else:
+                self.evidence_label.setText(
+                    "仅事件型需求需要确认：" + "、".join(missing)
+                    + "。可自动查找候选；普通板块/ETF研究无需处理。"
+                )
+                self.evidence_label.setStyleSheet("color:#8a5b14;")
 
     def edit_event_evidence(self) -> None:
         dialog = EventEvidenceDialog(self, self.event_evidence, topic=self.prompt.toPlainText().strip())
@@ -2639,6 +2949,10 @@ class ResearchHelperWindow(QMainWindow):
             data["事件证据"] = {"事件事实": facts, "产业机制": mechanisms,
                                   "A股暴露": exposures, "组合传导链": chains,
                                   "传导关系": links}
+        if self.force_event.isChecked():
+            data["强制事件驱动"] = True
+        else:
+            data.pop("强制事件驱动", None)
         return data
 
     def _write_generated_override(self, data: dict) -> str:
@@ -2680,7 +2994,15 @@ class ResearchHelperWindow(QMainWindow):
 
     @staticmethod
     def _quote_underlying_candidates(summary: dict, fallback: str) -> list[dict]:
-        """构建本次待报价池：客户点名优先，否则采用运行时冻结的系统候选。"""
+        """构建默认待报价池；系统扩展候选默认隐藏，避免误当成可报价结论。"""
+        return ResearchHelperWindow._quote_underlying_candidates_with_options(
+            summary, fallback, include_system_discovered=False)
+
+    @staticmethod
+    def _quote_underlying_candidates_with_options(
+        summary: dict, fallback: str, *, include_system_discovered: bool,
+    ) -> list[dict]:
+        """构建报价池，并按代码合并角色、正式名称及动态发现说明。"""
         from core.brief import _SECURITY_CODE_RE
         request = str(summary.get("request") or "")
         client_candidates: list[dict] = [
@@ -2688,37 +3010,100 @@ class ResearchHelperWindow(QMainWindow):
              "note": "客户原始需求中明确写入的代码"}
             for match in _SECURITY_CODE_RE.finditer(request)
         ]
-        candidates: list[dict] = list(client_candidates)
+        metadata = summary.get("metadata") or {}
+        raw = metadata.get("系统建议挂钩工具") or "[]"
+        try:
+            suggested = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            suggested = []
+        system_candidates: list[dict] = []
+        for item in suggested if isinstance(suggested, list) else []:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("code") or "").strip().upper()
+            if not re.fullmatch(r"\d{6}\.(?:SH|SZ)", code):
+                continue
+            system_candidates.append({
+                "code": code,
+                "name": str(item.get("name") or "").strip(),
+                "origin": "系统推荐",
+                "note": str(item.get("note") or "").strip(),
+            })
+        system_by_code = {item["code"]: item for item in system_candidates}
+
+        def enrich(item: dict) -> dict:
+            """角色以客户/研究选择为准，名称与理由采用同代码的完整核验信息。"""
+            result = dict(item)
+            matched = system_by_code.get(str(result.get("code") or "").upper()) or {}
+            if not str(result.get("name") or "").strip() and matched.get("name"):
+                result["name"] = matched["name"]
+            # 通用占位说明不应遮住动态发现阶段已经取得的具体主题/流动性依据。
+            if matched.get("note"):
+                result["note"] = matched["note"]
+            return result
+
+        # 客户明确点名时，只保留客户范围；同代码系统记录只用于补全名称与说明。
+        if client_candidates:
+            return ResearchHelperWindow._merge_quote_candidates(
+                [enrich(item) for item in client_candidates])
+
         fallback = str(fallback or "").strip().upper()
-        # 客户已点名时严格保持客户给出的比较范围，不混入系统自行发现的其它标的。
-        # 客户未点名时，主题 ETF 研究目标只是报价池中的优先候选，不能遮住同批
-        # 动态发现结果；分析师应在一个窗口里看到并选择所有可用候选。
-        if not client_candidates:
-            if fallback:
-                candidates.append({
-                    "code": fallback, "name": "", "origin": "研究取数目标",
-                    "note": "需求解析页用于主题 ETF 真实成分取数；报价前仍需再次确认",
-                })
-            raw = (summary.get("metadata") or {}).get("系统建议挂钩工具") or "[]"
-            try:
-                suggested = json.loads(raw) if isinstance(raw, str) else raw
-            except (TypeError, json.JSONDecodeError):
-                suggested = []
-            for item in suggested if isinstance(suggested, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                code = str(item.get("code") or "").strip().upper()
-                if not re.fullmatch(r"\d{6}\.(?:SH|SZ)", code):
-                    continue
-                candidates.append({"code": code, "name": str(item.get("name") or ""),
-                                   "origin": "系统推荐", "note": str(item.get("note") or "")})
-        unique: list[dict] = []
-        seen: set[str] = set()
-        for item in candidates:
-            if item["code"] not in seen:
-                unique.append(item)
-                seen.add(item["code"])
-        return unique
+        candidates: list[dict] = []
+        if fallback:
+            confirmation = metadata.get("分析师确认") or {}
+            if isinstance(confirmation, str):
+                try:
+                    confirmation = json.loads(confirmation)
+                except json.JSONDecodeError:
+                    confirmation = {}
+            confirmed_name = ""
+            if isinstance(confirmation, dict) and str(
+                    confirmation.get("underlying_code") or "").strip().upper() == fallback:
+                confirmed_name = str(confirmation.get("underlying_name") or "").strip()
+            candidates.append(enrich({
+                "code": fallback, "name": confirmed_name, "origin": "研究取数目标",
+                "note": "需求解析页用于主题 ETF 真实成分取数；报价前仍需再次确认",
+            }))
+            if include_system_discovered:
+                candidates.extend(system_candidates)
+        elif system_candidates:
+            # 标准行业/人工篮子没有研究 ETF 时，默认给出排名第一的系统候选；其余
+            # 只有在分析师主动选择“比较其他同主题工具”后才显示。
+            candidates.extend(system_candidates if include_system_discovered else system_candidates[:1])
+        return ResearchHelperWindow._merge_quote_candidates(candidates)
+
+    @staticmethod
+    def _merge_quote_candidates(candidates: list[dict]) -> list[dict]:
+        """稳定去重并保留同代码记录中更完整的名称、说明和高优先级角色。"""
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+        origin_priority = {"客户点名": 3, "研究取数目标": 2, "系统推荐": 1}
+        for raw in candidates:
+            code = str(raw.get("code") or "").strip().upper()
+            if not re.fullmatch(r"\d{6}\.(?:SH|SZ)", code):
+                continue
+            item = dict(raw)
+            item["code"] = code
+            if code not in merged:
+                merged[code] = item
+                order.append(code)
+                continue
+            current = merged[code]
+            if not str(current.get("name") or "").strip() and str(item.get("name") or "").strip():
+                current["name"] = str(item.get("name") or "").strip()
+            current_origin = str(current.get("origin") or "")
+            item_origin = str(item.get("origin") or "")
+            if origin_priority.get(item_origin, 0) > origin_priority.get(current_origin, 0):
+                current["origin"] = item_origin
+            # 具体检索说明优先于通用占位说明，但同一句不会被重复拼接。
+            current_note = str(current.get("note") or "").strip()
+            item_note = str(item.get("note") or "").strip()
+            if item_note and (not current_note or current_note.startswith("需求解析页用于")):
+                current["note"] = item_note
+            for key, value in item.items():
+                if key not in current or current[key] in (None, "", [], {}):
+                    current[key] = value
+        return [merged[code] for code in order]
 
     def _start_recommender_batch(self, *, summary: dict, request: str,
                                  underlyings: list[str], candidates: list[dict] | None = None) -> None:
@@ -3117,13 +3502,19 @@ class ResearchHelperWindow(QMainWindow):
         request = str(summary.get("request") or "").strip()
         underlying, research_only = self._confirmed_underlying(summary)
         candidates = self._quote_underlying_candidates(summary, underlying)
+        expanded_candidates = self._quote_underlying_candidates_with_options(
+            summary, underlying, include_system_discovered=True)
+        primary_codes = {str(item.get("code") or "") for item in candidates}
+        alternatives = [item for item in expanded_candidates
+                        if str(item.get("code") or "") not in primary_codes]
         if not request or research_only or not candidates:
             QMessageBox.information(self, "无法报价", "本次运行没有客户点名或系统发现的可报价标的代码。")
             return
         # 不论候选来自客户、主题 ETF 研究目标还是系统发现，也不论只有一只还是
         # 多只，都必须在研究完成后统一展示并由分析师再次确认。研究取数选择绝不
         # 自动等同于正式挂钩标的选择。
-        dialog = QuoteUnderlyingPoolDialog(self, candidates=candidates)
+        dialog = QuoteUnderlyingPoolDialog(
+            self, candidates=candidates, alternatives=alternatives)
         if not dialog.exec():
             return
         selected_codes = dialog.selected_codes()
@@ -3133,7 +3524,8 @@ class ResearchHelperWindow(QMainWindow):
         selected_set = set(selected_codes)
         self._start_recommender_batch(
             summary=summary, request=request, underlyings=selected_codes,
-            candidates=[item for item in candidates if str(item.get("code") or "") in selected_set],
+            candidates=[item for item in expanded_candidates
+                        if str(item.get("code") or "") in selected_set],
         )
 
     def retry_selected_quote_job(self) -> None:
@@ -3182,7 +3574,8 @@ class ResearchHelperWindow(QMainWindow):
         context = self._quote_candidate_context.get(code) or {}
         if context.get("name"):
             return str(context.get("name") or "").strip()
-        for item in ResearchHelperWindow._quote_underlying_candidates(summary, ""):
+        for item in ResearchHelperWindow._quote_underlying_candidates_with_options(
+                summary, "", include_system_discovered=True):
             if str(item.get("code") or "").strip().upper() == code:
                 return str(item.get("name") or "").strip()
         confirmation = (summary.get("metadata") or {}).get("分析师确认") or {}
@@ -3802,6 +4195,14 @@ class ResearchHelperWindow(QMainWindow):
         dialog = LlmSettingsDialog(self)
         if dialog.exec():
             QMessageBox.information(self, "LLM 设置已保存", "新设置会在下一次分析任务启动时生效。")
+
+    def edit_search_settings(self) -> None:
+        dialog = SearchSettingsDialog(self)
+        if dialog.exec():
+            QMessageBox.information(
+                self, "搜索设置已保存",
+                "Tavily/Bing 搜索设置会在下一次自动查找事件证据时生效。",
+            )
 
     def edit_ifind_credentials(self) -> None:
         dialog = IFindCredentialsDialog(self)

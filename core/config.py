@@ -63,6 +63,14 @@ def _cred(key: str, default: str = "") -> str:
     return os.environ.get(key) or _LOCAL.get(key, default)
 
 
+def _setting_bool(key: str, default: bool) -> bool:
+    """读取本机布尔设置；环境变量仍优先于 config.local.json。"""
+    raw = os.environ.get(key, _LOCAL.get(key, default))
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", "否"}
+
+
 # ---- DeepSeek / LLM 配置 ----
 DEEPSEEK_API_KEY = _cred("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
@@ -75,6 +83,16 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", _LOCAL.get("DEEPSEEK_MODEL", "
 # 数据源主力。注意：账户有周度取数上限，静态/慢变数据须缓存到本地（见 data_cache/）。
 IFIND_ACCOUNT = _cred("IFIND_ACCOUNT")
 IFIND_PASSWORD = _cred("IFIND_PASSWORD")
+
+# ---- 公开证据检索 ----
+# Tavily 负责高质量 URL 发现及清洗正文；无 Key、调用失败或额度不足时可回退
+# 到无需密钥的 Bing RSS。Key 只从环境变量或被 Git 忽略的本机配置读取。
+TAVILY_API_KEY = _cred("TAVILY_API_KEY")
+SEARCH_PROVIDER = str(_cred("SEARCH_PROVIDER", "tavily") or "tavily").strip().lower()
+SEARCH_DEPTH = str(_cred("SEARCH_DEPTH", "basic") or "basic").strip().lower()
+SEARCH_COUNTRY = str(_cred("SEARCH_COUNTRY", "china") or "china").strip().lower()
+SEARCH_LANGUAGE = str(_cred("SEARCH_LANGUAGE", "zh-cn") or "zh-cn").strip().lower()
+SEARCH_BING_FALLBACK = _setting_bool("SEARCH_BING_FALLBACK", True)
 
 # 本地数据缓存目录（静态数据取一次存这里，规避配额）
 DATA_CACHE_DIR = _PROJECT_ROOT / "data_cache"

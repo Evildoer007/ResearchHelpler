@@ -52,6 +52,8 @@ class Overrides:
     # 事件驱动报告的事实与传导证据。它和通用“外部事实”分开，后者只是给 planner
     # 的背景，前者会作为可溯源字段交给 writer，并受 event_evidence 的硬门校验。
     事件证据: object = None
+    # GUI 的显式体裁控制；只改变事件证据门和报告体裁，不提供任何事实或数值。
+    强制事件驱动: bool = False
     path: str = ""
     errors: list[str] = dfield(default_factory=list)
 
@@ -63,6 +65,7 @@ class Overrides:
     def 为空(self) -> bool:
         evidence = self.事件证据
         return (not self.字段覆盖 and not self.外部事实
+                and not self.强制事件驱动
                 and not getattr(evidence, "event_facts", [])
                 and not getattr(evidence, "industry_mechanisms", [])
                 and not getattr(evidence, "ashare_exposures", [])
@@ -139,6 +142,11 @@ def load(path: str | Path | None) -> Overrides:
     from . import event_evidence
     ov.事件证据 = event_evidence.parse(raw.get("事件证据"))
     ov.errors.extend(ov.事件证据.errors)
+    forced = raw.get("强制事件驱动", False)
+    if not isinstance(forced, bool):
+        ov.errors.append("「强制事件驱动」必须是 true 或 false")
+    else:
+        ov.强制事件驱动 = forced
     return ov
 
 

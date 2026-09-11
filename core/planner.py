@@ -40,6 +40,9 @@ _MARKET_LEVEL_IDS = {"E4", "M1", "M2", "M3", "M3b", "M4", "M4b", "M6", "M7"}
 # 研报观点在取数清单里的字段名前缀。pipeline 据此把它们从取数层排除
 # （值不是查出来的，是研报原文），并直接包装成 FieldValue 交给 writer。
 DOC_FIELD_PREFIX = "研报依据·"
+# 分析师确认的事件传导链不是研报，也不应伪装成普通行情字段。独立前缀让
+# pipeline/writer 能在不混淆来源的前提下，把它绑定到选中的正文逻辑。
+EVENT_FIELD_PREFIX = "事件链依据·"
 
 
 @dataclass
@@ -106,6 +109,9 @@ _SYSTEM_PICKED = """你是场外衍生品投资策略研报的"论点规划器"�
    不得推理演绎、不得补充你自己知道的行业知识；同样不得写具体数字。
    若其“证据范围”为**公司级**，它只能作为明确点名该公司的案例，不能写成
    “行业盈利改善”“板块景气上行”等行业结论，也不能据此决定整体方向。
+10. id 形如 `event_chain_N` 或 `event_direct_N` 的是分析师已经确认的事件传导论点。
+    只能依据随附的事件事实、产业机制、A股暴露原文及组合边界组织措辞；不得新增
+    传导环节，不得把“可能影响”升级成确定因果。
 只输出一个 JSON 对象，不要输出任何多余文字。"""
 
 
@@ -159,7 +165,8 @@ def triggers_to_spec(fired) -> list[dict]:
 def _build_user_prompt(topic: str, genre: dict, vocab: list[str], ctx: dict | None = None,
                        profile: dict | None = None, fired: list[dict] | None = None,
                        chosen: list[str] | None = None,
-                       doc_claims: list | None = None) -> str:
+                       doc_claims: list | None = None,
+                       event_claims: list | None = None) -> str:
     """构造 planner 输入 —— **以"已触发论点"为唯一候选来源**（DESIGN §7.3）。
 
     体裁（genres.py）在此只剩两个作用：给出主题类型、以及一句行文口吻参考；
@@ -188,10 +195,18 @@ def _build_user_prompt(topic: str, genre: dict, vocab: list[str], ctx: dict | No
                 "证据范围": getattr(c, "证据范围", "公司级"),
                 "证据主体": getattr(c, "证据主体", ""),
             })
+        for c in (event_claims or []):
+            picked.append({
+                "论点id": c.id, "名称": c.viewpoint, "类别": c.category,
+                "方向": c.direction, "来源": "分析师确认的事件传导链",
+                "受控证据链_具体论点只能依据这些原文和边界": c.source_text,
+                "出处": c.source, "证据范围": c.evidence_scope,
+                "证据主体": c.evidence_subject,
+            })
         spec["人工选定的正文主轴_必须全部输出_不得增删"] = picked
         spec["候选说明"] = (
             f"分析师已选定以上 {len(picked)} 条作为正文主轴"
-            f"（其中研报提炼 {len(doc_claims or [])} 条）。"
+            f"（其中事件传导 {len(event_claims or [])} 条、研报提炼 {len(doc_claims or [])} 条）。"
             "请为每条写出本主题下的具体论证表述，并串成叙事主轴、给出整体方向。"
         )
     else:
@@ -223,7 +238,8 @@ def _build_user_prompt(topic: str, genre: dict, vocab: list[str], ctx: dict | No
 def _postprocess(topic: str, genre: dict, raw: dict,
                  fired: list[dict] | None = None,
                  chosen: list[str] | None = None,
-                 doc_claims: list | None = None) -> ArgumentPlan:
+                 doc_claims: list | None = None,
+                 event_claims: list | None = None) -> ArgumentPlan:
     """把 LLM 输出规整成 ArgumentPlan，并把主轴条数约束在 2~3 条。
 
     体裁不参与兜底（DESIGN §7.3）：缺条数时从**本次已触发的论点**里补，
@@ -259,6 +275,7 @@ def _postprocess(topic: str, genre: dict, raw: dict,
         #    降级等于把分析师没选的论点又塞回正文）；③ 漏写的从触发结果补出来。
         want = list(dict.fromkeys(chosen))
         doc_map = {c.id: c for c in (doc_claims or [])}
+        event_map = {c.id: c for c in (event_claims or [])}
         kept = {lg.逻辑id: lg for lg in logics if lg.逻辑id in set(want)}
         for lg in kept.values():
             lg.来源 = SRC_SPINE
@@ -271,6 +288,11 @@ def _postprocess(topic: str, genre: dict, raw: dict,
                     lg = PlanLogic(逻辑id=cid, 标题=c.观点, 来源=SRC_SPINE,
                                    具体论点=c.观点, 所需数据字段=[],
                                    结构方向倾向=c.方向)
+                elif cid in event_map:
+                    c = event_map[cid]
+                    lg = PlanLogic(逻辑id=cid, 标题=c.viewpoint, 来源=SRC_SPINE,
+                                   具体论点=c.viewpoint, 所需数据字段=[],
+                                   结构方向倾向=c.direction)
                 else:
                     f = fired_map.get(cid)
                     if f is None:
@@ -282,6 +304,8 @@ def _postprocess(topic: str, genre: dict, raw: dict,
             # 研报观点的证据就是那段原文，字段名固定，不容 LLM 自拟
             if cid in doc_map:
                 lg.所需数据字段 = [f"{DOC_FIELD_PREFIX}{cid}"]
+            elif cid in event_map:
+                lg.所需数据字段 = [f"{EVENT_FIELD_PREFIX}{cid}"]
             logics.append(lg)
         spine_items = logics
     else:
@@ -365,7 +389,12 @@ def _postprocess(topic: str, genre: dict, raw: dict,
         for f in lg.所需数据字段:
             seen_fields.setdefault(f, None)
     plan.取数清单 = list(seen_fields)
-    plan.未知字段 = [f for f in plan.取数清单 if f not in schema.FIELDS]
+    plan.未知字段 = [
+        f for f in plan.取数清单
+        if f not in schema.FIELDS
+        and not f.startswith(DOC_FIELD_PREFIX)
+        and not f.startswith(EVENT_FIELD_PREFIX)
+    ]
     plan.ok = True
     return plan
 
@@ -374,7 +403,8 @@ def plan(topic: str, topic_type: str, client: DeepSeekClient | None = None,
          *, genre: dict | None = None, context: dict | None = None,
          profile: dict | None = None, fired: list[dict] | None = None,
          chosen: list[str] | None = None,
-         doc_claims: list | None = None) -> ArgumentPlan:
+         doc_claims: list | None = None,
+         event_claims: list | None = None) -> ArgumentPlan:
     """对主题做论点规划。
 
     genre  : 体裁配置（可传混合体裁 gr.merged_genre），只影响行文口吻，不决定论证什么。
@@ -395,13 +425,14 @@ def plan(topic: str, topic_type: str, client: DeepSeekClient | None = None,
 
     if fired is None:
         fired = _format_triggers(profile)
-    user = _build_user_prompt(topic, g, vocab, context, profile, fired, chosen, doc_claims)
+    user = _build_user_prompt(topic, g, vocab, context, profile, fired, chosen,
+                              doc_claims, event_claims)
     res: ChatResult = client.chat_json(_SYSTEM_PICKED if chosen else _SYSTEM,
                                        user, temperature=0.3)
     if not res.ok or not isinstance(res.data, dict):
         return ArgumentPlan(主题=topic, 类型=topic_type, ok=False,
                             error=res.error or "LLM 返回非预期结构")
-    return _postprocess(topic, g, res.data, fired, chosen, doc_claims)
+    return _postprocess(topic, g, res.data, fired, chosen, doc_claims, event_claims)
 
 
 if __name__ == "__main__":  # python -m core.planner

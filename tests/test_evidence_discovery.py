@@ -9,11 +9,18 @@ from core.evidence_discovery import (
     EvidenceDocument,
     DiscoveredEvidence,
     SearchHit,
+    UnifiedSearcher,
+    DiscoveryResult,
+    _collect_web_documents,
+    _event_entity_profile,
     assemble_inference_chains,
+    fetch_document,
     classify_documents,
     discover,
+    load_search_settings,
     plan_query_groups,
     plan_queries,
+    search_tavily,
     search_web,
 )
 from llm.client import ChatResult
@@ -284,6 +291,120 @@ class EvidenceDiscoveryTests(unittest.TestCase):
         self.assertEqual(hits, [SearchHit(
             title="Official filing", url="https://example.com/a", summary="Published result",
         )])
+
+    def test_search_settings_normalize_invalid_values(self) -> None:
+        values = load_search_settings({
+            "provider": "unknown", "search_depth": "ultra",
+            "country": " China ", "language": " ZH-CN ", "bing_fallback": "false",
+        })
+        self.assertEqual(values["provider"], "tavily")
+        self.assertEqual(values["search_depth"], "basic")
+        self.assertEqual(values["country"], "china")
+        self.assertEqual(values["language"], "zh-cn")
+        self.assertFalse(values["bing_fallback"])
+
+    def test_sk_hynix_event_queries_use_exact_bilingual_entity_anchors(self) -> None:
+        aliases, exclusions = _event_entity_profile("SK海力士发布业绩后如何影响A股半导体？")
+        self.assertEqual(aliases, ["SK海力士", "SK hynix"])
+        self.assertIn("SK-II", exclusions)
+        groups, _warnings = plan_query_groups(
+            "SK海力士发布业绩后如何影响A股半导体？", client=FakeClient({}, available=False))
+        self.assertIn('"SK海力士"', groups["事件事实"][0])
+        self.assertNotIn("SK-II", groups["事件事实"][0])
+        self.assertIn('"SK hynix"', groups["事件事实"][1])
+
+    def test_event_fact_drops_sk_ii_before_fetching_page(self) -> None:
+        irrelevant = SearchHit(
+            "SK-II official skincare", "https://example.com/skii",
+            summary="护肤品牌新品与化妆品介绍", provider="Tavily",
+        )
+        relevant = SearchHit(
+            "SK hynix earnings", "https://example.com/hynix",
+            summary="SK hynix announces quarterly earnings and HBM guidance", provider="Tavily",
+        )
+        fetched: list[str] = []
+
+        def fetcher(hit: SearchHit) -> EvidenceDocument:
+            fetched.append(hit.url)
+            return EvidenceDocument("", hit.title, hit.title, hit.url, "正文" * 80, "测试正文")
+
+        result = DiscoveryResult()
+        documents = _collect_web_documents(
+            ["query"], channel="事件事实", limit=4,
+            searcher=lambda _query: [irrelevant, relevant], fetcher=fetcher,
+            seen_urls=set(), result=result,
+            required_entity_aliases=["SK海力士", "SK hynix"],
+        )
+        self.assertEqual(len(documents), 1)
+        self.assertEqual(fetched, ["https://example.com/hynix"])
+        self.assertEqual(result.filtered_entity_mismatch_hits, 1)
+        self.assertTrue(any("事件主体" in str(item.get("reason")) for item in result.search_audit))
+
+    @patch("core.evidence_discovery._public_https", return_value=True)
+    def test_tavily_search_keeps_cleaned_content_and_usage(self, _safe) -> None:
+        calls: list[dict] = []
+
+        class Response:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status() -> None:
+                return None
+
+            @staticmethod
+            def json() -> dict:
+                return {
+                    "results": [{
+                        "title": "Official filing", "url": "https://example.com/filing",
+                        "content": "short summary", "raw_content": "A" * 120, "score": 0.91,
+                    }],
+                    "usage": {"credits": 2}, "response_time": 1.2,
+                }
+
+        class Session:
+            @staticmethod
+            def post(url, **kwargs):
+                calls.append({"url": url, **kwargs})
+                return Response()
+
+        hits, diagnostic = search_tavily(
+            "company filing", api_key="tvly-test", search_depth="advanced",
+            country="china", language="zh-cn", session=Session,
+        )
+        self.assertEqual(hits[0].provider, "Tavily")
+        self.assertEqual(hits[0].raw_content, "A" * 120)
+        self.assertEqual(diagnostic["credits"], 2.0)
+        self.assertEqual(calls[0]["headers"]["Authorization"], "Bearer tvly-test")
+        self.assertEqual(calls[0]["json"]["include_raw_content"], "text")
+        self.assertEqual(calls[0]["json"]["country"], "china")
+
+    def test_unified_search_falls_back_to_bing_on_tavily_failure(self) -> None:
+        fallback = SearchHit("Bing result", "https://example.com/bing")
+        searcher = UnifiedSearcher({
+            "provider": "tavily", "api_key": "bad", "bing_fallback": True,
+        })
+        with patch("core.evidence_discovery.search_tavily", side_effect=RuntimeError("quota")), \
+                patch("core.evidence_discovery.search_web", return_value=[fallback]):
+            hits = searcher("query")
+        diagnostics = searcher.take_diagnostics()
+        self.assertEqual(hits[0].provider, "Bing RSS")
+        self.assertEqual([item["provider"] for item in diagnostics], ["Tavily", "Bing RSS"])
+        self.assertFalse(diagnostics[0]["ok"])
+        self.assertTrue(diagnostics[1]["ok"])
+
+    @patch("core.evidence_discovery._public_https", return_value=True)
+    def test_fetch_document_uses_tavily_cleaned_content_without_second_request(self, _safe) -> None:
+        class Session:
+            @staticmethod
+            def get(*_args, **_kwargs):
+                raise AssertionError("已有 Tavily 清洗正文时不应再次抓取网页")
+
+        document = fetch_document(SearchHit(
+            "Official filing", "https://example.com/filing",
+            raw_content="已清洗的公司公告正文" * 12, provider="Tavily",
+        ), session=Session)
+        self.assertIsNotNone(document)
+        self.assertEqual(document.source_kind, "Tavily清洗正文")
 
 
 if __name__ == "__main__":

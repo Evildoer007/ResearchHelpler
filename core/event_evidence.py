@@ -54,6 +54,24 @@ class EvidenceChain:
         return f"[{refs}] {self.conclusion}（{suffix}）"
 
 
+@dataclass(frozen=True)
+class EventClaim:
+    """一条可进入正文主轴选择器的、已经分析师确认的事件传导论点。
+
+    它不是研报观点，也不是 LLM 新推断。``source_text`` 把该结论引用的事实、
+    产业机制、A 股暴露原文和组合边界放在一起，供 planner/writer 原样引用。
+    """
+
+    id: str
+    viewpoint: str
+    direction: str
+    source_text: str
+    source: str = "分析师确认的事件证据组合"
+    category: str = "事件/催化类"
+    evidence_scope: str = "事件传导链"
+    evidence_subject: str = ""
+
+
 @dataclass
 class EventEvidence:
     event_facts: list[EvidenceItem] = field(default_factory=list)
@@ -62,12 +80,59 @@ class EventEvidence:
     inference_chains: list[EvidenceChain] = field(default_factory=list)
     # 兼容旧版：若一条原文已经直接说明“事件为何影响本次 A 股对象”，可走捷径。
     transmission_links: list[EvidenceItem] = field(default_factory=list)
+    # 搜索服务、检索词、命中/读取、淘汰原因及额度；只用于内部审计，不进入客户正文。
+    search_audit: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
         composed = bool(self.industry_mechanisms and self.ashare_exposures and self.inference_chains)
         return not self.errors and bool(self.event_facts) and bool(self.transmission_links or composed)
+
+
+def _report_direction(value: str) -> str:
+    """把证据链方向统一成报告候选使用的方向词。"""
+    text = str(value or "").strip()
+    if any(word in text for word in ("正向", "利好", "上涨", "看涨")):
+        return "看涨"
+    if any(word in text for word in ("负向", "利空", "下跌", "看跌")):
+        return "看跌"
+    if "双向" in text:
+        return "双向"
+    return text or "不确定"
+
+
+def claims(evidence: EventEvidence, *, subject: str = "") -> list[EventClaim]:
+    """将已确认证据链转换为候选观点；不生成证据中不存在的新结论。"""
+    if not evidence.complete:
+        return []
+    known = {
+        item.evidence_id: item
+        for values in (evidence.event_facts, evidence.industry_mechanisms,
+                       evidence.ashare_exposures, evidence.transmission_links)
+        for item in values
+    }
+    out: list[EventClaim] = []
+    for index, chain in enumerate(evidence.inference_chains, 1):
+        refs = (*chain.fact_ids, *chain.mechanism_ids, *chain.exposure_ids)
+        quoted = [known[value].display() for value in refs if value in known]
+        quoted.append("分析师确认的组合结论：" + chain.display())
+        out.append(EventClaim(
+            id=f"event_chain_{index}", viewpoint=chain.conclusion,
+            direction=_report_direction(chain.direction),
+            source_text="\n".join(quoted), evidence_subject=subject,
+        ))
+    # 兼容旧版直接传导原文：事实 + 直接传导本身即可构成受控主轴候选。
+    for index, link in enumerate(evidence.transmission_links, 1):
+        facts = "\n".join(item.display() for item in evidence.event_facts)
+        text = "\n".join(value for value in (facts, link.display()) if value)
+        out.append(EventClaim(
+            id=f"event_direct_{index}",
+            viewpoint=f"{link.relation}：{link.content}", direction="不确定",
+            source_text=text, source=link.source,
+            evidence_scope="直接传导原文", evidence_subject=subject,
+        ))
+    return out
 
 
 @dataclass(frozen=True)
@@ -84,17 +149,42 @@ class GateResult:
 
 
 def required_for(brief) -> bool:
-    """仅对“有具体触发实体”的事件驱动需求启用硬门。
+    """对已识别的具体事件，或分析师显式指定的事件型需求启用硬门。
 
     普通板块报告不应因没有一家公司业绩材料而被挡住；反之，事件在混合类型中只要
     占一个角色，就不能把事件影响写成没有事实来源的联想。
     """
+    # 分析师显式指定事件型时，即使境外证券代码暂未被数据源验证，也必须保留
+    # 证据硬门；否则“强制事件型”反而会因代码覆盖不足静默退化成普通行业报告。
+    if bool(getattr(brief, "分析师强制事件驱动", False)):
+        return True
     entity = getattr(brief, "触发实体", None)
     if entity is None or not getattr(entity, "可用", False):
         return False
     kinds = [str(getattr(brief, "主导类型", "") or "")]
     kinds.extend(str(item or "") for item in (getattr(brief, "附加类型", []) or []))
     return genres.TYPE_EVENT in kinds
+
+
+def subject_for(brief) -> str:
+    """返回事件证据在候选与底稿中的展示主体。
+
+    自动识别到证券实体时优先显示名称与代码；分析师强制事件型但解析器没有形成
+    可验证证券代码时，退回已识别的事件描述或研究主题，不能因此丢弃整包证据。
+    """
+    entity = getattr(brief, "触发实体", None)
+    if entity is not None:
+        value = " ".join(filter(None, (
+            str(getattr(entity, "名称", "") or "").strip(),
+            str(getattr(entity, "代码", "") or "").strip(),
+        ))).strip()
+        if value:
+            return value
+    for name in ("触发事件", "研究主题", "主题"):
+        value = str(getattr(brief, name, "") or "").strip()
+        if value:
+            return value
+    return "本次事件"
 
 
 def assess(brief, evidence: EventEvidence) -> GateResult:
@@ -157,6 +247,11 @@ def parse(raw: object) -> EventEvidence:
     out.industry_mechanisms = items("产业机制", relation_required=False, prefix="M")
     out.ashare_exposures = items("A股暴露", relation_required=False, prefix="E")
     out.transmission_links = items("传导关系", relation_required=True, prefix="D")
+    raw_audit = raw.get("检索审计") or []
+    if isinstance(raw_audit, list):
+        out.search_audit = [dict(item) for item in raw_audit if isinstance(item, Mapping)]
+    else:
+        out.errors.append("「事件证据.检索审计」必须是列表")
 
     known = {
         item.evidence_id: kind
@@ -260,6 +355,7 @@ def to_dict(evidence: EventEvidence) -> dict[str, Any]:
             "方向": value.direction, "置信度": value.confidence, "边界": value.reason,
         } for value in evidence.inference_chains],
         "传导关系": [item(value) for value in evidence.transmission_links],
+        "检索审计": list(evidence.search_audit),
     }
 
 
@@ -271,9 +367,7 @@ def attach_to_analysis(ma, brief, evidence: EventEvidence) -> None:
     """
     if not evidence.complete:
         return
-    entity = getattr(brief, "触发实体", None)
-    if entity is None:
-        return
+    subject = subject_for(brief)
     for index, item in enumerate(evidence.event_facts, 1):
         note = ("自动检索原文并经分析师确认的事件本体事实"
                 if item.acquisition else "分析师提供的事件本体事实")
@@ -306,7 +400,7 @@ def attach_to_analysis(ma, brief, evidence: EventEvidence) -> None:
             note="结论只允许引用列示证据ID；不是新的外部事实来源", display=chain.display(),
         )
     ma.事件证据 = {
-        "事件主体": f"{getattr(entity, '名称', '')} {getattr(entity, '代码', '')}".strip(),
+        "事件主体": subject,
         "事件事实": [item.display() for item in evidence.event_facts],
         "产业机制": [item.display() for item in evidence.industry_mechanisms],
         "A股暴露": [item.display() for item in evidence.ashare_exposures],

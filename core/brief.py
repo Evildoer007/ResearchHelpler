@@ -72,6 +72,9 @@ class Brief:
     主题: str = ""
     主导类型: str = ""
     附加类型: list[str] = dfield(default_factory=list)
+    # GUI 中由分析师显式勾选。它把本次运行固定为事件驱动，并启用事件证据硬门；
+    # 不能因 LLM 分类不同或境外触发实体代码暂未校验就悄悄退化为普通行业研究。
+    分析师强制事件驱动: bool = False
     触发事件: str = ""
     关注点: str = ""
     # 客户点名的结构/报价诉求：保留作 OptionHelper 的独立输入与审计留痕，

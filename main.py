@@ -60,7 +60,7 @@ _WANT_PDF = False        # 由 --pdf 打开，见 main()
 _OH_OUTPUT = ""          # 由 --optionhelper quote|recommend 打开，见 main()
 _CLIENT_CONSTRAINTS = None  # 在 main() 解析为 ClientConstraints
 
-from core import (brief, event_evidence, market_confirmation, overrides as ov, pipeline,
+from core import (brief, event_evidence, genres, market_confirmation, overrides as ov, pipeline,
                   thesis, topics, validator, writer)
 from core.client_constraints import ClientConstraints, parse_cli as parse_client_constraints
 from core.provider import get_provider
@@ -375,8 +375,8 @@ def _write_interactive_review(ma, rc, report_path: str) -> tuple[str, str]:
 def _ask_picks(prepared) -> list[str] | None:
     """打印候选清单并读取分析师勾选。返回选中的 id 列表；直接回车 = 交回自动挑选。
 
-    候选含两类：数据触发的论点（阈值判定）与研报提炼的观点（需点开原文核对）。
-    编号跨两类连续，由 pipeline.candidates 统一分配，渲染与选号共用同一顺序。
+    候选含三类：数据触发、已确认事件传导与研报提炼。事件型报告必须至少保留
+    一条事件传导主轴；编号跨三类连续，由 pipeline.candidates 统一分配。
     """
     cands = pipeline.candidates(prepared)
     print()
@@ -404,6 +404,7 @@ def _ask_picks(prepared) -> list[str] | None:
             for index, candidate in enumerate(cands, 1)
         ],
         "suggested": pipeline.recommend(cands),
+        "require_event_chain": bool(getattr(prepared, "event_required", False)),
     }
     print("LOGIC_PICK_REQUIRED=" + json.dumps(picker_payload, ensure_ascii=False), flush=True)
 
@@ -415,6 +416,9 @@ def _ask_picks(prepared) -> list[str] | None:
     except EOFError:          # 非交互环境（重定向/管道）下退回自动
         return None
     if not raw:
+        if getattr(prepared, "event_required", False):
+            recommended = pipeline.select_candidates(cands, pipeline.recommend(cands))
+            return [c.id for c in recommended]
         return None
 
     picks = [int(x) for x in raw.replace(",", " ").split() if x.strip().isdigit()]
@@ -422,6 +426,10 @@ def _ask_picks(prepared) -> list[str] | None:
     if not chosen:
         print("  ⚠ 未识别到有效序号，改由系统自动挑选。")
         return None
+    if getattr(prepared, "event_required", False) and not any(c.kind == "event" for c in chosen):
+        print("  ⚠ 事件型报告至少需要一条已确认事件传导主轴，改用包含传导链的系统建议。")
+        recommended = pipeline.select_candidates(cands, pipeline.recommend(cands))
+        return [c.id for c in recommended]
 
     print(f"  已选 {len(chosen)} 条：" + "、".join(c.名称[:18] for c in chosen))
     # 以下均为出声提示，不阻拦——挑哪几条是分析师的判断
@@ -488,6 +496,18 @@ def generate_from_brief(text: str, *, pick: bool = False,
                 tracker.fail_stage(stage, b.error or "需求解析失败")
     else:
         b = brief.parse(text)
+    if b.ok and o.强制事件驱动:
+        previous_type = str(b.主导类型 or "").strip()
+        b.主导类型 = genres.TYPE_EVENT
+        b.分析师强制事件驱动 = True
+        if not str(b.触发事件 or "").strip():
+            b.触发事件 = str(b.研究主题 or b.主题 or text).strip()
+        if (previous_type and previous_type != genres.TYPE_EVENT
+                and previous_type not in b.附加类型):
+            b.附加类型.insert(0, previous_type)
+        if tracker:
+            tracker.add_metadata("报告类型覆盖", "分析师勾选：事件驱动")
+        print("  · 分析师已勾选事件驱动型：启用事件事实、产业机制与A股暴露证据硬门。")
     # 略去"外部事实待补"：此刻无法行动，完整清单与覆盖模板都在内部底稿里
     print(brief.render(b, 含外部事实=False))
     if not b.ok:
@@ -611,11 +631,14 @@ def generate_from_brief(text: str, *, pick: bool = False,
             return None
         evidence = event_evidence.parse(raw_evidence.get("event_evidence") or raw_evidence)
         gate = event_evidence.assess(b, evidence)
+        # 分析师确认后的证据必须写回本次运行的唯一状态对象。此前这里只更新局部变量，
+        # run_from_brief 随后从旧 overrides 再读一次，造成“明明有A股暴露却报缺失”。
+        o.事件证据 = evidence
         if tracker and not evidence.errors:
             tracker.add_metadata("分析师确认事件证据", json.dumps(
                 event_evidence.to_dict(evidence), ensure_ascii=False))
     if gate.required and not gate.ready:
-        entity = getattr(getattr(b, "触发实体", None), "名称", "该事件主体")
+        entity = event_evidence.subject_for(b)
         message = gate.message(entity)
         payload = {
             "message": message,
